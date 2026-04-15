@@ -62,6 +62,7 @@ from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 import pandas as pd
 
+# Matplotlib can fail on some cloud builds; keep the app alive with a safe fallback.
 try:
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
@@ -69,8 +70,46 @@ except Exception:
     plt = None
     HAS_MATPLOTLIB = False
 
-from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
-from sklearn.impute import KNNImputer
+# scikit-learn is required for full functionality, but the app should still open if it
+# is temporarily unavailable in the cloud environment.
+try:
+    from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+    from sklearn.impute import KNNImputer
+    HAS_SKLEARN = True
+except Exception:
+    HAS_SKLEARN = False
+
+    class _IdentityScaler:
+        def fit(self, X):
+            return self
+        def transform(self, X):
+            return np.asarray(X, dtype=float)
+        def fit_transform(self, X):
+            return self.transform(X)
+        def inverse_transform(self, X):
+            return np.asarray(X, dtype=float)
+
+    class StandardScaler(_IdentityScaler):
+        pass
+
+    class RobustScaler(_IdentityScaler):
+        pass
+
+    class MinMaxScaler(_IdentityScaler):
+        pass
+
+    class KNNImputer:
+        def __init__(self, *args, **kwargs):
+            pass
+        def fit(self, X):
+            return self
+        def transform(self, X):
+            arr = pd.DataFrame(X).copy()
+            arr = arr.apply(pd.to_numeric, errors='coerce')
+            arr = arr.ffill().bfill().fillna(0.0)
+            return arr.to_numpy(dtype=float)
+        def fit_transform(self, X):
+            return self.transform(X)
 
 # Desktop GUI is optional. Streamlit Cloud/mobile deployments do not support tkinter.
 try:
@@ -97,14 +136,6 @@ except Exception:
     HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore")
-
-
-def ensure_matplotlib():
-    if not HAS_MATPLOTLIB:
-        raise ImportError(
-            "matplotlib kurulamadı. requirements.txt içine matplotlib ekleyip Streamlit Cloud'da Reboot app yapın."
-        )
-
 
 
 # =========================================================
@@ -5966,6 +5997,41 @@ def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics
     return {"status": status, "notes": notes}
 
 
+
+def get_excel_engine_for_path(file_path: str) -> str:
+    suffix = os.path.splitext(str(file_path))[1].lower()
+    if suffix == ".xls":
+        return "xlrd"
+    return "openpyxl"
+
+
+def safe_open_excel_file(excel_path: str):
+    engine = get_excel_engine_for_path(excel_path)
+    try:
+        return pd.ExcelFile(excel_path, engine=engine)
+    except ImportError as e:
+        package = "xlrd" if engine == "xlrd" else "openpyxl"
+        raise RuntimeError(
+            f"Excel dosyasını okumak için gerekli '{package}' paketi Streamlit ortamında bulunamadı. "
+            f"Lütfen requirements.txt dosyasına '{package}' ekleyin ve uygulamayı yeniden başlatın."
+        ) from e
+    except ValueError as e:
+        # Some pandas/openpyxl combinations raise ValueError instead of ImportError
+        msg = str(e)
+        if "Excel file format cannot be determined" in msg or "Install" in msg or "engine" in msg.lower():
+            raise RuntimeError(
+                "Yüklenen Excel dosyası okunamadı. Dosyanın gerçekten .xlsx/.xls biçiminde olduğundan ve "
+                "gerekli Excel bağımlılıklarının requirements.txt içinde tanımlı olduğundan emin olun."
+            ) from e
+        raise
+
+
+def render_exception_block(title: str, exc: Exception):
+    st.error(title)
+    with st.expander("Hata detayı"):
+        st.code(f"{type(exc).__name__}: {exc}")
+
+
 def render_streamlit_app():
     st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
     st.title("Talep Tahminleme Studio")
@@ -5981,7 +6047,13 @@ def render_streamlit_app():
         return
 
     excel_path = save_uploaded_file(uploaded_excel)
-    xls = pd.ExcelFile(excel_path)
+    try:
+        xls = safe_open_excel_file(excel_path)
+    except Exception as e:
+        render_exception_block("Excel dosyası açılamadı.", e)
+        st.info("İpucu: requirements.txt içinde openpyxl ve xlrd paketlerinin yer aldığından emin ol. Sonra Streamlit Cloud'da Reboot app yap.")
+        return
+
     selected_sheet = st.sidebar.selectbox("Sheet seç", xls.sheet_names)
     output_base_dir = os.path.join(os.path.dirname(excel_path), "streamlit_outputs")
     os.makedirs(output_base_dir, exist_ok=True)
@@ -5991,9 +6063,13 @@ def render_streamlit_app():
         st.session_state["preprocess_cache"] = {}
 
     if st.sidebar.button("Önişleme + Tahminleme için hazırla", type="primary") or cache_key not in st.session_state["preprocess_cache"]:
-        with st.spinner("Veri önişleme ve yönetişim çalışıyor..."):
-            export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
-            st.session_state["preprocess_cache"][cache_key] = export_payload
+        try:
+            with st.spinner("Veri önişleme ve yönetişim çalışıyor..."):
+                export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
+                st.session_state["preprocess_cache"][cache_key] = export_payload
+        except Exception as e:
+            render_exception_block("Veri önişleme aşamasında hata oluştu.", e)
+            return
     export_payload = st.session_state["preprocess_cache"][cache_key]
 
     manifest = export_payload["manifest"]
@@ -6043,7 +6119,11 @@ def render_streamlit_app():
     if st.button(run_label, type="primary"):
         with st.spinner("Gelişmiş tahminleme katmanı çalışıyor..."):
             if mode == "Tek seri":
+                try:
                 outputs = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
+            except Exception as e:
+                render_exception_block("Tahminleme pipeline'ında hata oluştu.", e)
+                return
                 st.session_state["forecast_outputs"] = outputs
                 st.session_state["forecast_target"] = target_col
             else:
