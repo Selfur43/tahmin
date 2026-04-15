@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 
@@ -6009,8 +6009,9 @@ def fit_best_intermittent(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_al
             pred_val = croston_forecast(y_inner, len(y_val), alpha=alpha, variant=variant)
             val_w = wape(y_val.values, pred_val)
             val_s = smape(y_val.values, pred_val)
-            comp = val_w + 0.35 * val_s
-            rows.append({"variant": variant, "alpha": alpha, "val_wape": val_w, "val_smape": val_s, "composite_score": comp})
+            asym = compute_asymmetric_validation_penalty(y_val.values, pred_val, y_inner.values, severity=0.8)
+            comp = val_w + 0.35 * val_s + asym["penalty"]
+            rows.append({"variant": variant, "alpha": alpha, "val_wape": val_w, "val_smape": val_s, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "composite_score": comp})
             if comp < best_score:
                 best_score = comp
                 best = {"variant": variant, "alpha": alpha}
@@ -6052,8 +6053,9 @@ def fit_best_arima(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: st
                         resid = pd.Series(res.resid).dropna()
                         lb_p = acorr_ljungbox(resid, lags=[min(12, max(2, len(resid)//3))], return_df=True)["lb_pvalue"].iloc[0] if len(resid) >= 8 else np.nan
                         bias_penalty = abs(float(np.nanmean(resid))) / max(float(np.nanmean(np.abs(y_inner))) or 1.0, 1.0)
-                        comp = wape(y_val.values, pred) + 0.35 * smape(y_val.values, pred) + (0.50 if pd.notna(lb_p) and lb_p < 0.05 else 0.0) + 0.50 * bias_penalty
-                        rows.append({"transform": applied.get("name","none"), "order": str(order), "trend": trend, "aic": safe_float(getattr(res, "aic", np.nan)), "bic": safe_float(getattr(res, "bic", np.nan)), "ljung_box_pvalue": safe_float(lb_p), "val_wape": wape(y_val.values, pred), "val_smape": smape(y_val.values, pred), "composite_score": comp})
+                        asym = compute_asymmetric_validation_penalty(y_val.values, pred, y_inner.values, severity=0.9)
+                        comp = wape(y_val.values, pred) + 0.35 * smape(y_val.values, pred) + (0.50 if pd.notna(lb_p) and lb_p < 0.05 else 0.0) + 0.50 * bias_penalty + asym["penalty"]
+                        rows.append({"transform": applied.get("name","none"), "order": str(order), "trend": trend, "aic": safe_float(getattr(res, "aic", np.nan)), "bic": safe_float(getattr(res, "bic", np.nan)), "ljung_box_pvalue": safe_float(lb_p), "val_wape": wape(y_val.values, pred), "val_smape": smape(y_val.values, pred), "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "composite_score": comp})
                         if comp < best_score:
                             best_score = comp
                             best = {"order": order, "trend": trend, "transform_cfg": applied}
@@ -6644,7 +6646,8 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             except Exception:
                 lb_p = np.nan
                 bias_penalty = 0.0
-            composite = float(val_wape + 0.35 * val_smape + complexity_penalty + exog_penalty + residual_penalty)
+            asym = compute_asymmetric_validation_penalty(y_val.values, pred, y_inner.values, severity=0.9)
+            composite = float(val_wape + 0.35 * val_smape + complexity_penalty + exog_penalty + residual_penalty + asym["penalty"])
             row = {
                 "transform": applied_cfg.get("name", "none"),
                 "order": str(order),
@@ -6657,6 +6660,9 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
                 "residual_bias_penalty": safe_float(bias_penalty),
                 "val_wape": val_wape,
                 "val_smape": val_smape,
+                "bias_pct": asym["bias_pct"],
+                "under_forecast_rate": asym["under_forecast_rate"],
+                "peak_event_score": asym["peak_event_score"],
                 "composite_score": composite
             }
             return {"row": row, "composite": composite, "best": {"order": order, "seasonal_order": seasonal_order, "trend": trend_spec, "transform_cfg": applied_cfg, "use_exog": bool(use_exog)}}
@@ -6870,7 +6876,9 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             for alpha in [0.15,0.35,0.50,0.65,0.80,1.0]:
                 blend=np.maximum(alpha*np.asarray(pred,dtype=float)+(1-alpha)*np.asarray(baseline_pred,dtype=float),0.0)
                 corrected, post_cfg = compute_validation_postprocess_candidates(val["y"].values, blend, tr["y"], season_length)
-                val_w=wape(val["y"].values, corrected); val_s=smape(val["y"].values, corrected); score=val_w+0.35*val_s
+                val_w=wape(val["y"].values, corrected); val_s=smape(val["y"].values, corrected)
+                asym = compute_asymmetric_validation_penalty(val["y"].values, corrected, tr["y"].values, severity=1.0)
+                score=val_w+0.35*val_s+asym["penalty"]
                 if score < best_local_score:
                     best_local_score=score; best_alpha=alpha; best_post=post_cfg; best_w=val_w; best_s=val_s
             composite=best_local_score + 0.03*len(cols_now) + (0.03 if plan["transform_cfg"].get("name") != "none" else 0.0)
@@ -7013,8 +7021,10 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
                 model = last_model
             score = wape(val_inner["y"].values, pred_val)
             sm = smape(val_inner["y"].values, pred_val)
-            row = {**raw_cfg, "strategy": strategy, "transform": y_transform.get("name", "none"), "val_wape": score, "val_smape": sm, "backend": type(model).__name__ if model is not None else None}
-            return {"row": row, "score": score, "best": {"cfg": cfg, "strategy": strategy, "transform_cfg": y_transform}}
+            asym = compute_asymmetric_validation_penalty(val_inner["y"].values, pred_val, tr_inner["y"].values, severity=1.0)
+            composite = float(score + 0.35 * sm + asym["penalty"])
+            row = {**raw_cfg, "strategy": strategy, "transform": y_transform.get("name", "none"), "val_wape": score, "val_smape": sm, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "backend": type(model).__name__ if model is not None else None, "composite_score": composite}
+            return {"row": row, "score": composite, "best": {"cfg": cfg, "strategy": strategy, "transform_cfg": y_transform}}
         except Exception as e:
             row = {**raw_cfg, "strategy": strategy, "transform": y_transform.get("name", "none"), "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:180]}
             return {"row": row, "score": np.inf, "best": None}
@@ -7174,7 +7184,9 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
     rec_val_smape = safe_float(recursive_res.get("validation_smape", np.nan))
     dir_val_smape = safe_float(direct_res.get("validation_smape", np.nan))
     if pd.notna(rec_val_wape) and pd.notna(dir_val_wape):
-        best = recursive_res if (rec_val_wape, rec_val_smape) <= (dir_val_wape, dir_val_smape) else direct_res
+        rec_comp = safe_float(recursive_res.get("validation_wape", np.nan)) + 0.35 * safe_float(recursive_res.get("validation_smape", np.nan))
+        dir_comp = safe_float(direct_res.get("validation_wape", np.nan)) + 0.35 * safe_float(direct_res.get("validation_smape", np.nan))
+        best = recursive_res if (rec_comp, rec_val_wape, rec_val_smape) <= (dir_comp, dir_val_wape, dir_val_smape) else direct_res
     elif pd.notna(rec_val_wape):
         best = recursive_res
     elif pd.notna(dir_val_wape):
@@ -7698,6 +7710,13 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     outputs["model_errors"] = model_errors
     outputs["stage_timings"] = stage_timings
     outputs["stage_timing_table"] = build_stage_timer_rows(stage_timings)
+    outputs["fallback_summary"] = pd.DataFrame([
+        {"model": "XGBoost", "fallback_used": bool((outputs.get("xgboost") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("xgboost") or {}).get("fallback_method")},
+        {"model": "Prophet", "fallback_used": bool((outputs.get("prophet") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("prophet") or {}).get("fallback_method")},
+        {"model": "SARIMA/SARIMAX", "fallback_used": bool((outputs.get("sarima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("sarima") or {}).get("fallback_method")},
+        {"model": "ARIMA", "fallback_used": bool((outputs.get("arima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("arima") or {}).get("fallback_method")},
+        {"model": "Intermittent", "fallback_used": bool((outputs.get("intermittent") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("intermittent") or {}).get("fallback_method")},
+    ])
     outputs["rolling_origin_backtest"] = run_rolling_origin_backtest_full(export_payload, target_col, outputs, freq_alias, horizon=min(max(2, int(horizon)), 3), use_exog_for_stat_models=use_exog_for_stat_models, use_exog_for_prophet=use_exog_for_prophet, max_folds=3)
     outputs["production_governance"] = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
     outputs["production_model"] = outputs["production_governance"].get("production_model", outputs.get("best_model"))
@@ -7750,6 +7769,43 @@ def _seasonal_naive_array(y_train: pd.Series, horizon: int, season_length: int) 
     return np.repeat(float(y_train.iloc[-1]), horizon).astype(float)
 
 
+def compute_asymmetric_validation_penalty(y_true: np.ndarray, y_pred: np.ndarray, y_train: Optional[np.ndarray] = None, severity: float = 1.0) -> Dict[str, float]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    y_train = np.asarray(y_train if y_train is not None else y_true, dtype=float)
+    if len(y_true) == 0:
+        return {"penalty": 0.0, "bias_pct": np.nan, "under_forecast_rate": np.nan, "peak_event_score": np.nan, "service_gap": np.nan}
+    scale = max(
+        float(np.nanmean(np.abs(y_true))) if np.isfinite(y_true).any() else 0.0,
+        float(np.nanmean(np.abs(y_train))) if np.isfinite(y_train).any() else 0.0,
+        1.0,
+    )
+    err = y_pred - y_true
+    bias_pct = float(100.0 * np.nanmean(err) / scale) if len(err) else np.nan
+    under_rate = float(np.nanmean((y_pred < y_true).astype(float))) if len(y_true) else np.nan
+    peak = compute_peak_event_score(y_train, y_true, y_pred)
+    peak_score = float(peak.get("peak_event_score", np.nan)) if isinstance(peak, dict) else np.nan
+    target_service = 0.90 if len(y_true) <= 6 else 0.85
+    achieved_service = float(np.nanmean(y_pred >= y_true)) if len(y_true) else np.nan
+    service_gap = max(target_service - achieved_service, 0.0) if pd.notna(achieved_service) else np.nan
+    penalty = 0.0
+    if pd.notna(bias_pct) and bias_pct < 0:
+        penalty += min(abs(bias_pct) * 0.06 * severity, 2.0)
+    if pd.notna(under_rate) and under_rate > 0.55:
+        penalty += (under_rate - 0.55) * 3.0 * severity
+    if pd.notna(peak_score) and peak_score < 0.35:
+        penalty += (0.35 - peak_score) * 2.5 * severity
+    if pd.notna(service_gap) and service_gap > 0:
+        penalty += service_gap * 2.0 * severity
+    return {
+        "penalty": float(penalty),
+        "bias_pct": bias_pct,
+        "under_forecast_rate": under_rate,
+        "peak_event_score": peak_score,
+        "service_gap": float(service_gap) if pd.notna(service_gap) else np.nan,
+    }
+
+
 def operational_bias_peak_postprocess(train_y: pd.Series, pred: np.ndarray, freq_alias: str, model_name: str, profile: Optional[Dict[str, Any]] = None) -> np.ndarray:
     pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
     if pred.size == 0:
@@ -7760,30 +7816,58 @@ def operational_bias_peak_postprocess(train_y: pd.Series, pred: np.ndarray, freq
     profile = profile or {}
     season_length = infer_season_length_from_freq(freq_alias)
     seasonal_naive = _seasonal_naive_array(s, len(pred), season_length)
-    recent_k = min(max(3, len(pred)), len(s))
-    recent_mean = float(s.iloc[-recent_k:].mean()) if recent_k > 0 else float(s.mean())
-    recent_std = float(s.iloc[-min(max(6, len(pred) * 2), len(s)):].std()) if len(s) else 0.0
+    recent_window = min(max(6, len(pred) * 2), len(s))
+    recent_hist = s.iloc[-recent_window:]
+    recent_mean = float(recent_hist.mean()) if len(recent_hist) else float(s.mean())
+    recent_median = float(recent_hist.median()) if len(recent_hist) else float(s.median())
+    recent_std = float(recent_hist.std()) if len(recent_hist) else 0.0
     pred_mean = float(np.mean(pred)) if len(pred) else 0.0
-    anchor_ratio = recent_mean / max(pred_mean, 1e-6)
     trend_strength = float(profile.get("trend_strength", 0.0) or 0.0)
     seasonality = float(profile.get("seasonality_strength", 0.0) or 0.0)
     cv = float(profile.get("cv", 0.0) or 0.0)
-    if np.isfinite(anchor_ratio) and 1.03 <= anchor_ratio <= 1.18:
-        lift = 1.0 + 0.55 * (anchor_ratio - 1.0)
-        pred = pred * lift
+
     if model_name == "Prophet":
-        pred = 0.50 * pred + 0.35 * seasonal_naive + 0.15 * np.repeat(recent_mean, len(pred))
+        pred = 0.40 * pred + 0.40 * seasonal_naive + 0.20 * np.repeat(recent_mean, len(pred))
     elif model_name == "Ensemble":
-        pred = 0.75 * pred + 0.25 * seasonal_naive
+        pred = 0.70 * pred + 0.20 * seasonal_naive + 0.10 * np.repeat(recent_median, len(pred))
+    elif model_name in ["ARIMA", "SARIMA/SARIMAX"]:
+        pred = 0.85 * pred + 0.10 * seasonal_naive + 0.05 * np.repeat(recent_mean, len(pred))
     else:
         pred = 0.90 * pred + 0.10 * seasonal_naive
-    seasonal_peak = float(np.nanquantile(seasonal_naive, 0.80)) if len(seasonal_naive) else 0.0
-    if (seasonality >= 0.12 or trend_strength >= 0.10) and seasonal_peak > 0:
-        floor = 0.93 * seasonal_peak
-        pred = np.maximum(pred, np.minimum(np.repeat(floor, len(pred)), seasonal_naive * 1.08))
-    if recent_std > 0 and cv >= 0.10 and float(np.std(pred)) < 0.20 * recent_std:
-        ramp = np.linspace(-0.15, 0.15, len(pred)) * min(recent_std, recent_mean * 0.10)
-        pred = np.maximum(pred + ramp, 0.0)
+
+    anchor_ratio_mean = recent_mean / max(pred_mean, 1e-6)
+    anchor_ratio_median = recent_median / max(pred_mean, 1e-6)
+    uplift = 0.0
+    if np.isfinite(anchor_ratio_mean) and anchor_ratio_mean > 1.0:
+        uplift += min((anchor_ratio_mean - 1.0) * 0.45, 0.10)
+    if np.isfinite(anchor_ratio_median) and anchor_ratio_median > 1.0:
+        uplift += min((anchor_ratio_median - 1.0) * 0.25, 0.06)
+    if model_name in ["XGBoost", "ARIMA", "SARIMA/SARIMAX", "Ensemble"]:
+        uplift += 0.015
+    if seasonality >= 0.12 or trend_strength >= 0.10:
+        uplift += 0.01
+    if cv <= 0.35:
+        uplift += 0.01
+    uplift = min(max(uplift, 0.0), 0.16)
+    if uplift > 0:
+        pred = pred * (1.0 + uplift)
+
+    seasonal_q = float(np.nanquantile(seasonal_naive, 0.67)) if len(seasonal_naive) else 0.0
+    recent_q = float(np.nanquantile(recent_hist, 0.60)) if len(recent_hist) else recent_mean
+    service_floor = max(0.94 * seasonal_q, 0.96 * recent_q)
+    if (seasonality >= 0.10 or trend_strength >= 0.08) and service_floor > 0:
+        pred = np.maximum(pred, np.minimum(np.repeat(service_floor, len(pred)), np.maximum(seasonal_naive * 1.06, service_floor)))
+
+    if len(pred) >= 2 and len(seasonal_naive) == len(pred):
+        peak_ref = float(np.nanquantile(seasonal_naive, 0.75)) if len(seasonal_naive) else 0.0
+        peak_mask = seasonal_naive >= peak_ref if peak_ref > 0 else np.zeros(len(pred), dtype=bool)
+        if np.any(peak_mask):
+            peak_floor = np.maximum(seasonal_naive[peak_mask] * 1.08, 0.98 * np.maximum(recent_mean, recent_median))
+            pred[peak_mask] = np.maximum(pred[peak_mask], peak_floor)
+
+    if recent_std > 0 and float(np.std(pred)) < 0.18 * recent_std:
+        pred = 0.82 * pred + 0.18 * seasonal_naive
+
     return np.maximum(pred, 0.0)
 
 
@@ -7981,6 +8065,15 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
     gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame())
     interval_df = production_pack.get("production_interval_table", pd.DataFrame())
     feature_df = production_pack.get("feature_availability_audit", pd.DataFrame())
+    service_df = production_pack.get("production_service_table", pd.DataFrame())
+    fallback_flags = {
+        "XGBoost": bool((outputs.get("xgboost") or {}).get("fallback_used", False)),
+        "Prophet": bool((outputs.get("prophet") or {}).get("fallback_used", False)),
+        "SARIMA/SARIMAX": bool((outputs.get("sarima") or {}).get("fallback_used", False)),
+        "ARIMA": bool((outputs.get("arima") or {}).get("fallback_used", False)),
+        "Intermittent": bool((outputs.get("intermittent") or {}).get("fallback_used", False)),
+    }
+    fallback_rate = float(np.mean(list(fallback_flags.values()))) if fallback_flags else 0.0
     rows = []
     alerts = []
     train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
@@ -7989,19 +8082,47 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
     bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
     peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
     gate_row = gate_df.loc[gate_df["model"] == prod_model].head(1) if len(gate_df) else pd.DataFrame()
-    rows.append({"production_model": prod_model, "production_status": production_pack.get("production_status", "eligible"), "bias_pct": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan, "under_forecast_rate": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan, "peak_event_score": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan, "eligibility_score": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan, "drift_ratio_vs_recent": drift_ratio, "coverage_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan, "coverage_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan, "max_feature_risk": float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max()) if len(feature_df) else np.nan})
+    service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) else pd.DataFrame()
+    achieved_service = float(pd.to_numeric(service_row.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce")) if len(service_row) else np.nan
+    target_service = float(pd.to_numeric(service_row.iloc[0].get("service_level_target", np.nan), errors="coerce")) if len(service_row) else np.nan
+    rows.append({
+        "production_model": prod_model,
+        "production_status": production_pack.get("production_status", "eligible"),
+        "bias_pct": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
+        "under_forecast_rate": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan,
+        "peak_event_score": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan,
+        "eligibility_score": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan,
+        "drift_ratio_vs_recent": drift_ratio,
+        "coverage_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
+        "coverage_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
+        "max_feature_risk": float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max()) if len(feature_df) else np.nan,
+        "fallback_rate": fallback_rate,
+        "achieved_service": achieved_service,
+        "target_service": target_service,
+    })
     r = rows[0]
     if pd.notna(r["bias_pct"]) and abs(r["bias_pct"]) > 8.0:
         alerts.append({"severity": "high", "alert": "bias_alert", "detail": f"Bias yüksek: {r['bias_pct']:.2f}%"})
-    if pd.notna(r["under_forecast_rate"]) and r["under_forecast_rate"] > 0.65:
+    if pd.notna(r["under_forecast_rate"]) and r["under_forecast_rate"] > 0.60:
         alerts.append({"severity": "high", "alert": "under_forecast_alert", "detail": f"Under-forecast oranı yüksek: {r['under_forecast_rate']:.2f}"})
-    if pd.notna(r["peak_event_score"]) and r["peak_event_score"] < 0.20:
+    if pd.notna(r["peak_event_score"]) and r["peak_event_score"] < 0.35:
         alerts.append({"severity": "high", "alert": "peak_capture_alert", "detail": f"Peak-event yakalama zayıf: {r['peak_event_score']:.2f}"})
-    if pd.notna(r["drift_ratio_vs_recent"]) and not (0.80 <= r["drift_ratio_vs_recent"] <= 1.25):
+    if pd.notna(r["drift_ratio_vs_recent"]) and not (0.82 <= r["drift_ratio_vs_recent"] <= 1.22):
         alerts.append({"severity": "medium", "alert": "forecast_drift_alert", "detail": f"Forecast/recent seviye oranı: {r['drift_ratio_vs_recent']:.2f}"})
     if pd.notna(r["max_feature_risk"]) and r["max_feature_risk"] > 0.25:
         alerts.append({"severity": "high", "alert": "feature_contract_alert", "detail": "Production feature contract tamamen güvenli değil."})
-    return {"summary": pd.DataFrame(rows), "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"]) }
+    if pd.notna(r["achieved_service"]) and pd.notna(r["target_service"]) and r["achieved_service"] + 1e-9 < r["target_service"]:
+        alerts.append({"severity": "high", "alert": "service_level_alert", "detail": f"Servis seviyesi hedef altında: {r['achieved_service']:.2f} < {r['target_service']:.2f}"})
+    if fallback_rate > 0.20:
+        alerts.append({"severity": "medium", "alert": "fallback_rate_alert", "detail": f"Model ailelerinde fallback oranı yüksek: {fallback_rate:.2f}"})
+    recommendation = "eligible_for_guarded_production"
+    if any(a["severity"] == "high" for a in alerts):
+        recommendation = "shadow_mode_required"
+    elif alerts:
+        recommendation = "champion_challenger_parallel_run"
+    summary = pd.DataFrame(rows)
+    summary["deployment_recommendation"] = recommendation
+    return {"summary": summary, "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"])}
 
 
 def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
@@ -8028,15 +8149,28 @@ def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Di
     bias_small = bias_df[["model", "bias_pct", "under_forecast_rate"]] if len(bias_df) else pd.DataFrame(columns=["model", "bias_pct", "under_forecast_rate"])
     peak_small = peak_df[["model", "peak_event_score"]] if len(peak_df) else pd.DataFrame(columns=["model", "peak_event_score"])
     ranked = ranked.merge(bias_small, on="model", how="left").merge(peak_small, on="model", how="left")
+    service_rows = []
+    for model_name, sdf in service_tables.items():
+        if isinstance(sdf, pd.DataFrame) and len(sdf):
+            top = sdf.loc[sdf["service_level_target"] == sdf["service_level_target"].max()].head(1)
+            if len(top):
+                tgt = float(pd.to_numeric(top.iloc[0].get("service_level_target", np.nan), errors="coerce"))
+                ach = float(pd.to_numeric(top.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce"))
+                service_rows.append({"model": model_name, "service_level_target": tgt, "achieved_cycle_service": ach, "service_gap": max(tgt - ach, 0.0) if pd.notna(tgt) and pd.notna(ach) else np.nan})
+    service_df = pd.DataFrame(service_rows)
+    if len(service_df):
+        ranked = ranked.merge(service_df[["model", "service_gap", "achieved_cycle_service"]], on="model", how="left")
     status_rank = {"eligible": 0, "challenger_only": 1, "reject": 2}
     ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
-    ranked["bias_penalty"] = pd.to_numeric(ranked.get("bias_pct"), errors="coerce").abs().fillna(0.0)
-    ranked["peak_penalty"] = 1.0 - pd.to_numeric(ranked.get("peak_event_score"), errors="coerce").fillna(0.0)
-    sort_cols = ["status_rank", "WAPE", "sMAPE", "bias_penalty", "peak_penalty", "eligibility_score"]
-    asc = [True, True, True, True, True, False]
+    ranked["bias_penalty"] = pd.to_numeric(ranked.get("bias_pct"), errors="coerce").fillna(0.0).abs()
+    ranked["under_penalty"] = (pd.to_numeric(ranked.get("under_forecast_rate"), errors="coerce").fillna(0.0) - 0.50).clip(lower=0.0)
+    ranked["peak_penalty"] = (0.45 - pd.to_numeric(ranked.get("peak_event_score"), errors="coerce").fillna(0.0)).clip(lower=0.0)
+    ranked["service_penalty"] = pd.to_numeric(ranked.get("service_gap"), errors="coerce").fillna(0.0)
+    sort_cols = ["status_rank", "WAPE", "sMAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
+    asc = [True, True, True, True, True, True, True, False]
     if "ro_WAPE" in ranked.columns:
-        sort_cols = ["status_rank", "ro_WAPE", "WAPE", "sMAPE", "bias_penalty", "peak_penalty", "eligibility_score"]
-        asc = [True, True, True, True, True, True, False]
+        sort_cols = ["status_rank", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
+        asc = [True, True, True, True, True, True, True, False]
     ranked = ranked.sort_values(sort_cols, ascending=asc, na_position="last").reset_index(drop=True)
     production_model = ranked.iloc[0]["model"] if len(ranked) else outputs.get("best_model")
     production_status = ranked.iloc[0]["status"] if len(ranked) else "eligible"
