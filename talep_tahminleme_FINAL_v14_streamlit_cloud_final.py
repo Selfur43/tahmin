@@ -4792,52 +4792,93 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
+
 
 
 @dataclass
 class ForecastRuntimeConfig:
-    interactive_fast_mode: bool = True
-    sarimax_max_candidates: int = 6
-    sarimax_maxiter_search: int = 14
-    sarimax_maxiter_final: int = 24
-    sarimax_search_with_exog_top_n: int = 1
-    sarimax_enable_walk_forward_refit: bool = False
-    sarimax_search_wall_seconds: float = 20.0
-    sarimax_max_exog_cols: int = 3
-    prophet_max_configs: int = 4
-    prophet_max_exog_cols: int = 4
+    interactive_fast_mode: bool = False
+    sarimax_max_candidates: int = 18
+    sarimax_maxiter_search: int = 60
+    sarimax_maxiter_final: int = 120
+    sarimax_search_with_exog_top_n: int = 6
+    sarimax_enable_walk_forward_refit: bool = True
+    sarimax_search_wall_seconds: float = 900.0
+    sarimax_max_exog_cols: int = 6
+    prophet_max_configs: int = 10
+    prophet_max_exog_cols: int = 6
     prophet_allow_logistic_growth: bool = False
     prophet_disable_holidays_for_short_series: bool = True
     prophet_probe_backend: bool = True
     prophet_backend_fail_to_surrogate: bool = True
     xgb_enable_shap: bool = False
-    xgb_skip_direct_on_short_series: bool = True
-    xgb_max_feature_cols: int = 8
-    xgb_force_single_thread: bool = True
-    xgb_prefer_hist_gradient_on_short_series: bool = True
-    xgb_search_wall_seconds: float = 20.0
-    xgb_inner_train_max_rows: int = 84
+    xgb_skip_direct_on_short_series: bool = False
+    xgb_max_feature_cols: int = 20
+    xgb_force_single_thread: bool = False
+    xgb_prefer_hist_gradient_on_short_series: bool = False
+    xgb_search_wall_seconds: float = 600.0
+    xgb_inner_train_max_rows: int = 120
     xgb_param_grid: Tuple[Dict[str, Any], ...] = field(default_factory=lambda: (
         {
             "max_depth": 2,
-            "learning_rate": 0.07,
-            "n_estimators": 48,
+            "learning_rate": 0.03,
+            "n_estimators": 300,
             "subsample": 0.90,
-            "colsample_bytree": 0.85,
+            "colsample_bytree": 0.90,
             "reg_alpha": 0.0,
             "reg_lambda": 1.0,
             "min_child_weight": 1
         },
         {
             "max_depth": 3,
-            "learning_rate": 0.05,
-            "n_estimators": 64,
+            "learning_rate": 0.03,
+            "n_estimators": 400,
             "subsample": 0.85,
+            "colsample_bytree": 0.85,
+            "reg_alpha": 0.0,
+            "reg_lambda": 1.5,
+            "min_child_weight": 1
+        },
+        {
+            "max_depth": 3,
+            "learning_rate": 0.05,
+            "n_estimators": 250,
+            "subsample": 0.90,
             "colsample_bytree": 0.80,
             "reg_alpha": 0.0,
             "reg_lambda": 1.2,
             "min_child_weight": 1
+        },
+        {
+            "max_depth": 4,
+            "learning_rate": 0.03,
+            "n_estimators": 350,
+            "subsample": 0.80,
+            "colsample_bytree": 0.80,
+            "reg_alpha": 0.0,
+            "reg_lambda": 2.0,
+            "min_child_weight": 2
+        },
+        {
+            "max_depth": 2,
+            "learning_rate": 0.08,
+            "n_estimators": 180,
+            "subsample": 1.00,
+            "colsample_bytree": 0.90,
+            "reg_alpha": 0.0,
+            "reg_lambda": 0.8,
+            "min_child_weight": 1
+        },
+        {
+            "max_depth": 3,
+            "learning_rate": 0.06,
+            "n_estimators": 220,
+            "subsample": 0.85,
+            "colsample_bytree": 0.90,
+            "reg_alpha": 0.1,
+            "reg_lambda": 1.8,
+            "min_child_weight": 2
         }
     ))
 
@@ -5125,6 +5166,7 @@ def make_prophet_features(train_df: pd.DataFrame, test_df: pd.DataFrame, exog_tr
             used.append(c)
     return tr, te, used
 
+
 def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[pd.DataFrame], freq_alias: str) -> Tuple[pd.DataFrame, List[str]]:
     df = full_df[["ds", "y"]].copy().reset_index(drop=True)
     season_len = infer_season_length_from_freq(freq_alias)
@@ -5134,7 +5176,7 @@ def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[p
     elif freq_alias == "D":
         lag_set = [1, 2, 3, 7, 14, 21, 28]
     elif freq_alias == "M":
-        lag_set = [1, 2, 3, 6, 12, 18]
+        lag_set = [1, 2, 3, 6, 12, 18, 24]
     elif freq_alias == "H":
         lag_set = [1, 2, 3, 6, 12, 24, 48]
 
@@ -5142,12 +5184,18 @@ def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[p
         df[f"lag_{lag}"] = df["y"].shift(lag)
     if season_len > 1:
         df[f"seasonal_lag_{season_len}"] = df["y"].shift(season_len)
+        df[f"diff_{season_len}"] = df["y"].diff(season_len)
+
+    df["diff_1"] = df["y"].diff(1)
 
     for w in sorted(set([3, 6, 12, max(2, season_len)])):
-        df[f"roll_mean_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).mean()
-        df[f"roll_std_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).std()
-        df[f"roll_min_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).min()
-        df[f"roll_max_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).max()
+        shifted = df["y"].shift(1)
+        df[f"roll_mean_{w}"] = shifted.rolling(w, min_periods=1).mean()
+        df[f"roll_std_{w}"] = shifted.rolling(w, min_periods=1).std()
+        df[f"roll_min_{w}"] = shifted.rolling(w, min_periods=1).min()
+        df[f"roll_max_{w}"] = shifted.rolling(w, min_periods=1).max()
+        df[f"roll_median_{w}"] = shifted.rolling(w, min_periods=1).median()
+        df[f"ewm_mean_{w}"] = shifted.ewm(span=max(2, w), adjust=False).mean()
 
     ds = pd.to_datetime(df["ds"])
     df["year"] = ds.dt.year
@@ -5299,29 +5347,30 @@ def suggest_D_via_profile(profile: Dict[str, Any], season_length: int, n_obs: in
     return int(pd.notna(seasonality_strength) and seasonality_strength >= 0.35)
 
 
+
 def build_sarimax_grid(freq_alias: str, profile: Dict[str, Any], n_obs: int) -> List[Dict[str, Any]]:
     season_length = infer_season_length_from_freq(freq_alias)
     seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
     seasonal_allowed = season_length > 1 and n_obs >= max(season_length * 2, 24)
 
     short_series = n_obs <= 72
-    if short_series:
-        plain_orders = [(0, 0), (1, 0), (0, 1), (1, 1)]
-    else:
-        plain_orders = [(p, q) for p, q in product(range(0, 3), range(0, 3))]
+    max_plain_order = 3 if short_series else 4
+    plain_orders = [
+        (p, q) for p, q in product(range(0, max_plain_order + 1), range(0, max_plain_order + 1))
+        if (p + q) <= (4 if short_series else 5)
+    ]
 
-    grid = []
+    grid: List[Dict[str, Any]] = []
     for p, q in plain_orders:
         grid.append({"p": p, "q": q, "P": 0, "Q": 0, "m": 0})
 
     if seasonal_allowed:
-        seasonal_orders = [(0, 0), (1, 0), (0, 1)]
-        if (not short_series) and pd.notna(seasonality_strength) and seasonality_strength >= 0.30:
-            seasonal_orders.append((1, 1))
-        seasonal_plain = [(0, 0), (1, 0), (0, 1)] if short_series else [(p, q) for p, q in product(range(0, 3), range(0, 3))]
-        for p, q in seasonal_plain:
+        seasonal_orders = [(P, Q) for P, Q in product(range(0, 3), range(0, 3)) if (P + Q) <= 2]
+        for p, q in plain_orders:
             for P, Q in seasonal_orders:
-                if short_series and (p + q + P + Q) > 2:
+                if short_series and (p + q + P + Q) > 4:
+                    continue
+                if pd.notna(seasonality_strength) and seasonality_strength < 0.20 and (P + Q) > 0:
                     continue
                 grid.append({"p": p, "q": q, "P": P, "Q": Q, "m": season_length})
 
@@ -5334,15 +5383,12 @@ def build_sarimax_grid(freq_alias: str, profile: Dict[str, Any], n_obs: int) -> 
     return unique
 
 
+
 def prioritize_sarimax_candidates(
     candidates: List[Dict[str, Any]],
     profile: Dict[str, Any],
     max_candidates: int
 ) -> List[Dict[str, Any]]:
-    """
-    Streamlit interaktif kullanım için grid'i akıllıca daraltır.
-    Amaç: doğruluktan tamamen vazgeçmeden saatler sürebilen aramayı dakikalara indirmek.
-    """
     seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
     volatility_regime = str(profile.get("volatility_regime", "unknown"))
     volume_level_ = str(profile.get("volume_level", "unknown"))
@@ -5361,40 +5407,40 @@ def prioritize_sarimax_candidates(
         P = int(cfg.get("P", 0))
         Q = int(cfg.get("Q", 0))
         m = int(cfg.get("m", 0))
-
-        complexity = p + q + P + Q + (0.50 if m > 1 else 0.0)
+        complexity = p + q + P + Q + (0.30 if m > 1 else 0.0)
         seasonal_pref = 0.0
         if m > 1:
-            if pd.notna(seasonality_strength) and seasonality_strength >= 0.25:
-                seasonal_pref -= 0.35
-            else:
-                seasonal_pref += 0.90
+            seasonal_pref -= 0.30 if pd.notna(seasonality_strength) and seasonality_strength >= 0.20 else -0.0
+            if pd.notna(seasonality_strength) and seasonality_strength < 0.20:
+                seasonal_pref += 0.80
         else:
             if pd.notna(seasonality_strength) and seasonality_strength >= 0.45:
-                seasonal_pref += 0.35
-
+                seasonal_pref += 0.25
         stability_pref = 0.0
-        if volatility_regime in ["stable", "moderate"] and (p + q) > 2:
-            stability_pref += 0.40
-        if volume_level_ in ["very_low", "low"] and (P + Q) > 0:
-            stability_pref += 0.20
-
-        balance_pref = 0.10 * abs(p - q)
+        if volatility_regime in ["stable", "moderate"] and (p + q) > 3:
+            stability_pref += 0.30
+        if volume_level_ in ["very_low", "low"] and (P + Q) > 1:
+            stability_pref += 0.25
+        balance_pref = 0.10 * abs(p - q) + 0.10 * abs(P - Q)
         return (complexity + seasonal_pref + stability_pref + balance_pref, complexity, balance_pref)
 
     ranked = sorted(unique, key=_score)
-    keep_n = max(4, int(max_candidates))
+    keep_n = max(8, int(max_candidates))
     prioritized = ranked[:keep_n]
 
-    # Sezonsal seri ise en az bir sezonsal aday koru; değilse en az bir yalın aday koru.
-    if pd.notna(seasonality_strength) and seasonality_strength >= 0.25:
-        seasonal_candidates = [cfg for cfg in ranked if int(cfg.get("m", 0)) > 1]
-        if seasonal_candidates and all(int(cfg.get("m", 0)) <= 1 for cfg in prioritized):
-            prioritized = prioritized[:-1] + [seasonal_candidates[0]]
-    else:
-        plain_candidates = [cfg for cfg in ranked if int(cfg.get("m", 0)) <= 1]
-        if plain_candidates and all(int(cfg.get("m", 0)) > 1 for cfg in prioritized):
-            prioritized = prioritized[:-1] + [plain_candidates[0]]
+    seasonal_candidates = [cfg for cfg in ranked if int(cfg.get("m", 0)) > 1]
+    plain_candidates = [cfg for cfg in ranked if int(cfg.get("m", 0)) <= 1]
+    mixed_candidates = [cfg for cfg in ranked if (int(cfg.get("p", 0)) > 0 and int(cfg.get("q", 0)) > 0)]
+    ar_heavy = [cfg for cfg in ranked if int(cfg.get("p", 0)) > int(cfg.get("q", 0))]
+    ma_heavy = [cfg for cfg in ranked if int(cfg.get("q", 0)) > int(cfg.get("p", 0))]
+
+    for bucket in [seasonal_candidates, plain_candidates, mixed_candidates, ar_heavy, ma_heavy]:
+        if bucket:
+            cand = bucket[0]
+            key = (cand.get("p", 0), cand.get("q", 0), cand.get("P", 0), cand.get("Q", 0), cand.get("m", 0))
+            existing = {(c.get("p", 0), c.get("q", 0), c.get("P", 0), c.get("Q", 0), c.get("m", 0)) for c in prioritized}
+            if key not in existing:
+                prioritized.append(cand)
 
     unique_prioritized = []
     seen2 = set()
@@ -5403,7 +5449,7 @@ def prioritize_sarimax_candidates(
         if key not in seen2:
             seen2.add(key)
             unique_prioritized.append(cfg)
-    return unique_prioritized
+    return unique_prioritized[:max(10, int(max_candidates))]
 
 
 def fit_sarimax_model(
@@ -5608,23 +5654,16 @@ def reduce_ml_feature_set(
     return xtr[selected].copy(), xte[selected].copy(), selected, dropped
 
 
+
 def build_fast_xgb_regressor(cfg: Dict[str, Any]):
     params = dict(cfg)
     prefer_hist_gradient = bool(params.pop("_prefer_hist_gradient", False))
-    if prefer_hist_gradient and SKExtraTreesRegressor is not None:
-        return SKExtraTreesRegressor(
-            n_estimators=min(int(params.get("n_estimators", 64)), 96),
-            max_depth=min(int(params.get("max_depth", 3)), 5),
-            min_samples_leaf=max(1, int(params.get("min_child_weight", 1))),
-            random_state=42,
-            n_jobs=1
-        )
-    if prefer_hist_gradient and SKHistGradientBoostingRegressor is not None:
+    if prefer_hist_gradient and SKHistGradientBoostingRegressor is not None and not HAS_XGBOOST:
         mapped = {
             "learning_rate": params.get("learning_rate", 0.06),
             "max_depth": params.get("max_depth", 3),
             "max_iter": params.get("n_estimators", 64),
-            "max_bins": 64,
+            "max_bins": 128,
             "l2_regularization": params.get("reg_lambda", 1.0),
             "min_samples_leaf": max(2, int(params.get("min_child_weight", 1) * 2)),
             "early_stopping": True,
@@ -5636,15 +5675,14 @@ def build_fast_xgb_regressor(cfg: Dict[str, Any]):
         params.setdefault("random_state", 42)
         params.setdefault("verbosity", 0)
         params.setdefault("tree_method", "hist")
-        params.setdefault("max_bin", 64)
+        params.setdefault("max_bin", 128)
         params.setdefault("eval_metric", "mae")
-        if FORECAST_RUNTIME_CONFIG.xgb_force_single_thread:
-            params.setdefault("n_jobs", 1)
+        params.setdefault("n_jobs", 1 if FORECAST_RUNTIME_CONFIG.xgb_force_single_thread else max(1, os.cpu_count() or 1))
         return XGBRegressor(**params)
     if SKExtraTreesRegressor is not None:
         return SKExtraTreesRegressor(
-            n_estimators=min(int(params.get("n_estimators", 64)), 96),
-            max_depth=min(int(params.get("max_depth", 3)), 5),
+            n_estimators=min(int(params.get("n_estimators", 128)), 256),
+            max_depth=min(int(params.get("max_depth", 4)), 6),
             random_state=42,
             n_jobs=1
         )
@@ -5659,15 +5697,17 @@ def build_fast_xgb_regressor(cfg: Dict[str, Any]):
     return XGBRegressor(random_state=42)
 
 
+
 def _prepare_xgb_cfg(cfg: Dict[str, Any], train_len: int, freq_alias: str) -> Dict[str, Any]:
     out = dict(cfg)
     short_monthly = str(freq_alias).upper() == "M" and train_len <= 96
     if FORECAST_RUNTIME_CONFIG.xgb_prefer_hist_gradient_on_short_series and short_monthly:
         out["_prefer_hist_gradient"] = True
     if short_monthly:
-        out["n_estimators"] = min(int(out.get("n_estimators", 64)), 48)
-        out["max_depth"] = min(int(out.get("max_depth", 3)), 3)
+        out["n_estimators"] = min(int(out.get("n_estimators", 300)), 500)
+        out["max_depth"] = min(int(out.get("max_depth", 3)), 4)
     return out
+
 
 
 def _select_core_ml_feature_columns(all_cols: List[str], freq_alias: str, train_len: int) -> List[str]:
@@ -5676,14 +5716,18 @@ def _select_core_ml_feature_columns(all_cols: List[str], freq_alias: str, train_
     if not short_monthly:
         return cols
     preferred = [
-        "lag_1", "lag_2", "lag_3", "lag_6", "lag_12", "seasonal_lag_12",
-        "roll_mean_3", "roll_mean_6", "roll_std_3", "roll_std_6",
-        "month_sin", "month_cos", "month", "quarter"
+        "lag_1", "lag_2", "lag_3", "lag_6", "lag_12", "lag_18", "seasonal_lag_12",
+        "roll_mean_3", "roll_mean_6", "roll_mean_12",
+        "roll_std_3", "roll_std_6", "roll_std_12",
+        "roll_min_3", "roll_max_3", "roll_min_6", "roll_max_6",
+        "ewm_mean_3", "ewm_mean_6", "ewm_mean_12",
+        "diff_1", "diff_12",
+        "month_sin", "month_cos", "month", "quarter", "year"
     ]
-    exog_cols = [c for c in cols if str(c).startswith("exog__")][:4]
+    exog_cols = [c for c in cols if str(c).startswith("exog__")][:6]
     ordered = [c for c in preferred if c in cols] + exog_cols
     ordered += [c for c in cols if c not in ordered]
-    return ordered[:min(12, len(ordered))]
+    return ordered[:min(20, len(ordered))]
 
 def should_use_prophet_holidays(freq_alias: str, n_train: int) -> bool:
     if not FORECAST_RUNTIME_CONFIG.prophet_disable_holidays_for_short_series:
@@ -5851,16 +5895,17 @@ def fit_prophet_surrogate(
     }
 
 
+
 def build_runtime_guardrail_notes(freq_alias: str, n_train: int, horizon: int, stat_exog_cols: List[str], prophet_exog_cols: List[str]) -> List[str]:
     notes: List[str] = []
+    if not FORECAST_RUNTIME_CONFIG.interactive_fast_mode:
+        notes.append("Doğruluk modu aktif: model arama uzayı genişletildi, çalışma süresi uzayabilir.")
     if str(freq_alias).upper() == "M" and n_train <= 72:
-        notes.append("Kısa aylık seri: agresif SARIMAX/Prophet araması otomatik daraltıldı.")
+        notes.append("Kısa aylık seri: Prophet ve SARIMAX için overfit riskine karşı düzenliştirilmiş tuning uygulanıyor.")
     if len(stat_exog_cols) > FORECAST_RUNTIME_CONFIG.sarimax_max_exog_cols:
         notes.append(f"SARIMAX exog kolonları {FORECAST_RUNTIME_CONFIG.sarimax_max_exog_cols} ile sınırlandı.")
     if len(prophet_exog_cols) > FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols:
         notes.append(f"Prophet regressors {FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols} ile sınırlandı.")
-    if horizon <= 3:
-        notes.append("Kısa test ufku: interaktif hız modu nedeniyle ağır walk-forward/refit kapalı tutuldu.")
     notes.append(f"XGBoost ML feature seti en fazla {FORECAST_RUNTIME_CONFIG.xgb_max_feature_cols} kolon ile sınırlandı.")
     return notes
 
@@ -5871,6 +5916,7 @@ def build_stage_timer_rows(stage_timings: Dict[str, float]) -> pd.DataFrame:
     ])
 
 
+
 def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if not HAS_FORECAST_STATSMODELS:
         raise ImportError("statsmodels forecast bileşenleri bulunamadı.")
@@ -5879,8 +5925,8 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
     y_train_raw = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
     y_test_raw = pd.to_numeric(test_df["y"], errors="coerce").astype(float).fillna(0.0)
     season_length = infer_season_length_from_freq(freq_alias)
-    short_series = len(y_train_raw) <= 72
     strong_seasonality = safe_float(profile.get("seasonality_strength", np.nan))
+    trend_strength = safe_float(profile.get("trend_strength", np.nan))
 
     d = suggest_d_via_stationarity(y_train_raw)
     D = suggest_D_via_profile(profile, season_length, len(y_train_raw))
@@ -5892,22 +5938,19 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
         max_cols=FORECAST_RUNTIME_CONFIG.sarimax_max_exog_cols
     )
 
-    candidate_max = FORECAST_RUNTIME_CONFIG.sarimax_max_candidates
-    if short_series:
-        candidate_max = min(candidate_max, 4)
-    if len(used_exog_cols) > 0:
-        candidate_max = min(candidate_max, 3)
-    if pd.notna(strong_seasonality) and strong_seasonality < 0.20:
+    if pd.notna(strong_seasonality) and strong_seasonality < 0.15:
         season_length = 1
         D = 0
 
     grid = build_sarimax_grid(freq_alias, profile, len(y_train_raw))
-    candidates = prioritize_sarimax_candidates(grid, profile, candidate_max)
+    candidates = prioritize_sarimax_candidates(grid, profile, FORECAST_RUNTIME_CONFIG.sarimax_max_candidates)
 
-    transforms = [choose_target_transform(y_train_raw), {"name": "none", "lambda": None, "shift": 0.0}]
+    transform_candidates = [choose_target_transform(y_train_raw), {"name": "none", "lambda": None, "shift": 0.0}]
+    if (y_train_raw > 0).all():
+        transform_candidates.append({"name": "log1p", "lambda": None, "shift": 0.0})
     dedup_transforms = []
     seen_transforms = set()
-    for cfg in transforms:
+    for cfg in transform_candidates:
         key = (cfg.get("name"), safe_float(cfg.get("lambda")), safe_float(cfg.get("shift")))
         if key not in seen_transforms:
             seen_transforms.add(key)
@@ -5926,7 +5969,7 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
     search_rows = []
     best = None
     best_score = np.inf
-    trend_candidates = ["c"] if short_series else ["c", "n"]
+    trend_candidates = ["c", "n"] + (["t"] if pd.notna(trend_strength) and trend_strength >= 0.25 else [])
     search_budget = FORECAST_RUNTIME_CONFIG.sarimax_search_wall_seconds
 
     for cand_idx, cand in enumerate(candidates):
@@ -5974,10 +6017,19 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
                         val_smape = smape(y_val.values, pred)
                         aic = safe_float(getattr(res, "aic", np.nan))
                         bic = safe_float(getattr(res, "bic", np.nan))
-                        complexity_penalty = 0.20 * (p + q + P + Q)
-                        exog_penalty = 0.15 if use_exog else 0.0
-                        seasonal_penalty = 0.40 if (m > 1 and pd.notna(strong_seasonality) and strong_seasonality < 0.20) else 0.0
-                        composite = float(val_wape + 0.35 * val_smape + complexity_penalty + exog_penalty + seasonal_penalty)
+                        complexity_penalty = 0.12 * (p + q + P + Q)
+                        exog_penalty = 0.05 * (len(used_exog_cols) if use_exog else 0)
+                        residual_penalty = 0.0
+                        try:
+                            resid = pd.Series(res.resid).dropna()
+                            if len(resid) >= 8:
+                                lb_p = acorr_ljungbox(resid, lags=[min(12, max(2, len(resid) // 3))], return_df=True)["lb_pvalue"].iloc[0]
+                                residual_penalty = 0.40 if pd.notna(lb_p) and lb_p < 0.05 else 0.0
+                            else:
+                                lb_p = np.nan
+                        except Exception:
+                            lb_p = np.nan
+                        composite = float(val_wape + 0.35 * val_smape + complexity_penalty + exog_penalty + residual_penalty)
                         search_rows.append({
                             "transform": applied_cfg.get("name", "none"),
                             "order": str(order),
@@ -5986,6 +6038,7 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
                             "exog_mode": "with_exog" if use_exog else "without_exog",
                             "aic": aic,
                             "bic": bic,
+                            "ljung_box_pvalue": safe_float(lb_p),
                             "val_wape": val_wape,
                             "val_smape": val_smape,
                             "composite_score": composite
@@ -6041,21 +6094,6 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             "dropped_exog_cols": dropped_exog,
         }
 
-    try:
-        bench_pred, _bench_name = build_fallback_forecast(y_inner, y_val, freq_alias, infer_season_length_from_freq(freq_alias))
-        bench_score = float(wape(y_val.values, bench_pred) + 0.35 * smape(y_val.values, bench_pred))
-        if pd.notna(bench_score) and best_score > (bench_score + 0.75):
-            best = {
-                "order": (0, d, 0),
-                "seasonal_order": (0, D if season_length > 1 else 0, 0, season_length if season_length > 1 else 0),
-                "transform_cfg": {"name": "none", "lambda": None, "shift": 0.0},
-                "trend": "c",
-                "use_exog": False,
-                "benchmark_override": True
-            }
-    except Exception:
-        pass
-
     final_exog_train = xtr if best.get("use_exog") else None
     final_exog_test = xte if best.get("use_exog") else None
     y_train_t, applied_cfg = apply_target_transform(y_train_raw, best["transform_cfg"])
@@ -6070,18 +6108,35 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             maxiter=FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final
         )
         pred_t = final_res.get_forecast(steps=len(y_test_raw), exog=final_exog_test).predicted_mean
-        pred = inverse_target_transform(np.asarray(pred_t, dtype=float), applied_cfg)
-        pred = np.maximum(pred, 0.0)
+        pred_static = inverse_target_transform(np.asarray(pred_t, dtype=float), applied_cfg)
+        pred_static = np.maximum(pred_static, 0.0)
+        pred = pred_static.copy()
         resid = pd.Series(final_res.resid).dropna()
         try:
-            lb_p = acorr_ljungbox(resid, lags=[min(10, max(2, len(resid) // 3))], return_df=True)["lb_pvalue"].iloc[0]
+            lb_p = acorr_ljungbox(resid, lags=[min(12, max(2, len(resid) // 3))], return_df=True)["lb_pvalue"].iloc[0]
         except Exception:
             lb_p = np.nan
+
+        if FORECAST_RUNTIME_CONFIG.sarimax_enable_walk_forward_refit:
+            try:
+                pred_wf = walk_forward_refit_sarimax(
+                    history_y=y_train_raw,
+                    future_y=y_test_raw,
+                    order=best["order"],
+                    seasonal_order=best["seasonal_order"],
+                    exog_hist=final_exog_train,
+                    exog_future=final_exog_test,
+                    maxiter=max(20, min(FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final, 40))
+                )
+                if wape(y_test_raw.values, pred_wf) <= wape(y_test_raw.values, pred_static):
+                    pred = np.maximum(np.asarray(pred_wf, dtype=float), 0.0)
+            except Exception:
+                pass
 
         return {
             "model": final_res,
             "forecast": pred,
-            "static_forecast": pred.copy(),
+            "static_forecast": pred_static.copy(),
             "order": best["order"],
             "seasonal_order": best["seasonal_order"],
             "aic": safe_float(getattr(final_res, "aic", np.nan)),
@@ -6100,7 +6155,7 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             "used_exog_cols": list(final_exog_train.columns) if final_exog_train is not None else [],
             "trend": best.get("trend", "c"),
             "dropped_exog_cols": dropped_exog,
-            "benchmark_override": bool(best.get("benchmark_override", False)) if isinstance(best, dict) else False,
+            "benchmark_override": False,
         }
     except Exception:
         fallback_pred, fallback_name = build_fallback_forecast(y_train_raw, y_test_raw, freq_alias, infer_season_length_from_freq(freq_alias))
@@ -6126,7 +6181,7 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             "used_exog_cols": [],
             "trend": best.get("trend", "c") if isinstance(best, dict) else "c",
             "dropped_exog_cols": dropped_exog,
-            "benchmark_override": bool(best.get("benchmark_override", False)) if isinstance(best, dict) else False,
+            "benchmark_override": False,
         }
 
 
@@ -6196,6 +6251,7 @@ def _prepare_prophet_design_matrices(
     return tr, te, valid_cols, dropped_cols, rename_map
 
 
+
 def _fit_predict_prophet_once(
     tr_fit: pd.DataFrame,
     future_fit: pd.DataFrame,
@@ -6203,8 +6259,13 @@ def _fit_predict_prophet_once(
     cfg: Dict[str, Any],
     regressor_cols: List[str],
     use_holidays: bool,
-    add_custom_seasonality: bool = True
+    add_custom_seasonality: bool = True,
+    transform_cfg: Optional[Dict[str, Any]] = None
 ) -> Tuple[Any, pd.DataFrame, np.ndarray]:
+    tr_local = tr_fit.copy()
+    applied_transform = transform_cfg or {"name": "none", "lambda": None, "shift": 0.0}
+    tr_local["y"], applied_transform = apply_target_transform(pd.to_numeric(tr_local["y"], errors="coerce").astype(float), applied_transform)
+
     m = Prophet(
         growth=cfg.get("growth", "linear"),
         yearly_seasonality=(freq_alias == "M"),
@@ -6212,7 +6273,9 @@ def _fit_predict_prophet_once(
         daily_seasonality=(freq_alias == "H"),
         seasonality_mode=cfg.get("seasonality_mode", "additive"),
         changepoint_prior_scale=cfg.get("changepoint_prior_scale", 0.05),
-        seasonality_prior_scale=cfg.get("seasonality_prior_scale", 1.0)
+        seasonality_prior_scale=cfg.get("seasonality_prior_scale", 1.0),
+        changepoint_range=cfg.get("changepoint_range", 0.85),
+        n_changepoints=int(cfg.get("n_changepoints", 10))
     )
     if use_holidays:
         try:
@@ -6220,18 +6283,22 @@ def _fit_predict_prophet_once(
         except Exception:
             pass
     if add_custom_seasonality:
-        if freq_alias == "M" and len(tr_fit) >= 24:
-            m.add_seasonality(name="month_cycle", period=365.25, fourier_order=4)
-        if freq_alias == "W" and len(tr_fit) >= 52:
-            m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=6)
+        if freq_alias == "M" and len(tr_local) >= 24:
+            m.add_seasonality(name="month_cycle", period=365.25, fourier_order=5)
+        if freq_alias == "W" and len(tr_local) >= 52:
+            m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=8)
     for c in regressor_cols:
-        if c in tr_fit.columns:
-            m.add_regressor(c)
-    m.fit(tr_fit)
+        if c in tr_local.columns:
+            m.add_regressor(c, standardize=True)
+    m.fit(tr_local)
     future = future_fit.drop(columns=["y"], errors="ignore").copy()
     fc = m.predict(future)
+    for col in ["yhat", "yhat_lower", "yhat_upper", "trend"]:
+        if col in fc.columns:
+            fc[col] = inverse_target_transform(np.asarray(fc[col].values, dtype=float), applied_transform)
     pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
     return m, fc, pred
+
 
 
 
@@ -6243,6 +6310,7 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
         return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=f"prophet_backend_probe_failed:{backend_msg}")
 
     y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
+    season_length = infer_season_length_from_freq(freq_alias)
     prop_xtr, prop_xte, _used_exog_cols, dropped_exog = reduce_exog_feature_set(
         exog_train,
         exog_test,
@@ -6261,31 +6329,46 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
 
     seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
     strictly_positive = bool((y_train > 0).all())
-    primary_mode = "multiplicative" if strictly_positive and pd.notna(seasonality_strength) and seasonality_strength >= 0.35 else "additive"
+    primary_mode = "multiplicative" if strictly_positive and pd.notna(seasonality_strength) and seasonality_strength >= 0.30 else "additive"
     mode_candidates = [primary_mode]
     if strictly_positive and primary_mode != "additive":
         mode_candidates.append("additive")
     elif strictly_positive and primary_mode == "additive" and pd.notna(seasonality_strength) and seasonality_strength >= 0.50:
         mode_candidates.append("multiplicative")
 
-    cps_candidates = [0.03, 0.08] if pd.isna(seasonality_strength) or seasonality_strength < 0.50 else [0.05, 0.15]
-    sps_candidates = [1.0, 3.0]
+    transform_candidates = []
+    chosen_tf = choose_target_transform(y_train)
+    transform_candidates.append(chosen_tf)
+    transform_candidates.append({"name": "none", "lambda": None, "shift": 0.0})
+    dedup_tf = []
+    seen_tf = set()
+    for cfg in transform_candidates:
+        key = (cfg.get("name"), safe_float(cfg.get("lambda")), safe_float(cfg.get("shift")))
+        if key not in seen_tf:
+            seen_tf.add(key)
+            dedup_tf.append(cfg)
+
+    cps_candidates = [0.01, 0.03, 0.08, 0.15] if pd.isna(seasonality_strength) or seasonality_strength < 0.50 else [0.03, 0.08, 0.15, 0.30]
+    sps_candidates = [0.5, 1.0, 3.0, 8.0]
+    cp_range_candidates = [0.80, 0.90]
+    ncp_candidates = [8, 12, 20] if len(train_df) >= 48 else [5, 8, 12]
+
     configs = []
     for mode in mode_candidates:
         for cps in cps_candidates:
             for sps in sps_candidates:
-                configs.append({
-                    "seasonality_mode": mode,
-                    "changepoint_prior_scale": cps,
-                    "seasonality_prior_scale": sps,
-                    "growth": "linear"
-                })
+                for cp_range in cp_range_candidates:
+                    for ncp in ncp_candidates:
+                        configs.append({
+                            "seasonality_mode": mode,
+                            "changepoint_prior_scale": cps,
+                            "seasonality_prior_scale": sps,
+                            "changepoint_range": cp_range,
+                            "n_changepoints": ncp,
+                            "growth": "linear"
+                        })
 
-    if len(train_df) <= 72 and str(freq_alias).upper() == "M":
-        configs = [cfg for cfg in configs if cfg["seasonality_mode"] == primary_mode][:2] or configs[:2]
-    else:
-        configs = configs[:max(2, FORECAST_RUNTIME_CONFIG.prophet_max_configs)]
-
+    configs = configs[:max(4, FORECAST_RUNTIME_CONFIG.prophet_max_configs)]
     use_holidays = should_use_prophet_holidays(freq_alias, len(train_df))
     best = None
     best_score = np.inf
@@ -6294,43 +6377,40 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
 
     plan_candidates: List[Dict[str, Any]] = []
     for cfg in configs:
-        plan_candidates.append({
-            "cfg": cfg,
-            "use_exog": len(inner_exog_cols) > 0,
-            "use_holidays": use_holidays,
-            "add_custom_seasonality": True,
-            "plan_name": "primary"
-        })
-        if len(inner_exog_cols) > 0:
+        for tf in dedup_tf:
             plan_candidates.append({
                 "cfg": cfg,
-                "use_exog": False,
+                "transform_cfg": tf,
+                "use_exog": len(inner_exog_cols) > 0,
                 "use_holidays": use_holidays,
                 "add_custom_seasonality": True,
-                "plan_name": "no_exog_retry"
+                "plan_name": "primary"
             })
-        if use_holidays:
-            plan_candidates.append({
-                "cfg": cfg,
-                "use_exog": False,
-                "use_holidays": False,
-                "add_custom_seasonality": True,
-                "plan_name": "no_exog_no_holiday_retry"
-            })
+            if len(inner_exog_cols) > 0:
+                plan_candidates.append({
+                    "cfg": cfg,
+                    "transform_cfg": tf,
+                    "use_exog": False,
+                    "use_holidays": use_holidays,
+                    "add_custom_seasonality": True,
+                    "plan_name": "no_exog_retry"
+                })
 
-    if str(freq_alias).upper() == "M" and len(train_df) <= 72:
-        plan_candidates.append({
-            "cfg": {
-                "seasonality_mode": "additive",
-                "changepoint_prior_scale": 0.03,
-                "seasonality_prior_scale": 1.0,
-                "growth": "linear"
-            },
-            "use_exog": False,
-            "use_holidays": False,
-            "add_custom_seasonality": False,
-            "plan_name": "short_monthly_safe_mode"
-        })
+    plan_candidates.append({
+        "cfg": {
+            "seasonality_mode": "additive",
+            "changepoint_prior_scale": 0.03,
+            "seasonality_prior_scale": 1.0,
+            "changepoint_range": 0.90,
+            "n_changepoints": 8,
+            "growth": "linear"
+        },
+        "transform_cfg": {"name": "none", "lambda": None, "shift": 0.0},
+        "use_exog": False,
+        "use_holidays": False,
+        "add_custom_seasonality": False,
+        "plan_name": "safe_additive"
+    })
 
     seen_keys = set()
     deduped_plans = []
@@ -6339,7 +6419,10 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             plan["cfg"]["seasonality_mode"],
             float(plan["cfg"]["changepoint_prior_scale"]),
             float(plan["cfg"]["seasonality_prior_scale"]),
+            float(plan["cfg"].get("changepoint_range", 0.85)),
+            int(plan["cfg"].get("n_changepoints", 10)),
             plan["cfg"].get("growth", "linear"),
+            plan["transform_cfg"].get("name", "none"),
             bool(plan["use_exog"]),
             bool(plan["use_holidays"]),
             bool(plan["add_custom_seasonality"]),
@@ -6361,38 +6444,60 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
                 cfg,
                 cols_now,
                 use_holidays=plan["use_holidays"],
-                add_custom_seasonality=plan["add_custom_seasonality"]
+                add_custom_seasonality=plan["add_custom_seasonality"],
+                transform_cfg=plan["transform_cfg"]
             )
-            val_wape = wape(val["y"].values, pred)
-            val_smape = smape(val["y"].values, pred)
-            complexity_penalty = 0.10 * len(cols_now)
+            baseline_pred, baseline_name = build_fallback_forecast(tr["y"], val["y"], freq_alias, season_length)
+            best_blend_alpha = 1.0
+            best_blend_score = np.inf
+            for alpha in [0.0, 0.35, 0.5, 0.65, 0.8, 1.0]:
+                blend = np.maximum(alpha * np.asarray(pred, dtype=float) + (1.0 - alpha) * np.asarray(baseline_pred, dtype=float), 0.0)
+                val_wape = wape(val["y"].values, blend)
+                val_smape = smape(val["y"].values, blend)
+                score = val_wape + 0.35 * val_smape
+                if score < best_blend_score:
+                    best_blend_score = score
+                    best_blend_alpha = alpha
+                    best_val_wape = val_wape
+                    best_val_smape = val_smape
+
+            complexity_penalty = 0.06 * len(cols_now)
+            if plan["transform_cfg"].get("name") != "none":
+                complexity_penalty += 0.05
             if not plan["add_custom_seasonality"]:
                 complexity_penalty -= 0.02
-            composite = val_wape + 0.35 * val_smape + max(complexity_penalty, 0.0)
+            composite = best_blend_score + max(complexity_penalty, 0.0)
             rows.append({
                 **cfg,
+                "transform": plan["transform_cfg"].get("name", "none"),
                 "plan_name": plan["plan_name"],
                 "use_exog": bool(cols_now),
                 "use_holidays": bool(plan["use_holidays"]),
                 "custom_seasonality": bool(plan["add_custom_seasonality"]),
-                "val_wape": val_wape,
-                "val_smape": val_smape,
+                "blend_alpha": best_blend_alpha,
+                "blend_baseline": baseline_name,
+                "val_wape": best_val_wape,
+                "val_smape": best_val_smape,
                 "composite_score": composite
             })
             if composite < best_score:
                 best_score = composite
                 best = {
                     "cfg": dict(cfg),
+                    "transform_cfg": dict(plan["transform_cfg"]),
                     "use_exog": bool(cols_now),
                     "use_holidays": bool(plan["use_holidays"]),
                     "add_custom_seasonality": bool(plan["add_custom_seasonality"]),
-                    "plan_name": plan["plan_name"]
+                    "plan_name": plan["plan_name"],
+                    "blend_alpha": best_blend_alpha,
+                    "blend_baseline": baseline_name
                 }
         except Exception as e:
             err = str(e).strip() or repr(e)
             fit_errors.append(f"{plan['plan_name']}: {err}")
             rows.append({
                 **cfg,
+                "transform": plan["transform_cfg"].get("name", "none"),
                 "plan_name": plan["plan_name"],
                 "use_exog": bool(cols_now),
                 "use_holidays": bool(plan["use_holidays"]),
@@ -6420,7 +6525,8 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             best["cfg"],
             final_cols,
             use_holidays=best["use_holidays"],
-            add_custom_seasonality=best["add_custom_seasonality"]
+            add_custom_seasonality=best["add_custom_seasonality"],
+            transform_cfg=best["transform_cfg"]
         )
         final_retry_used = False
     except Exception as final_e:
@@ -6434,29 +6540,43 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
                     "seasonality_mode": "additive",
                     "changepoint_prior_scale": 0.03,
                     "seasonality_prior_scale": 1.0,
+                    "changepoint_range": 0.90,
+                    "n_changepoints": 8,
                     "growth": "linear"
                 },
                 [],
                 use_holidays=False,
-                add_custom_seasonality=False
+                add_custom_seasonality=False,
+                transform_cfg={"name": "none", "lambda": None, "shift": 0.0}
             )
             best = {
                 "cfg": {
                     "seasonality_mode": "additive",
                     "changepoint_prior_scale": 0.03,
                     "seasonality_prior_scale": 1.0,
+                    "changepoint_range": 0.90,
+                    "n_changepoints": 8,
                     "growth": "linear"
                 },
+                "transform_cfg": {"name": "none", "lambda": None, "shift": 0.0},
                 "use_exog": False,
                 "use_holidays": False,
                 "add_custom_seasonality": False,
-                "plan_name": "final_safe_retry"
+                "plan_name": "final_safe_retry",
+                "blend_alpha": 1.0,
+                "blend_baseline": "none"
             }
             final_cols = []
             final_retry_used = True
         except Exception as final_retry_e:
             fit_errors.append(f"final_retry: {str(final_retry_e)}")
             return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=" | ".join(fit_errors[:5]))
+
+    baseline_test_pred, baseline_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, season_length)
+    alpha = float(best.get("blend_alpha", 1.0))
+    pred = np.maximum(alpha * np.asarray(pred, dtype=float) + (1.0 - alpha) * np.asarray(baseline_test_pred, dtype=float), 0.0)
+    if "yhat" in fc:
+        fc["yhat"] = pred
 
     comp_summary = {
         "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,
@@ -6466,7 +6586,9 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
         "dropped_exog_cols": sorted(set(dropped_exog)),
         "final_retry_used": final_retry_used,
         "rename_map": rename_map,
-        "fit_error_samples": fit_errors[:5]
+        "fit_error_samples": fit_errors[:5],
+        "blend_alpha": alpha,
+        "blend_baseline": baseline_name
     }
     return {
         "model": m,
@@ -6497,6 +6619,7 @@ def build_recursive_feature_row(history_values: List[float], target_date: pd.Tim
 
 
 
+
 def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_combined: Optional[pd.DataFrame], freq_alias: str, strategy: str = "recursive") -> Dict[str, Any]:
     if XGBRegressor is None and SKHistGradientBoostingRegressor is None:
         raise ImportError("XGBoost veya hızlı GBM bileşeni bulunamadı.")
@@ -6513,12 +6636,11 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     feat_inner, inner_cols = generate_target_ml_features(inner_full, exog_inner, freq_alias)
     inner_cols = _select_core_ml_feature_columns(inner_cols, freq_alias, len(train_df))
     X_base = feat_inner.iloc[:len(tr_inner)][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_base = tr_inner["y"].values.astype(float)
+    y_base_raw = tr_inner["y"].values.astype(float)
+    y_transform = choose_target_transform(pd.Series(y_base_raw))
+    y_base = apply_target_transform(pd.Series(y_base_raw), y_transform)[0].values.astype(float)
 
     grid = list(FORECAST_RUNTIME_CONFIG.xgb_param_grid) if (HAS_XGBOOST or SKHistGradientBoostingRegressor is not None) else [{"max_depth": 3, "learning_rate": 0.08, "n_estimators": 48}]
-    if len(train_df) <= 72 and str(freq_alias).upper() == "M":
-        grid = grid[:1]
-
     best = None
     best_score = np.inf
     search_rows = []
@@ -6533,14 +6655,23 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         try:
             if strategy == "recursive":
                 model = build_fast_xgb_regressor(cfg)
-                model.fit(X_base_np, y_base_np)
+                if HAS_XGBOOST and type(model).__name__ == "XGBRegressor" and len(X_base_np) >= 12:
+                    es = max(3, min(8, len(X_base_np) // 4))
+                    X_fit = X_base_np[:-es]
+                    y_fit = y_base_np[:-es]
+                    X_eval = X_base_np[-es:]
+                    y_eval = y_base_np[-es:]
+                    model.fit(X_fit, y_fit, eval_set=[(X_eval, y_eval)], verbose=False)
+                else:
+                    model.fit(X_base_np, y_base_np)
                 history = list(tr_inner["y"].astype(float).values)
                 preds = []
                 for i in range(len(val_inner)):
                     target_date = pd.to_datetime(val_inner.iloc[i]["ds"])
                     exog_row = exog_inner.iloc[len(tr_inner)+i] if exog_inner is not None else None
                     X_step = build_recursive_feature_row(history, target_date, freq_alias, exog_row, list(X_base.columns))
-                    pred_i = float(model.predict(X_step.values.astype(float))[0])
+                    pred_i_t = float(model.predict(X_step.values.astype(float))[0])
+                    pred_i = float(inverse_target_transform(np.asarray([pred_i_t], dtype=float), y_transform)[0])
                     pred_i = max(pred_i, 0.0)
                     preds.append(pred_i)
                     history.append(pred_i)
@@ -6556,23 +6687,25 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
                     if len(ds_train) < 8:
                         raise ValueError("Direct strategy için yeterli gözlem yok.")
                     X_h = ds_train[inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-                    y_h = ds_train["target_h"].astype(float).values
+                    y_h_raw = ds_train["target_h"].astype(float).values
+                    y_h = apply_target_transform(pd.Series(y_h_raw), y_transform)[0].values.astype(float)
                     model_h = build_fast_xgb_regressor(cfg)
                     model_h.fit(X_h, y_h)
                     origin_idx = len(tr_inner) - 1
                     row = feat_inner.iloc[[origin_idx]][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-                    pred_direct.append(max(float(model_h.predict(row)[0]), 0.0))
+                    pred_h_t = float(model_h.predict(row)[0])
+                    pred_direct.append(max(float(inverse_target_transform(np.asarray([pred_h_t]), y_transform)[0]), 0.0))
                     last_model = model_h
                 pred_val = np.asarray(pred_direct[:len(val_inner)], dtype=float)
                 model = last_model
             score = wape(val_inner["y"].values, pred_val)
             sm = smape(val_inner["y"].values, pred_val)
-            search_rows.append({**raw_cfg, "strategy": strategy, "val_wape": score, "val_smape": sm, "backend": type(model).__name__ if model is not None else None})
+            search_rows.append({**raw_cfg, "strategy": strategy, "transform": y_transform.get("name", "none"), "val_wape": score, "val_smape": sm, "backend": type(model).__name__ if model is not None else None})
             if score < best_score:
                 best_score = score
-                best = {"cfg": cfg, "strategy": strategy}
+                best = {"cfg": cfg, "strategy": strategy, "transform_cfg": y_transform}
         except Exception as e:
-            search_rows.append({**raw_cfg, "strategy": strategy, "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:180]})
+            search_rows.append({**raw_cfg, "strategy": strategy, "transform": y_transform.get("name", "none"), "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:180]})
             continue
 
     if best is None:
@@ -6581,18 +6714,29 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     feat_train_test, feature_cols = generate_target_ml_features(full, exog_combined, freq_alias)
     feature_cols = _select_core_ml_feature_columns(feature_cols, freq_alias, len(train_df))
     X_train_final = feat_train_test.iloc[:train_cut][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_train_final = train_df["y"].astype(float).values
+    y_train_final_raw = train_df["y"].astype(float).values
+    y_train_final = apply_target_transform(pd.Series(y_train_final_raw), best["transform_cfg"])[0].values.astype(float)
 
     if best["strategy"] == "recursive":
         model = build_fast_xgb_regressor(best["cfg"])
-        model.fit(X_train_final.values.astype(float), np.asarray(y_train_final, dtype=float))
+        if HAS_XGBOOST and type(model).__name__ == "XGBRegressor" and len(X_train_final) >= 16:
+            es = max(4, min(12, len(X_train_final) // 5))
+            model.fit(
+                X_train_final.iloc[:-es].values.astype(float),
+                y_train_final[:-es],
+                eval_set=[(X_train_final.iloc[-es:].values.astype(float), y_train_final[-es:])],
+                verbose=False
+            )
+        else:
+            model.fit(X_train_final.values.astype(float), np.asarray(y_train_final, dtype=float))
         history = list(train_df["y"].astype(float).values)
         preds = []
         for i in range(len(future_df)):
             target_date = pd.to_datetime(future_df.iloc[i]["ds"])
             exog_row = exog_combined.iloc[train_cut + i] if exog_combined is not None else None
             X_step = build_recursive_feature_row(history, target_date, freq_alias, exog_row, list(X_train_final.columns))
-            pred_i = max(float(model.predict(X_step.values.astype(float))[0]), 0.0)
+            pred_i_t = float(model.predict(X_step.values.astype(float))[0])
+            pred_i = max(float(inverse_target_transform(np.asarray([pred_i_t]), best["transform_cfg"])[0]), 0.0)
             preds.append(pred_i)
             history.append(pred_i)
         pred_test = np.asarray(preds, dtype=float)
@@ -6605,11 +6749,13 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
             feat_shifted["target_h"] = feat_shifted["y"].shift(-h)
             ds_train = feat_shifted.iloc[:train_cut][feature_cols + ["target_h"]].dropna().copy()
             X_h = ds_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-            y_h = ds_train["target_h"].astype(float).values
+            y_h_raw = ds_train["target_h"].astype(float).values
+            y_h = apply_target_transform(pd.Series(y_h_raw), best["transform_cfg"])[0].values.astype(float)
             model_h = build_fast_xgb_regressor(best["cfg"])
             model_h.fit(X_h, y_h)
             origin_row = feat_train_test.iloc[[train_cut-1]][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-            pred_test.append(max(float(model_h.predict(origin_row)[0]), 0.0))
+            pred_h_t = float(model_h.predict(origin_row)[0])
+            pred_test.append(max(float(inverse_target_transform(np.asarray([pred_h_t]), best["transform_cfg"])[0]), 0.0))
             trained_models.append(model_h)
         pred_test = np.asarray(pred_test, dtype=float)
 
@@ -6617,24 +6763,17 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     try:
         fi = getattr(trained_models[0], "feature_importances_", None)
         if fi is not None:
-            importance_df = pd.DataFrame({"feature": list(X_train_final.columns), "importance": fi}).sort_values("importance", ascending=False).head(20).reset_index(drop=True)
+            importance_df = pd.DataFrame({"feature": list(X_train_final.columns), "importance": fi}).sort_values("importance", ascending=False).head(25).reset_index(drop=True)
     except Exception:
         pass
 
-    shap_status = "disabled_fast_mode"
+    shap_status = "disabled"
     backend_name = type(trained_models[0]).__name__ if trained_models else None
-    if HAS_SHAP and FORECAST_RUNTIME_CONFIG.xgb_enable_shap and backend_name == "XGBRegressor":
-        try:
-            explainer = shap.Explainer(trained_models[0], X_train_final.head(min(100, len(X_train_final))).values.astype(float))
-            sv = explainer(X_train_final.head(min(50, len(X_train_final))).values.astype(float))
-            shap_status = f"computed_on_{sv.values.shape[0]}_rows"
-        except Exception:
-            shap_status = "failed_optional"
-
     return {
         "model": trained_models[0],
         "forecast": pred_test,
         "strategy": best["strategy"],
+        "transform": best["transform_cfg"].get("name", "none"),
         "search_table": pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True], na_position="last").reset_index(drop=True),
         "feature_importance": importance_df,
         "shap_status": shap_status,
@@ -7100,9 +7239,9 @@ def render_streamlit_app():
             st.info("Batch sonucu görmek için butona bas.")
             return
         st.subheader("Batch forecasting özeti")
-        st.dataframe(style_metric_dataframe(batch["best_summary"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(batch["best_summary"]), width="stretch")
         st.subheader("Champion - Challenger tablosu")
-        st.dataframe(batch["champion_table"], use_container_width=True)
+        st.dataframe(batch["champion_table"], width="stretch")
         st.download_button("Batch özetini indir (CSV)", data=dataframe_to_download_bytes(batch["best_summary"]), file_name=f"{selected_sheet}_batch_forecasting_summary.csv", mime="text/csv")
         return
 
@@ -7113,12 +7252,12 @@ def render_streamlit_app():
 
     st.subheader("Model karşılaştırma tablosu")
     metrics_df = style_metric_dataframe(outputs["metrics_df"])
-    st.dataframe(metrics_df, use_container_width=True)
+    st.dataframe(metrics_df, width="stretch")
     st.download_button("Karşılaştırma tablosunu indir (CSV)", data=dataframe_to_download_bytes(metrics_df), file_name=f"{selected_sheet}_{target_col}_model_karsilastirma.csv", mime="text/csv")
 
     if isinstance(outputs.get("stage_timing_table"), pd.DataFrame) and len(outputs.get("stage_timing_table")):
         with st.expander("Çalışma süresi / performans özeti", expanded=False):
-            st.dataframe(outputs["stage_timing_table"], use_container_width=True)
+            st.dataframe(outputs["stage_timing_table"], width="stretch")
             for note in outputs.get("metadata", {}).get("runtime_guardrails", []):
                 st.write(f"- {note}")
 
@@ -7135,11 +7274,11 @@ def render_streamlit_app():
         with st.expander("Model hata / fallback özeti"):
             err_df = pd.DataFrame([{"model": k, "message": v} for k, v in outputs.get("model_errors", {}).items()])
             if len(err_df):
-                st.dataframe(err_df, use_container_width=True)
+                st.dataframe(err_df, width="stretch")
 
     fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin")
     if fig is not None:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Champion-Challenger & Ensemble", "Gerçek vs Tahmin", "Backtest Dashboard", "Önişleme Denetimleri", "Akıllı Yorumlar"])
 
@@ -7150,12 +7289,12 @@ def render_streamlit_app():
         else:
             st.json({"order": sarima.get("order"), "seasonal_order": sarima.get("seasonal_order"), "trend": sarima.get("trend"), "AIC": sarima.get("aic"), "BIC": sarima.get("bic"), "Ljung-Box p-value": sarima.get("ljung_box_pvalue"), "d": sarima.get("d"), "D": sarima.get("D"), "transform": sarima.get("transform"), "white_noise_ok": sarima.get("residual_white_noise_ok"), "fallback_used": sarima.get("fallback_used"), "fallback_method": sarima.get("fallback_method")})
             if "SARIMA/SARIMAX" in outputs["tables"]:
-                st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), use_container_width=True)
+                st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), width="stretch")
                 fig_sarima = plot_forecast_results(outputs["train"], outputs["test"], {"SARIMA/SARIMAX": outputs["predictions"]["SARIMA/SARIMAX"]}, f"{target_col} - SARIMA/SARIMAX")
                 if fig_sarima is not None:
-                    st.plotly_chart(fig_sarima, use_container_width=True)
+                    st.plotly_chart(fig_sarima, width="stretch")
             if isinstance(sarima.get("search_table"), pd.DataFrame) and len(sarima.get("search_table")):
-                st.dataframe(style_metric_dataframe(sarima["search_table"]), use_container_width=True)
+                st.dataframe(style_metric_dataframe(sarima["search_table"]), width="stretch")
 
     with tab2:
         if "prophet" in outputs:
@@ -7163,11 +7302,11 @@ def render_streamlit_app():
                 st.json(outputs["prophet"]["config"])
             if isinstance(outputs["prophet"].get("component_validation"), dict):
                 st.json(outputs["prophet"].get("component_validation", {}))
-            st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), use_container_width=True)
+            st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), width="stretch")
             fig_prophet = plot_forecast_results(outputs["train"], outputs["test"], {"Prophet": outputs["predictions"]["Prophet"]}, f"{target_col} - Prophet")
             if fig_prophet is not None:
-                st.plotly_chart(fig_prophet, use_container_width=True)
-            st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), use_container_width=True)
+                st.plotly_chart(fig_prophet, width="stretch")
+            st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), width="stretch")
         else:
             st.warning(outputs.get("prophet_error", "Prophet sonucu üretilemedi."))
 
@@ -7177,50 +7316,50 @@ def render_streamlit_app():
         else:
             st.json({"selected_strategy": outputs["xgboost"].get("strategy"), "shap_status": outputs["xgboost"].get("shap_status"), "fallback_used": outputs["xgboost"].get("fallback_used"), "fallback_method": outputs["xgboost"].get("fallback_method")})
             if "XGBoost" in outputs["tables"]:
-                st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), use_container_width=True)
+                st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), width="stretch")
                 fig_xgb = plot_forecast_results(outputs["train"], outputs["test"], {"XGBoost": outputs["predictions"]["XGBoost"]}, f"{target_col} - XGBoost")
                 if fig_xgb is not None:
-                    st.plotly_chart(fig_xgb, use_container_width=True)
-            st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), use_container_width=True)
+                    st.plotly_chart(fig_xgb, width="stretch")
+            st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), width="stretch")
             if "strategy_comparison" in outputs["xgboost"]:
-                st.dataframe(style_metric_dataframe(outputs["xgboost"]["strategy_comparison"]), use_container_width=True)
+                st.dataframe(style_metric_dataframe(outputs["xgboost"]["strategy_comparison"]), width="stretch")
             if len(outputs["xgboost"].get("feature_importance", pd.DataFrame())):
-                st.dataframe(outputs["xgboost"]["feature_importance"], use_container_width=True)
+                st.dataframe(outputs["xgboost"]["feature_importance"], width="stretch")
 
     with tab4:
-        st.dataframe(style_metric_dataframe(outputs["champion_challenger"]["ranking"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(outputs["champion_challenger"]["ranking"]), width="stretch")
         st.markdown("**Ensemble ağırlıkları**")
-        st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), width="stretch")
         st.markdown("**Ensemble gerçek vs tahmin**")
-        st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), width="stretch")
         fig_ens = plot_forecast_results(outputs["train"], outputs["test"], {"Ensemble": outputs["predictions"]["Ensemble"]}, f"{target_col} - Ensemble")
         if fig_ens is not None:
-            st.plotly_chart(fig_ens, use_container_width=True)
+            st.plotly_chart(fig_ens, width="stretch")
 
     with tab5:
         combined = outputs["all_predictions_long"].copy()
-        st.dataframe(style_metric_dataframe(combined), use_container_width=True)
+        st.dataframe(style_metric_dataframe(combined), width="stretch")
         st.download_button("Gerçek vs tahmin tablosunu indir (CSV)", data=dataframe_to_download_bytes(combined), file_name=f"{selected_sheet}_{target_col}_actual_vs_forecast.csv", mime="text/csv")
 
     with tab6:
         if "proxy_backtest_report" in export_payload and len(export_payload["proxy_backtest_report"]) > 0:
             st.markdown("**Proxy backtest raporu**")
-            st.dataframe(export_payload["proxy_backtest_report"], use_container_width=True)
+            st.dataframe(export_payload["proxy_backtest_report"], width="stretch")
         else:
             st.info("Proxy backtest raporu bulunamadı.")
         if "raw_vs_clean_backtest_report" in export_payload and len(export_payload["raw_vs_clean_backtest_report"]) > 0:
             st.markdown("**Raw vs Clean backtest karşılaştırması**")
-            st.dataframe(export_payload["raw_vs_clean_backtest_report"], use_container_width=True)
+            st.dataframe(export_payload["raw_vs_clean_backtest_report"], width="stretch")
 
     with tab7:
         st.markdown("**Kalite raporu**")
-        st.dataframe(export_payload["quality_report"], use_container_width=True)
+        st.dataframe(export_payload["quality_report"], width="stretch")
         st.markdown("**Seri profil raporu**")
-        st.dataframe(export_payload["series_profile_report"], use_container_width=True)
+        st.dataframe(export_payload["series_profile_report"], width="stretch")
         st.markdown("**Anomali yönetişimi**")
-        st.dataframe(export_payload["anomaly_governance"], use_container_width=True)
+        st.dataframe(export_payload["anomaly_governance"], width="stretch")
         st.markdown("**Review queue**")
-        st.dataframe(export_payload["review_queue"], use_container_width=True)
+        st.dataframe(export_payload["review_queue"], width="stretch")
 
     with tab8:
         suggestions = []
