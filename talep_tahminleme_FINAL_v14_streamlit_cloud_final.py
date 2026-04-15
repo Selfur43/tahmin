@@ -2072,6 +2072,94 @@ def _seasonal_period_from_freq(freq_alias: str) -> int:
     return 12
 
 
+def _make_unique_text_labels(labels: List[Any]) -> List[str]:
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for raw in list(labels):
+        base = str(raw)
+        if base not in seen:
+            seen[base] = 0
+            out.append(base)
+        else:
+            seen[base] += 1
+            out.append(f"{base}__{seen[base]}")
+    return out
+
+
+def _plot_tick_step(n_labels: int) -> int:
+    if n_labels <= 20:
+        return 1
+    if n_labels <= 40:
+        return 2
+    if n_labels <= 80:
+        return 4
+    if n_labels <= 120:
+        return 6
+    return 8
+
+
+def _safe_save_matrix_heatmap(matrix: pd.DataFrame, title: str, output_path: str) -> bool:
+    try:
+        if matrix is None or matrix.empty:
+            return False
+        row_labels = _make_unique_text_labels(matrix.index.tolist())
+        col_labels = _make_unique_text_labels(matrix.columns.tolist())
+        arr = np.asarray(matrix.values, dtype=float)
+        fig, ax = plt.subplots(figsize=(max(10, 0.24 * len(col_labels)), max(8, 0.24 * len(row_labels))))
+        im = ax.imshow(arr, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
+        fig.colorbar(im, ax=ax)
+        x_step = _plot_tick_step(len(col_labels))
+        y_step = _plot_tick_step(len(row_labels))
+        x_pos = np.arange(0, len(col_labels), x_step)
+        y_pos = np.arange(0, len(row_labels), y_step)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([col_labels[i] for i in x_pos], rotation=90, fontsize=8)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([row_labels[i] for i in y_pos], fontsize=8)
+        ax.set_title(title)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        return True
+    except Exception:
+        try:
+            plt.close('all')
+        except Exception:
+            pass
+        return False
+
+
+def _safe_save_pivot_heatmap(piv: pd.DataFrame, title: str, output_path: str) -> bool:
+    try:
+        if piv is None or piv.empty:
+            return False
+        row_labels = _make_unique_text_labels(piv.index.tolist())
+        col_labels = _make_unique_text_labels(piv.columns.tolist())
+        arr = np.asarray(piv.values, dtype=float)
+        fig, ax = plt.subplots(figsize=(max(8, 0.42 * len(col_labels)), max(6, 0.32 * len(row_labels))))
+        im = ax.imshow(arr, aspect="auto", cmap="viridis")
+        fig.colorbar(im, ax=ax)
+        x_step = _plot_tick_step(len(col_labels))
+        y_step = _plot_tick_step(len(row_labels))
+        x_pos = np.arange(0, len(col_labels), x_step)
+        y_pos = np.arange(0, len(row_labels), y_step)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels([col_labels[i] for i in x_pos], fontsize=8)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels([row_labels[i] for i in y_pos], fontsize=8)
+        ax.set_title(title)
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        return True
+    except Exception:
+        try:
+            plt.close('all')
+        except Exception:
+            pass
+        return False
+
+
 def save_correlation_analysis(
     df_for_corr: pd.DataFrame,
     target_cols: List[str],
@@ -2088,48 +2176,63 @@ def save_correlation_analysis(
         corr_long = pd.DataFrame(columns=["target_series", "variable", "correlation", "abs_correlation"])
         return corr_matrix, corr_long
 
+    original_numeric_cols = list(numeric_df.columns)
+    unique_numeric_cols = _make_unique_text_labels(original_numeric_cols)
+    numeric_df.columns = unique_numeric_cols
+    target_name_map: Dict[str, List[str]] = {}
+    for orig_name, unique_name in zip(original_numeric_cols, unique_numeric_cols):
+        target_name_map.setdefault(str(orig_name), []).append(unique_name)
+
     corr_matrix = numeric_df.corr(method="pearson")
     corr_matrix.to_csv(os.path.join(sheet_dir, "correlation_matrix.csv"), encoding="utf-8-sig")
     corr_matrix.to_excel(os.path.join(sheet_dir, "correlation_matrix.xlsx"))
 
-    plt.figure(figsize=(max(10, 0.45 * len(corr_matrix.columns)), max(8, 0.45 * len(corr_matrix.columns))))
-    plt.imshow(corr_matrix.values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
-    plt.colorbar()
-    plt.xticks(range(len(corr_matrix.columns)), corr_matrix.columns, rotation=90)
-    plt.yticks(range(len(corr_matrix.index)), corr_matrix.index)
-    plt.title("Correlation Matrix")
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, "correlation_matrix_heatmap.png"), dpi=150)
-    plt.close()
+    _safe_save_matrix_heatmap(
+        corr_matrix,
+        "Correlation Matrix",
+        os.path.join(plot_dir, "correlation_matrix_heatmap.png")
+    )
 
     rows = []
     for target in target_cols:
-        if target not in corr_matrix.columns:
+        mapped_targets = target_name_map.get(str(target), [])
+        if not mapped_targets:
             continue
-        tmp = corr_matrix[target].drop(labels=[target], errors="ignore").reset_index()
-        tmp.columns = ["variable", "correlation"]
-        tmp["target_series"] = target
-        tmp["abs_correlation"] = tmp["correlation"].abs()
-        tmp = tmp.sort_values("abs_correlation", ascending=False)
-        rows.append(tmp[["target_series", "variable", "correlation", "abs_correlation"]])
+        for mapped_target in mapped_targets:
+            if mapped_target not in corr_matrix.columns:
+                continue
+            tmp = corr_matrix[mapped_target].drop(labels=[mapped_target], errors="ignore").reset_index()
+            if tmp.shape[1] < 2:
+                continue
+            tmp = tmp.iloc[:, :2].copy()
+            tmp.columns = ["variable", "correlation"]
+            tmp["target_series"] = str(target)
+            tmp["abs_correlation"] = pd.to_numeric(tmp["correlation"], errors="coerce").abs()
+            tmp = tmp.sort_values("abs_correlation", ascending=False)
+            rows.append(tmp[["target_series", "variable", "correlation", "abs_correlation"]])
 
-        top_n = min(20, len(tmp))
-        if top_n > 0:
-            plt.figure(figsize=(10, max(5, 0.35 * top_n)))
-            tmp_plot = tmp.head(top_n).sort_values("correlation")
-            plt.barh(tmp_plot["variable"].astype(str), tmp_plot["correlation"].astype(float))
-            plt.axvline(0.0, linewidth=1.0)
-            plt.title(f"Top correlations with {target}")
-            plt.xlabel("Correlation")
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, f"{_safe_plot_name(target)}_top_correlations.png"), dpi=150)
-            plt.close()
+            top_n = min(20, len(tmp))
+            if top_n > 0:
+                try:
+                    plt.figure(figsize=(10, max(5, 0.35 * top_n)))
+                    tmp_plot = tmp.head(top_n).sort_values("correlation")
+                    plt.barh(tmp_plot["variable"].astype(str), tmp_plot["correlation"].astype(float))
+                    plt.axvline(0.0, linewidth=1.0)
+                    plt.title(f"Top correlations with {target}")
+                    plt.xlabel("Correlation")
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(plot_dir, f"{_safe_plot_name(str(target))}_top_correlations.png"), dpi=150)
+                    plt.close()
+                except Exception:
+                    try:
+                        plt.close('all')
+                    except Exception:
+                        pass
 
     corr_long = pd.concat(rows, axis=0, ignore_index=True) if rows else pd.DataFrame(columns=["target_series", "variable", "correlation", "abs_correlation"])
     corr_long.to_csv(os.path.join(sheet_dir, "target_correlations_long.csv"), index=False, encoding="utf-8-sig")
     corr_long.to_excel(os.path.join(sheet_dir, "target_correlations_long.xlsx"), index=False)
     return corr_matrix, corr_long
-
 
 def save_seasonality_heatmaps_and_decomposition(
     df_clean: pd.DataFrame,
@@ -2183,17 +2286,11 @@ def save_seasonality_heatmaps_and_decomposition(
         if len(piv) > 0:
             piv.to_csv(os.path.join(sheet_dir, f"{_safe_plot_name(col)}_heatmap_data.csv"), encoding="utf-8-sig")
 
-            plt.figure(figsize=(max(8, 0.5 * max(1, len(piv.columns))), max(5, 0.4 * max(1, len(piv.index)))))
-            plt.imshow(piv.values, aspect="auto", cmap="YlOrRd")
-            plt.colorbar()
-            plt.xticks(range(len(piv.columns)), piv.columns)
-            plt.yticks(range(len(piv.index)), piv.index)
-            plt.title(f"{col} - Heatmap ({row_label} x {col_label})")
-            plt.xlabel(col_label)
-            plt.ylabel(row_label)
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, heatmap_name), dpi=150)
-            plt.close()
+            _safe_save_pivot_heatmap(
+                piv,
+                f"{col} - Heatmap ({row_label} x {col_label})",
+                os.path.join(plot_dir, heatmap_name)
+            )
 
             heatmap_rows.append({
                 "series": col,
@@ -4667,10 +4764,21 @@ try:
     HAS_XGBOOST = True
 except Exception:
     HAS_XGBOOST = False
-    try:
-        from sklearn.ensemble import HistGradientBoostingRegressor as XGBRegressor
-    except Exception:
-        XGBRegressor = None
+    XGBRegressor = None
+
+try:
+    from sklearn.ensemble import HistGradientBoostingRegressor as SKHistGradientBoostingRegressor
+except Exception:
+    SKHistGradientBoostingRegressor = None
+
+if XGBRegressor is None and SKHistGradientBoostingRegressor is not None:
+    XGBRegressor = SKHistGradientBoostingRegressor
+
+try:
+    from sklearn.ensemble import ExtraTreesRegressor as SKExtraTreesRegressor
+except Exception:
+    SKExtraTreesRegressor = None
+
 
 try:
     import shap
@@ -4684,18 +4792,18 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 
 @dataclass
 class ForecastRuntimeConfig:
     interactive_fast_mode: bool = True
     sarimax_max_candidates: int = 6
-    sarimax_maxiter_search: int = 12
-    sarimax_maxiter_final: int = 20
+    sarimax_maxiter_search: int = 14
+    sarimax_maxiter_final: int = 24
     sarimax_search_with_exog_top_n: int = 1
     sarimax_enable_walk_forward_refit: bool = False
-    sarimax_search_wall_seconds: float = 18.0
+    sarimax_search_wall_seconds: float = 20.0
     sarimax_max_exog_cols: int = 3
     prophet_max_configs: int = 4
     prophet_max_exog_cols: int = 4
@@ -4705,27 +4813,30 @@ class ForecastRuntimeConfig:
     prophet_backend_fail_to_surrogate: bool = True
     xgb_enable_shap: bool = False
     xgb_skip_direct_on_short_series: bool = True
-    xgb_max_feature_cols: int = 14
+    xgb_max_feature_cols: int = 8
     xgb_force_single_thread: bool = True
+    xgb_prefer_hist_gradient_on_short_series: bool = True
+    xgb_search_wall_seconds: float = 20.0
+    xgb_inner_train_max_rows: int = 84
     xgb_param_grid: Tuple[Dict[str, Any], ...] = field(default_factory=lambda: (
         {
             "max_depth": 2,
-            "learning_rate": 0.08,
-            "n_estimators": 72,
+            "learning_rate": 0.07,
+            "n_estimators": 48,
             "subsample": 0.90,
             "colsample_bytree": 0.85,
             "reg_alpha": 0.0,
-            "reg_lambda": 1.2,
+            "reg_lambda": 1.0,
             "min_child_weight": 1
         },
         {
             "max_depth": 3,
-            "learning_rate": 0.06,
-            "n_estimators": 96,
+            "learning_rate": 0.05,
+            "n_estimators": 64,
             "subsample": 0.85,
             "colsample_bytree": 0.80,
             "reg_alpha": 0.0,
-            "reg_lambda": 1.4,
+            "reg_lambda": 1.2,
             "min_child_weight": 1
         }
     ))
@@ -5499,16 +5610,80 @@ def reduce_ml_feature_set(
 
 def build_fast_xgb_regressor(cfg: Dict[str, Any]):
     params = dict(cfg)
+    prefer_hist_gradient = bool(params.pop("_prefer_hist_gradient", False))
+    if prefer_hist_gradient and SKExtraTreesRegressor is not None:
+        return SKExtraTreesRegressor(
+            n_estimators=min(int(params.get("n_estimators", 64)), 96),
+            max_depth=min(int(params.get("max_depth", 3)), 5),
+            min_samples_leaf=max(1, int(params.get("min_child_weight", 1))),
+            random_state=42,
+            n_jobs=1
+        )
+    if prefer_hist_gradient and SKHistGradientBoostingRegressor is not None:
+        mapped = {
+            "learning_rate": params.get("learning_rate", 0.06),
+            "max_depth": params.get("max_depth", 3),
+            "max_iter": params.get("n_estimators", 64),
+            "max_bins": 64,
+            "l2_regularization": params.get("reg_lambda", 1.0),
+            "min_samples_leaf": max(2, int(params.get("min_child_weight", 1) * 2)),
+            "early_stopping": True,
+            "random_state": 42
+        }
+        return SKHistGradientBoostingRegressor(**mapped)
     if HAS_XGBOOST:
         params.setdefault("objective", "reg:squarederror")
         params.setdefault("random_state", 42)
         params.setdefault("verbosity", 0)
         params.setdefault("tree_method", "hist")
         params.setdefault("max_bin", 64)
+        params.setdefault("eval_metric", "mae")
         if FORECAST_RUNTIME_CONFIG.xgb_force_single_thread:
             params.setdefault("n_jobs", 1)
         return XGBRegressor(**params)
+    if SKExtraTreesRegressor is not None:
+        return SKExtraTreesRegressor(
+            n_estimators=min(int(params.get("n_estimators", 64)), 96),
+            max_depth=min(int(params.get("max_depth", 3)), 5),
+            random_state=42,
+            n_jobs=1
+        )
+    if SKHistGradientBoostingRegressor is not None:
+        return SKHistGradientBoostingRegressor(
+            learning_rate=params.get("learning_rate", 0.06),
+            max_depth=params.get("max_depth", 3),
+            max_iter=params.get("n_estimators", 64),
+            random_state=42,
+            early_stopping=True
+        )
     return XGBRegressor(random_state=42)
+
+
+def _prepare_xgb_cfg(cfg: Dict[str, Any], train_len: int, freq_alias: str) -> Dict[str, Any]:
+    out = dict(cfg)
+    short_monthly = str(freq_alias).upper() == "M" and train_len <= 96
+    if FORECAST_RUNTIME_CONFIG.xgb_prefer_hist_gradient_on_short_series and short_monthly:
+        out["_prefer_hist_gradient"] = True
+    if short_monthly:
+        out["n_estimators"] = min(int(out.get("n_estimators", 64)), 48)
+        out["max_depth"] = min(int(out.get("max_depth", 3)), 3)
+    return out
+
+
+def _select_core_ml_feature_columns(all_cols: List[str], freq_alias: str, train_len: int) -> List[str]:
+    cols = list(all_cols)
+    short_monthly = str(freq_alias).upper() == "M" and train_len <= 96
+    if not short_monthly:
+        return cols
+    preferred = [
+        "lag_1", "lag_2", "lag_3", "lag_6", "lag_12", "seasonal_lag_12",
+        "roll_mean_3", "roll_mean_6", "roll_std_3", "roll_std_6",
+        "month_sin", "month_cos", "month", "quarter"
+    ]
+    exog_cols = [c for c in cols if str(c).startswith("exog__")][:4]
+    ordered = [c for c in preferred if c in cols] + exog_cols
+    ordered += [c for c in cols if c not in ordered]
+    return ordered[:min(12, len(ordered))]
 
 def should_use_prophet_holidays(freq_alias: str, n_train: int) -> bool:
     if not FORECAST_RUNTIME_CONFIG.prophet_disable_holidays_for_short_series:
@@ -5529,9 +5704,16 @@ def probe_prophet_backend() -> Tuple[bool, str]:
     if _PROPhet_BACKEND_PROBE_CACHE["done"]:
         return bool(_PROPhet_BACKEND_PROBE_CACHE["ok"]), str(_PROPhet_BACKEND_PROBE_CACHE["message"])
     try:
-        m = Prophet()
-        ok = hasattr(m, "stan_backend") and getattr(m, "stan_backend", None) is not None
-        msg = "ok" if ok else "stan_backend_missing"
+        mini = pd.DataFrame({
+            "ds": pd.date_range("2022-01-01", periods=8, freq="MS"),
+            "y": np.array([10.0, 11.0, 12.5, 12.0, 13.0, 14.0, 13.5, 14.5], dtype=float)
+        })
+        m = Prophet(yearly_seasonality=False, weekly_seasonality=False, daily_seasonality=False)
+        m.fit(mini)
+        future = pd.DataFrame({"ds": pd.date_range("2022-09-01", periods=1, freq="MS")})
+        _ = m.predict(future)
+        ok = True
+        msg = "mini_fit_ok"
     except Exception as e:
         ok = False
         msg = str(e)
@@ -5539,7 +5721,6 @@ def probe_prophet_backend() -> Tuple[bool, str]:
     _PROPhet_BACKEND_PROBE_CACHE["ok"] = bool(ok)
     _PROPhet_BACKEND_PROBE_CACHE["message"] = str(msg)
     return bool(ok), str(msg)
-
 
 def _build_prophet_style_surrogate_design(
     base_df: pd.DataFrame,
@@ -5860,6 +6041,21 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             "dropped_exog_cols": dropped_exog,
         }
 
+    try:
+        bench_pred, _bench_name = build_fallback_forecast(y_inner, y_val, freq_alias, infer_season_length_from_freq(freq_alias))
+        bench_score = float(wape(y_val.values, bench_pred) + 0.35 * smape(y_val.values, bench_pred))
+        if pd.notna(bench_score) and best_score > (bench_score + 0.75):
+            best = {
+                "order": (0, d, 0),
+                "seasonal_order": (0, D if season_length > 1 else 0, 0, season_length if season_length > 1 else 0),
+                "transform_cfg": {"name": "none", "lambda": None, "shift": 0.0},
+                "trend": "c",
+                "use_exog": False,
+                "benchmark_override": True
+            }
+    except Exception:
+        pass
+
     final_exog_train = xtr if best.get("use_exog") else None
     final_exog_test = xte if best.get("use_exog") else None
     y_train_t, applied_cfg = apply_target_transform(y_train_raw, best["transform_cfg"])
@@ -5904,6 +6100,7 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             "used_exog_cols": list(final_exog_train.columns) if final_exog_train is not None else [],
             "trend": best.get("trend", "c"),
             "dropped_exog_cols": dropped_exog,
+            "benchmark_override": bool(best.get("benchmark_override", False)) if isinstance(best, dict) else False,
         }
     except Exception:
         fallback_pred, fallback_name = build_fallback_forecast(y_train_raw, y_test_raw, freq_alias, infer_season_length_from_freq(freq_alias))
@@ -5929,6 +6126,7 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             "used_exog_cols": [],
             "trend": best.get("trend", "c") if isinstance(best, dict) else "c",
             "dropped_exog_cols": dropped_exog,
+            "benchmark_override": bool(best.get("benchmark_override", False)) if isinstance(best, dict) else False,
         }
 
 
@@ -6300,20 +6498,24 @@ def build_recursive_feature_row(history_values: List[float], target_date: pd.Tim
 
 
 def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_combined: Optional[pd.DataFrame], freq_alias: str, strategy: str = "recursive") -> Dict[str, Any]:
-    if XGBRegressor is None:
-        raise ImportError("XGBoost veya sklearn gradient boosting bulunamadı.")
+    if XGBRegressor is None and SKHistGradientBoostingRegressor is None:
+        raise ImportError("XGBoost veya hızlı GBM bileşeni bulunamadı.")
+
+    start_ts = time.perf_counter()
     full = pd.concat([train_df[["ds", "y"]], future_df[["ds", "y"]]], axis=0, ignore_index=True)
-    feat_full, feature_cols = generate_target_ml_features(full, exog_combined, freq_alias)
     train_cut = len(train_df)
 
     tr_inner, val_inner = make_inner_train_val_split(train_df)
+    if len(tr_inner) > FORECAST_RUNTIME_CONFIG.xgb_inner_train_max_rows:
+        tr_inner = tr_inner.iloc[-FORECAST_RUNTIME_CONFIG.xgb_inner_train_max_rows:].reset_index(drop=True)
     inner_full = pd.concat([tr_inner[["ds", "y"]], val_inner[["ds", "y"]]], axis=0, ignore_index=True)
-    exog_inner = exog_combined.iloc[:len(inner_full)].copy() if exog_combined is not None else None
+    exog_inner = exog_combined.iloc[:len(inner_full)].copy().reset_index(drop=True) if exog_combined is not None else None
     feat_inner, inner_cols = generate_target_ml_features(inner_full, exog_inner, freq_alias)
+    inner_cols = _select_core_ml_feature_columns(inner_cols, freq_alias, len(train_df))
     X_base = feat_inner.iloc[:len(tr_inner)][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     y_base = tr_inner["y"].values.astype(float)
 
-    grid = list(FORECAST_RUNTIME_CONFIG.xgb_param_grid) if HAS_XGBOOST else [{"max_depth": 3, "learning_rate": 0.08, "n_estimators": 72}]
+    grid = list(FORECAST_RUNTIME_CONFIG.xgb_param_grid) if (HAS_XGBOOST or SKHistGradientBoostingRegressor is not None) else [{"max_depth": 3, "learning_rate": 0.08, "n_estimators": 48}]
     if len(train_df) <= 72 and str(freq_alias).upper() == "M":
         grid = grid[:1]
 
@@ -6323,7 +6525,11 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     X_base_np = X_base.values.astype(float)
     y_base_np = np.asarray(y_base, dtype=float)
 
-    for cfg in grid:
+    for raw_cfg in grid:
+        if (time.perf_counter() - start_ts) > FORECAST_RUNTIME_CONFIG.xgb_search_wall_seconds and best is not None:
+            search_rows.append({**raw_cfg, "strategy": strategy, "val_wape": np.nan, "val_smape": np.nan, "fit_error": "search_budget_exceeded"})
+            break
+        cfg = _prepare_xgb_cfg(raw_cfg, len(train_df), freq_alias)
         try:
             if strategy == "recursive":
                 model = build_fast_xgb_regressor(cfg)
@@ -6361,18 +6567,19 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
                 model = last_model
             score = wape(val_inner["y"].values, pred_val)
             sm = smape(val_inner["y"].values, pred_val)
-            search_rows.append({**cfg, "strategy": strategy, "val_wape": score, "val_smape": sm})
+            search_rows.append({**raw_cfg, "strategy": strategy, "val_wape": score, "val_smape": sm, "backend": type(model).__name__ if model is not None else None})
             if score < best_score:
                 best_score = score
                 best = {"cfg": cfg, "strategy": strategy}
         except Exception as e:
-            search_rows.append({**cfg, "strategy": strategy, "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:180]})
+            search_rows.append({**raw_cfg, "strategy": strategy, "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:180]})
             continue
 
     if best is None:
         raise RuntimeError("XGBoost modeli kurulamadı.")
 
     feat_train_test, feature_cols = generate_target_ml_features(full, exog_combined, freq_alias)
+    feature_cols = _select_core_ml_feature_columns(feature_cols, freq_alias, len(train_df))
     X_train_final = feat_train_test.iloc[:train_cut][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     y_train_final = train_df["y"].astype(float).values
 
@@ -6415,7 +6622,8 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         pass
 
     shap_status = "disabled_fast_mode"
-    if HAS_SHAP and FORECAST_RUNTIME_CONFIG.xgb_enable_shap:
+    backend_name = type(trained_models[0]).__name__ if trained_models else None
+    if HAS_SHAP and FORECAST_RUNTIME_CONFIG.xgb_enable_shap and backend_name == "XGBRegressor":
         try:
             explainer = shap.Explainer(trained_models[0], X_train_final.head(min(100, len(X_train_final))).values.astype(float))
             sv = explainer(X_train_final.head(min(50, len(X_train_final))).values.astype(float))
@@ -6432,12 +6640,12 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         "shap_status": shap_status,
         "used_feature_count": len(X_train_final.columns),
         "fallback_used": False,
-        "fallback_method": None
+        "fallback_method": None,
+        "backend_name": backend_name
     }
 
-
 def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M") -> Dict[str, Any]:
-    if XGBRegressor is None:
+    if XGBRegressor is None and SKHistGradientBoostingRegressor is None:
         fallback = seasonal_naive_forecast(train_df["y"], len(test_df), infer_seasonal_period(freq_alias))
         return {
             "model": None,
@@ -6448,7 +6656,8 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
             "shap_status": "disabled",
             "used_feature_count": 0,
             "fallback_used": True,
-            "fallback_method": "seasonal_naive"
+            "fallback_method": "seasonal_naive",
+            "backend_name": "seasonal_naive"
         }
 
     exog_combined = None
@@ -6468,12 +6677,14 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
     recursive_res["selected_ml_feature_cols"] = selected_ml_cols
     recursive_res["dropped_ml_feature_cols"] = dropped_ml_cols
 
-    if FORECAST_RUNTIME_CONFIG.xgb_skip_direct_on_short_series and len(train_df) <= 72:
+    short_monthly = str(freq_alias).upper() == "M" and len(train_df) <= 96
+    if FORECAST_RUNTIME_CONFIG.xgb_skip_direct_on_short_series and short_monthly:
         recursive_res["strategy_comparison"] = pd.DataFrame([{
             "strategy": "recursive",
             "WAPE": wape(test_df["y"].values, recursive_res["forecast"]),
             "sMAPE": smape(test_df["y"].values, recursive_res["forecast"]),
-            "used_feature_count": recursive_res.get("used_feature_count", np.nan)
+            "used_feature_count": recursive_res.get("used_feature_count", np.nan),
+            "backend_name": recursive_res.get("backend_name")
         }])
         return recursive_res
 
@@ -6484,8 +6695,8 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
     dir_wape = wape(test_df["y"].values, direct_res["forecast"])
     best = recursive_res if rec_wape <= dir_wape else direct_res
     best["strategy_comparison"] = pd.DataFrame([
-        {"strategy": "recursive", "WAPE": rec_wape, "sMAPE": smape(test_df["y"].values, recursive_res["forecast"]), "used_feature_count": recursive_res.get("used_feature_count", np.nan)},
-        {"strategy": "direct", "WAPE": dir_wape, "sMAPE": smape(test_df["y"].values, direct_res["forecast"]), "used_feature_count": direct_res.get("used_feature_count", np.nan)},
+        {"strategy": "recursive", "WAPE": rec_wape, "sMAPE": smape(test_df["y"].values, recursive_res["forecast"]), "used_feature_count": recursive_res.get("used_feature_count", np.nan), "backend_name": recursive_res.get("backend_name")},
+        {"strategy": "direct", "WAPE": dir_wape, "sMAPE": smape(test_df["y"].values, direct_res["forecast"]), "used_feature_count": direct_res.get("used_feature_count", np.nan), "backend_name": direct_res.get("backend_name")},
     ]).sort_values(["WAPE", "sMAPE"], ascending=[True, True]).reset_index(drop=True)
     return best
 
