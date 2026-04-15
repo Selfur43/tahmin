@@ -7177,6 +7177,14 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
     return best
 
 def build_model_metrics(model_name: str, y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    err = y_pred - y_true
+    scale = max(float(np.nanmean(np.abs(y_true))) if np.isfinite(np.nanmean(np.abs(y_true))) else 0.0, 1e-6)
+    bias = float(np.nanmean(err)) if len(err) else np.nan
+    bias_pct = float(100.0 * bias / scale) if pd.notna(bias) else np.nan
+    under_forecast_rate = float(np.nanmean((y_pred < y_true).astype(float))) if len(y_true) else np.nan
+    over_forecast_rate = float(np.nanmean((y_pred > y_true).astype(float))) if len(y_true) else np.nan
     return {
         "model": model_name,
         "MAE": mae(y_true, y_pred),
@@ -7185,6 +7193,10 @@ def build_model_metrics(model_name: str, y_train: np.ndarray, y_true: np.ndarray
         "sMAPE": smape(y_true, y_pred),
         "WAPE": wape(y_true, y_pred),
         "MASE": mase(y_true, y_pred, y_train, seasonality=1),
+        "Bias": bias,
+        "BiasPct": bias_pct,
+        "UnderForecastRate": under_forecast_rate,
+        "OverForecastRate": over_forecast_rate,
     }
 
 
@@ -7243,6 +7255,345 @@ def build_model_level_fallback(model_name: str, train_df: pd.DataFrame, test_df:
         "fallback_used": True,
         "fallback_method": method_name,
         "error": str(error_message)
+    }
+
+
+def compute_peak_event_score(y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, quantile: float = 0.80) -> Dict[str, Any]:
+    y_train = np.asarray(y_train, dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    if len(y_true) == 0:
+        return {"peak_threshold": np.nan, "peak_precision": np.nan, "peak_recall": np.nan, "peak_f1": np.nan, "peak_event_score": np.nan}
+    base_hist = y_train[np.isfinite(y_train)] if np.isfinite(y_train).any() else y_true[np.isfinite(y_true)]
+    if len(base_hist) == 0:
+        threshold = np.nanmedian(y_true)
+    else:
+        threshold = float(np.nanquantile(base_hist, quantile))
+    actual_peak = y_true >= threshold
+    pred_peak = y_pred >= max(threshold * 0.98, 1e-6)
+    tp = int(np.sum(actual_peak & pred_peak))
+    fp = int(np.sum((~actual_peak) & pred_peak))
+    fn = int(np.sum(actual_peak & (~pred_peak)))
+    precision = float(tp / max(tp + fp, 1))
+    recall = float(tp / max(tp + fn, 1))
+    f1 = float(2 * precision * recall / max(precision + recall, 1e-12)) if (precision + recall) > 0 else 0.0
+    return {
+        "peak_threshold": threshold,
+        "peak_precision": precision,
+        "peak_recall": recall,
+        "peak_f1": f1,
+        "peak_event_score": f1,
+        "actual_peak_count": int(np.sum(actual_peak)),
+        "pred_peak_count": int(np.sum(pred_peak)),
+    }
+
+
+def build_bias_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for model_name, table in (outputs.get("tables") or {}).items():
+        if table is None or len(table) == 0:
+            continue
+        y_true = pd.to_numeric(table["y"], errors="coerce").astype(float).values
+        y_pred = pd.to_numeric(table["prediction"], errors="coerce").astype(float).values
+        err = y_pred - y_true
+        mean_demand = max(float(np.nanmean(np.abs(y_true))) if len(y_true) else 0.0, 1e-6)
+        rows.append({
+            "model": model_name,
+            "mean_error": float(np.nanmean(err)) if len(err) else np.nan,
+            "median_error": float(np.nanmedian(err)) if len(err) else np.nan,
+            "bias_pct": float(100.0 * np.nanmean(err) / mean_demand) if len(err) else np.nan,
+            "under_forecast_rate": float(np.nanmean((y_pred < y_true).astype(float))) if len(y_true) else np.nan,
+            "over_forecast_rate": float(np.nanmean((y_pred > y_true).astype(float))) if len(y_true) else np.nan,
+            "max_under_error": float(np.nanmin(err)) if len(err) else np.nan,
+            "max_over_error": float(np.nanmax(err)) if len(err) else np.nan,
+        })
+    if not rows:
+        return pd.DataFrame(columns=["model", "mean_error", "median_error", "bias_pct", "under_forecast_rate", "over_forecast_rate", "max_under_error", "max_over_error"])
+    out = pd.DataFrame(rows)
+    out["abs_bias_pct"] = pd.to_numeric(out["bias_pct"], errors="coerce").abs()
+    out = out.sort_values(["abs_bias_pct", "mean_error"], ascending=[True, True]).drop(columns=["abs_bias_pct"]).reset_index(drop=True)
+    return out
+
+
+def build_peak_event_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    y_train = pd.to_numeric(outputs["train"]["y"], errors="coerce").astype(float).values if outputs.get("train") is not None else np.array([])
+    for model_name, table in (outputs.get("tables") or {}).items():
+        if table is None or len(table) == 0:
+            continue
+        peak = compute_peak_event_score(y_train, table["y"].values, table["prediction"].values)
+        peak["model"] = model_name
+        rows.append(peak)
+    if not rows:
+        return pd.DataFrame(columns=["model", "peak_threshold", "peak_precision", "peak_recall", "peak_f1", "peak_event_score", "actual_peak_count", "pred_peak_count"])
+    return pd.DataFrame(rows).sort_values(["peak_event_score", "peak_recall"], ascending=[False, False]).reset_index(drop=True)
+
+
+def estimate_model_interval_scale(outputs: Dict[str, Any], model_name: str) -> float:
+    robt = outputs.get("rolling_origin_backtest")
+    if isinstance(robt, pd.DataFrame) and len(robt) > 0 and "model" in robt.columns:
+        rows = robt.loc[robt["model"] == model_name].copy()
+        if len(rows) > 0 and "MAE" in rows.columns:
+            val = float(pd.to_numeric(rows["MAE"], errors="coerce").median())
+            if np.isfinite(val) and val > 0:
+                return val
+    metrics_df = outputs.get("metrics_df")
+    if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) > 0:
+        row = metrics_df.loc[metrics_df["model"] == model_name]
+        if len(row) > 0:
+            val = float(pd.to_numeric(row.iloc[0].get("MAE", np.nan), errors="coerce"))
+            if np.isfinite(val) and val > 0:
+                return val
+    table = (outputs.get("tables") or {}).get(model_name)
+    if isinstance(table, pd.DataFrame) and len(table) > 0:
+        val = float(pd.to_numeric(table.get("abs_error"), errors="coerce").median())
+        if np.isfinite(val) and val > 0:
+            return val
+    return 1.0
+
+
+def build_prediction_interval_table(test_df: pd.DataFrame, pred: np.ndarray, scale: float, coverage_levels: Tuple[float, ...] = (0.80, 0.90, 0.95)) -> pd.DataFrame:
+    out = test_df[["ds", "y"]].copy().reset_index(drop=True)
+    out["q50"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    z_map = {0.80: 1.2816, 0.90: 1.6449, 0.95: 1.9600}
+    for level in coverage_levels:
+        z = z_map.get(round(float(level), 2), 1.6449)
+        h_idx = np.arange(1, len(out) + 1, dtype=float)
+        width = np.maximum(float(scale), 1e-6) * np.sqrt(h_idx) * z
+        low = np.maximum(out["q50"].values - width, 0.0)
+        high = np.maximum(out["q50"].values + width, 0.0)
+        low_q = int(round(((1.0 - level) / 2.0) * 100.0))
+        high_q = int(round((1.0 - (1.0 - level) / 2.0) * 100.0))
+        out[f"q{low_q:02d}"] = low
+        out[f"q{high_q:02d}"] = high
+        out[f"coverage_{int(level*100)}"] = ((out["y"] >= low) & (out["y"] <= high)).astype(int)
+    return out
+
+
+def build_feature_availability_audit(df_features: pd.DataFrame, date_col: str, target_col: str, stat_exog_cols: List[str], prophet_exog_cols: List[str], ml_feature_cols: List[str]) -> pd.DataFrame:
+    safe_future_keywords = ["month", "quarter", "year", "week", "dayofweek", "dayofmonth", "sin", "cos", "is_month", "is_quarter", "is_year", "holiday", "calendar"]
+    risky_keywords = ["price", "promo", "campaign", "stock", "inventory", "epidem", "rx", "otc", "channel", "weather", "temp", "shipment", "supply"]
+    rows: List[Dict[str, Any]] = []
+    memberships = {}
+    for c in stat_exog_cols:
+        memberships.setdefault(c, set()).add("statistical")
+    for c in prophet_exog_cols:
+        memberships.setdefault(c, set()).add("prophet")
+    for c in ml_feature_cols:
+        memberships.setdefault(c, set()).add("ml")
+    for c, used_in in sorted(memberships.items()):
+        lc = str(c).lower()
+        if any(k in lc for k in safe_future_keywords):
+            status = "future_known"
+            risk_score = 0.05
+            recommendation = "Üretimde güvenle üretilebilir/türetilir."
+        elif any(k in lc for k in risky_keywords):
+            status = "requires_business_plan_or_forecast"
+            risk_score = 0.65
+            recommendation = "Üretim anında bu değişken için ayrı plan/forecast gerekir."
+        else:
+            status = "unknown_future_availability"
+            risk_score = 0.40
+            recommendation = "Üretimde varlığı veri kontratı ile doğrulanmalı."
+        non_na_ratio = float(pd.to_numeric(df_features[c], errors="coerce").notna().mean()) if c in df_features.columns else np.nan
+        rows.append({
+            "feature": c,
+            "used_in": ", ".join(sorted(used_in)),
+            "availability_status": status,
+            "availability_risk_score": risk_score,
+            "historical_non_null_ratio": non_na_ratio,
+            "recommendation": recommendation,
+        })
+    if not rows:
+        return pd.DataFrame(columns=["feature", "used_in", "availability_status", "availability_risk_score", "historical_non_null_ratio", "recommendation"])
+    return pd.DataFrame(rows).sort_values(["availability_risk_score", "feature"], ascending=[False, True]).reset_index(drop=True)
+
+
+def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.DataFrame) -> pd.DataFrame:
+    profile = outputs.get("metadata", {}).get("profile", {}) or {}
+    n_obs = int(outputs.get("metadata", {}).get("train_n", 0) + outputs.get("metadata", {}).get("test_n", 0))
+    intermittency = float(profile.get("intermittency_ratio", 0.0) or 0.0)
+    seasonality = float(profile.get("seasonality_strength", 0.0) or 0.0)
+    trend_strength = float(profile.get("trend_strength", 0.0) or 0.0)
+    val_df = outputs.get("validation_metrics_df", pd.DataFrame()).copy()
+    bias_df = build_bias_dashboard(outputs)
+    peak_df = build_peak_event_dashboard(outputs)
+    metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
+    risk_by_area = {}
+    if isinstance(feature_audit_df, pd.DataFrame) and len(feature_audit_df) > 0 and "used_in" in feature_audit_df.columns:
+        for area in ["statistical", "prophet", "ml"]:
+            rows = feature_audit_df[feature_audit_df["used_in"].str.contains(area, na=False)]
+            risk_by_area[area] = float(rows["availability_risk_score"].max()) if len(rows) else 0.0
+    rows_out: List[Dict[str, Any]] = []
+    for model_name in ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "Intermittent", "Ensemble"]:
+        reasons = []
+        score = 100.0
+        area_risk = 0.0
+        if model_name in ["SARIMA/SARIMAX", "ARIMA"]:
+            area_risk = risk_by_area.get("statistical", 0.0)
+        elif model_name == "Prophet":
+            area_risk = risk_by_area.get("prophet", 0.0)
+        elif model_name == "XGBoost":
+            area_risk = risk_by_area.get("ml", 0.0)
+        score -= 20.0 * area_risk
+        if area_risk >= 0.60:
+            reasons.append("Future-known olmayan feature bağımlılığı yüksek.")
+        val_row = val_df.loc[val_df["model"] == model_name] if len(val_df) else pd.DataFrame()
+        val_wape = float(pd.to_numeric(val_row.iloc[0].get("val_WAPE", np.nan), errors="coerce")) if len(val_row) else np.nan
+        if pd.notna(val_wape):
+            score -= min(max(val_wape - 8.0, 0.0), 40.0)
+            if val_wape > 22.0:
+                reasons.append("Validation WAPE yüksek.")
+        bias_row = bias_df.loc[bias_df["model"] == model_name] if len(bias_df) else pd.DataFrame()
+        bias_pct = float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan
+        if pd.notna(bias_pct):
+            score -= min(abs(bias_pct) * 0.8, 20.0)
+            if abs(bias_pct) > 12.0:
+                reasons.append("Bias yüksek.")
+        peak_row = peak_df.loc[peak_df["model"] == model_name] if len(peak_df) else pd.DataFrame()
+        peak_score = float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan
+        if pd.notna(peak_score):
+            score -= 15.0 * max(0.0, 0.35 - peak_score)
+            if peak_score < 0.20:
+                reasons.append("Peak event yakalama zayıf.")
+        if model_name == "Prophet":
+            if n_obs < 36:
+                score -= 12.0
+                reasons.append("Kısa seri için Prophet kırılgan olabilir.")
+            if intermittency >= 0.25:
+                score -= 18.0
+                reasons.append("Intermittent yapı Prophet için zayıf uyumlu.")
+            if seasonality < 0.15 and trend_strength < 0.08:
+                score -= 10.0
+                reasons.append("Trend/sezonsallık sinyali Prophet için zayıf.")
+        if model_name == "Intermittent" and intermittency < 0.20:
+            score -= 25.0
+            reasons.append("Intermittent model, düzenli seri için birincil aday değil.")
+        if model_name == "XGBoost" and n_obs < 30:
+            score -= 15.0
+            reasons.append("ML model için gözlem sayısı sınırlı.")
+        if model_name == "Ensemble":
+            metric_row = metrics_df.loc[metrics_df["model"] == model_name] if len(metrics_df) else pd.DataFrame()
+            champion_row = metrics_df.head(1)
+            if len(metric_row) and len(champion_row):
+                ens_wape = float(pd.to_numeric(metric_row.iloc[0].get("WAPE", np.nan), errors="coerce"))
+                champ_wape = float(pd.to_numeric(champion_row.iloc[0].get("WAPE", np.nan), errors="coerce"))
+                if pd.notna(ens_wape) and pd.notna(champ_wape) and ens_wape > champ_wape + 0.75:
+                    score -= 20.0
+                    reasons.append("Ensemble champion modele göre anlamlı üstünlük sağlamıyor.")
+        status = "eligible"
+        if score < 72.0:
+            status = "challenger_only"
+        if score < 55.0:
+            status = "reject"
+        rows_out.append({
+            "model": model_name,
+            "eligibility_score": float(np.clip(score, 0.0, 100.0)),
+            "status": status,
+            "validation_wape": val_wape,
+            "bias_pct": bias_pct,
+            "peak_event_score": peak_score,
+            "feature_availability_risk": area_risk,
+            "reasons": " | ".join(reasons) if reasons else "Uygunluk açısından belirgin kırmızı bayrak yok.",
+        })
+    return pd.DataFrame(rows_out).sort_values(["status", "eligibility_score"], ascending=[True, False]).reset_index(drop=True)
+
+
+def build_forecast_value_add(outputs: Dict[str, Any], freq_alias: str) -> pd.DataFrame:
+    train_df = outputs.get("train")
+    test_df = outputs.get("test")
+    if train_df is None or test_df is None or len(test_df) == 0:
+        return pd.DataFrame(columns=["model", "baseline_name", "baseline_WAPE", "model_WAPE", "fva_wape_pct", "baseline_MAE", "model_MAE", "fva_mae_pct"])
+    season_len = infer_season_length_from_freq(freq_alias)
+    baseline_pred, baseline_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, season_len)
+    baseline_w = wape(test_df["y"].values, baseline_pred)
+    baseline_m = mae(test_df["y"].values, baseline_pred)
+    rows = []
+    for _, row in outputs.get("metrics_df", pd.DataFrame()).iterrows():
+        model_name = row["model"]
+        model_w = float(pd.to_numeric(row.get("WAPE", np.nan), errors="coerce"))
+        model_m = float(pd.to_numeric(row.get("MAE", np.nan), errors="coerce"))
+        rows.append({
+            "model": model_name,
+            "baseline_name": baseline_name,
+            "baseline_WAPE": baseline_w,
+            "model_WAPE": model_w,
+            "fva_wape_pct": float(100.0 * (baseline_w - model_w) / max(baseline_w, 1e-6)) if pd.notna(model_w) else np.nan,
+            "baseline_MAE": baseline_m,
+            "model_MAE": model_m,
+            "fva_mae_pct": float(100.0 * (baseline_m - model_m) / max(baseline_m, 1e-6)) if pd.notna(model_m) else np.nan,
+        })
+    return pd.DataFrame(rows).sort_values(["fva_wape_pct", "fva_mae_pct"], ascending=[False, False]).reset_index(drop=True)
+
+
+def build_service_level_simulation(test_df: pd.DataFrame, pred: np.ndarray, interval_df: pd.DataFrame) -> pd.DataFrame:
+    if test_df is None or len(test_df) == 0:
+        return pd.DataFrame(columns=["service_level_target", "achieved_cycle_service", "avg_safety_stock", "avg_total_stock_target", "avg_stockout_units"])
+    actual = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
+    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    rows = []
+    for level, hi_col in [(0.80, "q90"), (0.90, "q95")]:
+        if hi_col not in interval_df.columns:
+            continue
+        stock_target = np.maximum(pd.to_numeric(interval_df[hi_col], errors="coerce").astype(float).values, pred)
+        safety_stock = np.maximum(stock_target - pred, 0.0)
+        achieved = float(np.mean(actual <= stock_target)) if len(actual) else np.nan
+        stockout_units = np.maximum(actual - stock_target, 0.0)
+        rows.append({
+            "service_level_target": level,
+            "achieved_cycle_service": achieved,
+            "avg_safety_stock": float(np.nanmean(safety_stock)) if len(safety_stock) else np.nan,
+            "avg_total_stock_target": float(np.nanmean(stock_target)) if len(stock_target) else np.nan,
+            "avg_stockout_units": float(np.nanmean(stockout_units)) if len(stockout_units) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
+    feature_audit_df = build_feature_availability_audit(
+        export_payload.get("features", pd.DataFrame()),
+        export_payload.get("metadata", {}).get("date_col", "ds"),
+        target_col,
+        outputs.get("metadata", {}).get("stat_exog_cols", []) or [],
+        outputs.get("metadata", {}).get("prophet_exog_cols", []) or [],
+        outputs.get("metadata", {}).get("ml_feature_cols", []) or [],
+    )
+    bias_df = build_bias_dashboard(outputs)
+    peak_df = build_peak_event_dashboard(outputs)
+    eligibility_df = build_model_eligibility_gate(outputs, feature_audit_df)
+    fva_df = build_forecast_value_add(outputs, freq_alias)
+    quantile_tables: Dict[str, pd.DataFrame] = {}
+    service_tables: Dict[str, pd.DataFrame] = {}
+    for model_name, pred in (outputs.get("predictions") or {}).items():
+        scale = estimate_model_interval_scale(outputs, model_name)
+        qdf = build_prediction_interval_table(outputs["test"], pred, scale)
+        quantile_tables[model_name] = qdf
+        service_tables[model_name] = build_service_level_simulation(outputs["test"], pred, qdf)
+    metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
+    ranked = metrics_df.copy()
+    ranked = ranked.merge(eligibility_df[["model", "status", "eligibility_score"]], on="model", how="left")
+    status_rank = {"eligible": 0, "challenger_only": 1, "reject": 2}
+    ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
+    ranked = ranked.sort_values(["status_rank", "WAPE", "sMAPE", "eligibility_score"], ascending=[True, True, True, False], na_position="last").reset_index(drop=True)
+    production_model = ranked.iloc[0]["model"] if len(ranked) else outputs.get("best_model")
+    production_status = ranked.iloc[0]["status"] if len(ranked) else "eligible"
+    if production_status == "reject":
+        production_model = "SARIMA/SARIMAX" if "SARIMA/SARIMAX" in outputs.get("predictions", {}) else outputs.get("best_model")
+        production_status = "guarded_fallback"
+    production_interval = quantile_tables.get(production_model, pd.DataFrame())
+    production_service = service_tables.get(production_model, pd.DataFrame())
+    return {
+        "feature_availability_audit": feature_audit_df,
+        "bias_dashboard": bias_df,
+        "peak_event_dashboard": peak_df,
+        "forecast_value_add": fva_df,
+        "model_eligibility_gate": eligibility_df,
+        "quantile_forecasts": quantile_tables,
+        "service_level_simulation": service_tables,
+        "production_model": production_model,
+        "production_status": production_status,
+        "production_interval_table": production_interval,
+        "production_service_table": production_service,
     }
 
 
@@ -7327,6 +7678,9 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     outputs["stage_timings"] = stage_timings
     outputs["stage_timing_table"] = build_stage_timer_rows(stage_timings)
     outputs["rolling_origin_backtest"] = run_rolling_origin_backtest_light(df_series.loc[df_series["is_usable"], ["ds", "y"]].copy(), outputs, freq_alias, max_folds=3, horizon=min(max(2, int(horizon)), 3))
+    outputs["production_governance"] = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
+    outputs["production_model"] = outputs["production_governance"].get("production_model", outputs.get("best_model"))
+    outputs["production_status"] = outputs["production_governance"].get("production_status", "eligible")
     SEARCH_ACCELERATOR.put_result(pipeline_key, outputs)
     return copy.deepcopy(outputs)
 
@@ -7564,10 +7918,20 @@ def render_streamlit_app():
                 st.write(f"- {note}")
 
     readiness = assess_production_readiness(export_payload, outputs["metrics_df"], target_col)
-    st.warning("Bu sürüm tez ve karar destek için güçlüdür; ancak kör şekilde tam otomatik üretim planı olarak kullanılmamalıdır.")
+    prod_pack = outputs.get("production_governance", {}) or {}
+    prod_model = outputs.get("production_model", outputs.get("best_model"))
+    prod_status = outputs.get("production_status", "eligible")
+    if prod_status in ["eligible", "guarded_fallback"]:
+        st.success(f"Üretim önerisi: {prod_model} | Durum: {prod_status}")
+    else:
+        st.warning(f"Üretim önerisi: {prod_model} | Durum: {prod_status}")
     with st.expander("Üretim kullanımı değerlendirmesi", expanded=False):
         for note in readiness["notes"]:
             st.write(f"- {note}")
+        gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
+        if isinstance(gate_df, pd.DataFrame) and len(gate_df) > 0:
+            st.markdown("**Automatic model eligibility gate**")
+            st.dataframe(style_metric_dataframe(gate_df), width="stretch")
 
     cc = outputs.get("champion_challenger", {})
     if cc.get("champion"):
@@ -7582,7 +7946,7 @@ def render_streamlit_app():
     if fig is not None:
         st.plotly_chart(fig, width="stretch")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Champion-Challenger & Ensemble", "Gerçek vs Tahmin", "Backtest Dashboard", "Önişleme Denetimleri", "Akıllı Yorumlar"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Champion-Challenger & Ensemble", "Gerçek vs Tahmin", "Backtest Dashboard", "Production Governance", "Önişleme Denetimleri", "Akıllı Yorumlar"])
 
     with tab1:
         sarima = outputs.get("sarima")
@@ -7660,6 +8024,21 @@ def render_streamlit_app():
             st.dataframe(export_payload["raw_vs_clean_backtest_report"], width="stretch")
 
     with tab7:
+        prod_pack = outputs.get("production_governance", {}) or {}
+        st.markdown("**Bias dashboard**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("bias_dashboard", pd.DataFrame())), width="stretch")
+        st.markdown("**Peak-event detection score**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("peak_event_dashboard", pd.DataFrame())), width="stretch")
+        st.markdown("**Forecast Value Add (baseline'e göre)**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("forecast_value_add", pd.DataFrame())), width="stretch")
+        st.markdown("**Production feature availability audit**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("feature_availability_audit", pd.DataFrame())), width="stretch")
+        st.markdown("**Üretim modeli için prediction interval / quantile forecast**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("production_interval_table", pd.DataFrame())), width="stretch")
+        st.markdown("**Service-level / stok etkisi simülasyonu**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("production_service_table", pd.DataFrame())), width="stretch")
+
+    with tab8:
         st.markdown("**Kalite raporu**")
         st.dataframe(export_payload["quality_report"], width="stretch")
         st.markdown("**Seri profil raporu**")
@@ -7669,7 +8048,7 @@ def render_streamlit_app():
         st.markdown("**Review queue**")
         st.dataframe(export_payload["review_queue"], width="stretch")
 
-    with tab8:
+    with tab9:
         suggestions = []
         if float(profile.get("seasonality_strength", 0) or 0) >= 0.35:
             suggestions.append("Seri sezonsal; auto seasonal (P,D,Q,m), Prophet custom seasonality ve ensemble kritik.")
