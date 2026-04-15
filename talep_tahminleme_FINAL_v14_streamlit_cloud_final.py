@@ -5424,6 +5424,42 @@ def build_prophet_country_holidays() -> Optional[pd.DataFrame]:
         return None
 
 
+def _fit_basic_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str) -> Dict[str, Any]:
+    if not HAS_PROPHET:
+        raise ImportError("prophet paketi bulunamadı.")
+    tr = train_df[["ds", "y"]].copy()
+    te = test_df[["ds", "y"]].copy()
+    m = Prophet(
+        growth="linear",
+        yearly_seasonality=(freq_alias == "M"),
+        weekly_seasonality=(freq_alias in ["D", "H"]),
+        daily_seasonality=(freq_alias == "H"),
+        seasonality_mode="additive",
+        changepoint_prior_scale=0.05,
+        seasonality_prior_scale=5.0,
+    )
+    try:
+        if freq_alias == "M":
+            m.add_seasonality(name="month_cycle", period=365.25, fourier_order=6)
+    except Exception:
+        pass
+    m.fit(tr)
+    fc = m.predict(te[["ds"]].copy())
+    pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
+    return {
+        "model": m,
+        "forecast_df": fc,
+        "forecast": pred,
+        "config": {"fallback_basic_prophet": True, "growth": "linear", "seasonality_mode": "additive"},
+        "component_validation": {
+            "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,
+            "seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if "yearly" in fc else np.nan,
+            "seasonality_present": bool("yearly" in fc or "weekly" in fc)
+        },
+        "search_table": pd.DataFrame([{"fallback_basic_prophet": True}])
+    }
+
+
 def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if not HAS_PROPHET:
         raise ImportError("prophet paketi bulunamadı.")
@@ -5484,58 +5520,62 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             if composite < best_score:
                 best_score = composite
                 best = cfg
-        except Exception:
+        except Exception as e:
+            rows.append({**cfg, "val_wape": np.nan, "val_smape": np.nan, "composite_score": np.inf, "error": str(e)[:300]})
             continue
 
     if best is None:
-        raise RuntimeError("Prophet modeli kurulamadı.")
+        return _fit_basic_prophet(train_df, test_df, freq_alias)
 
     tr_fit = tr_full.copy()
     te_fit = te_full.copy()
-    if best["growth"] == "logistic":
-        cap = max(1.1 * float(tr_fit["y"].max()), 1.0)
-        floor = 0.0
-        tr_fit["cap"] = cap
-        tr_fit["floor"] = floor
-        te_fit["cap"] = cap
-        te_fit["floor"] = floor
-    m = Prophet(
-        growth=best["growth"],
-        yearly_seasonality=(freq_alias == "M"),
-        weekly_seasonality=(freq_alias in ["D", "H"]),
-        daily_seasonality=(freq_alias == "H"),
-        seasonality_mode=best["seasonality_mode"],
-        changepoint_prior_scale=best["changepoint_prior_scale"],
-        seasonality_prior_scale=best["seasonality_prior_scale"]
-    )
     try:
-        m.add_country_holidays(country_name="Turkey")
-    except Exception:
-        pass
-    if freq_alias == "M":
-        m.add_seasonality(name="month_cycle", period=365.25, fourier_order=8)
-    if freq_alias == "W":
-        m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=10)
-    for c in exog_cols:
-        m.add_regressor(c)
-    m.fit(tr_fit)
-    future = te_fit.drop(columns=["y"]).copy()
-    fc = m.predict(future)
-    pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
+        if best["growth"] == "logistic":
+            cap = max(1.1 * float(tr_fit["y"].max()), 1.0)
+            floor = 0.0
+            tr_fit["cap"] = cap
+            tr_fit["floor"] = floor
+            te_fit["cap"] = cap
+            te_fit["floor"] = floor
+        m = Prophet(
+            growth=best["growth"],
+            yearly_seasonality=(freq_alias == "M"),
+            weekly_seasonality=(freq_alias in ["D", "H"]),
+            daily_seasonality=(freq_alias == "H"),
+            seasonality_mode=best["seasonality_mode"],
+            changepoint_prior_scale=best["changepoint_prior_scale"],
+            seasonality_prior_scale=best["seasonality_prior_scale"]
+        )
+        try:
+            m.add_country_holidays(country_name="Turkey")
+        except Exception:
+            pass
+        if freq_alias == "M":
+            m.add_seasonality(name="month_cycle", period=365.25, fourier_order=8)
+        if freq_alias == "W":
+            m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=10)
+        for c in exog_cols:
+            m.add_regressor(c)
+        m.fit(tr_fit)
+        future = te_fit.drop(columns=["y"]).copy()
+        fc = m.predict(future)
+        pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
 
-    comp_summary = {
-        "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,
-        "seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if "yearly" in fc else np.nan,
-        "seasonality_present": bool("yearly" in fc or "weekly" in fc)
-    }
-    return {
-        "model": m,
-        "forecast_df": fc,
-        "forecast": pred,
-        "config": best,
-        "component_validation": comp_summary,
-        "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True]).reset_index(drop=True)
-    }
+        comp_summary = {
+            "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,
+            "seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if "yearly" in fc else np.nan,
+            "seasonality_present": bool("yearly" in fc or "weekly" in fc)
+        }
+        return {
+            "model": m,
+            "forecast_df": fc,
+            "forecast": pred,
+            "config": best,
+            "component_validation": comp_summary,
+            "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True)
+        }
+    except Exception:
+        return _fit_basic_prophet(train_df, test_df, freq_alias)
 
 
 def build_recursive_feature_row(history_values: List[float], target_date: pd.Timestamp, freq_alias: str, exog_row: Optional[pd.Series], all_feature_names: List[str]) -> pd.DataFrame:
@@ -6110,7 +6150,7 @@ def render_streamlit_app():
 
     fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin")
     if fig is not None:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True) if fig is not None else st.line_chart(build_actual_vs_pred_df(outputs["data"]["test_df"], outputs["predictions"]))
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Champion-Challenger & Ensemble", "Gerçek vs Tahmin", "Backtest Dashboard", "Önişleme Denetimleri", "Akıllı Yorumlar"])
 
@@ -6124,7 +6164,7 @@ def render_streamlit_app():
                 st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), use_container_width=True)
                 fig_sarima = plot_forecast_results(outputs["train"], outputs["test"], {"SARIMA/SARIMAX": outputs["predictions"]["SARIMA/SARIMAX"]}, f"{target_col} - SARIMA/SARIMAX")
                 if fig_sarima is not None:
-                    st.plotly_chart(fig_sarima, use_container_width=True)
+                    st.plotly_chart(fig_sarima, use_container_width=True) if fig_sarima is not None else st.line_chart(build_actual_vs_pred_df(outputs["data"]["test_df"], {"SARIMA/SARIMAX": outputs["predictions"].get("SARIMA/SARIMAX", np.full(len(outputs["data"]["test_df"]), np.nan))}))
             if isinstance(sarima.get("search_table"), pd.DataFrame) and len(sarima.get("search_table")):
                 st.dataframe(style_metric_dataframe(sarima["search_table"]), use_container_width=True)
 
@@ -6137,7 +6177,7 @@ def render_streamlit_app():
             st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), use_container_width=True)
             fig_prophet = plot_forecast_results(outputs["train"], outputs["test"], {"Prophet": outputs["predictions"]["Prophet"]}, f"{target_col} - Prophet")
             if fig_prophet is not None:
-                st.plotly_chart(fig_prophet, use_container_width=True)
+                st.plotly_chart(fig_prophet, use_container_width=True) if fig_prophet is not None else st.line_chart(build_actual_vs_pred_df(outputs["data"]["test_df"], {"Prophet": outputs["predictions"].get("Prophet", np.full(len(outputs["data"]["test_df"]), np.nan))}))
             st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), use_container_width=True)
         else:
             st.warning(outputs.get("prophet_error", "Prophet sonucu üretilemedi."))
@@ -6151,7 +6191,7 @@ def render_streamlit_app():
                 st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), use_container_width=True)
                 fig_xgb = plot_forecast_results(outputs["train"], outputs["test"], {"XGBoost": outputs["predictions"]["XGBoost"]}, f"{target_col} - XGBoost")
                 if fig_xgb is not None:
-                    st.plotly_chart(fig_xgb, use_container_width=True)
+                    st.plotly_chart(fig_xgb, use_container_width=True) if fig_xgb is not None else st.line_chart(build_actual_vs_pred_df(outputs["data"]["test_df"], {"XGBoost": outputs["predictions"].get("XGBoost", np.full(len(outputs["data"]["test_df"]), np.nan))}))
             st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), use_container_width=True)
             if "strategy_comparison" in outputs["xgboost"]:
                 st.dataframe(style_metric_dataframe(outputs["xgboost"]["strategy_comparison"]), use_container_width=True)
@@ -6166,7 +6206,7 @@ def render_streamlit_app():
         st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), use_container_width=True)
         fig_ens = plot_forecast_results(outputs["train"], outputs["test"], {"Ensemble": outputs["predictions"]["Ensemble"]}, f"{target_col} - Ensemble")
         if fig_ens is not None:
-            st.plotly_chart(fig_ens, use_container_width=True)
+            st.plotly_chart(fig_ens, use_container_width=True) if fig_ens is not None else st.line_chart(build_actual_vs_pred_df(outputs["data"]["test_df"], {"Ensemble": outputs["predictions"].get("Ensemble", np.full(len(outputs["data"]["test_df"]), np.nan))}))
 
     with tab5:
         combined = outputs["all_predictions_long"].copy()
