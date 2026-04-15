@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 
 
@@ -5597,8 +5597,107 @@ def build_actual_vs_pred_df(test_df: pd.DataFrame, pred: np.ndarray, model_name:
     out["ape"] = np.where(np.abs(out["y"]) > 1e-8, np.abs(out["y"] - out["prediction"]) / np.abs(out["y"]) * 100.0, np.nan)
     return out
 
+TURKCE_KOLON_HARITASI = {
+    "model": "Model",
+    "prediction": "Tahmin",
+    "abs_error": "Mutlak Hata",
+    "ape": "Mutlak Yüzde Hata",
+    "ds": "Tarih",
+    "y": "Gerçek",
+    "WAPE": "WAPE",
+    "sMAPE": "sMAPE",
+    "RMSE": "RMSE",
+    "MAE": "MAE",
+    "MAPE": "MAPE",
+    "MASE": "MASE",
+    "Bias": "Sapma",
+    "BiasPct": "SapmaYüzde",
+    "bias_pct": "SapmaYüzde",
+    "under_forecast_rate": "EksikTahminOranı",
+    "over_forecast_rate": "FazlaTahminOranı",
+    "UnderForecastRate": "EksikTahminOranı",
+    "OverForecastRate": "FazlaTahminOranı",
+    "eligibility_score": "UygunlukSkoru",
+    "status": "Durum",
+    "reasons": "Gerekçeler",
+    "feature_availability_risk": "ÖzellikErişimRiski",
+    "validation_wape": "DoğrulamaWAPE",
+    "rolling_wape": "RollingWAPE",
+    "peak_event_score": "TepeOlaySkoru",
+    "peak_precision": "TepeKesinlik",
+    "peak_recall": "TepeDuyarlılık",
+    "peak_f1": "TepeF1",
+    "actual_peak_count": "GerçekTepeSayısı",
+    "pred_peak_count": "TahminTepeSayısı",
+    "service_level_target": "HedefServisSeviyesi",
+    "achieved_cycle_service": "GerçekleşenServisSeviyesi",
+    "service_gap": "ServisAçığı",
+    "quantile_10": "AltBant_10",
+    "quantile_20": "AltBant_20",
+    "quantile_80": "ÜstBant_80",
+    "quantile_90": "ÜstBant_90",
+    "coverage_80": "Kapsama_80",
+    "coverage_90": "Kapsama_90",
+    "coverage_95": "Kapsama_95",
+    "interval_width_80": "BantGenişliği_80",
+    "interval_width_90": "BantGenişliği_90",
+    "interval_width_95": "BantGenişliği_95",
+    "production_model": "ÜretimModeli",
+    "production_status": "ÜretimDurumu",
+    "drift_ratio_vs_recent": "YakınDönemDriftOranı",
+    "max_feature_risk": "MaksÖzellikRiski",
+    "fallback_rate": "FallbackOranı",
+    "target_service": "HedefServis",
+    "achieved_service": "GerçekleşenServis",
+    "deployment_recommendation": "DağıtımÖnerisi",
+    "alert": "Alarm",
+    "detail": "Detay",
+    "severity": "Şiddet",
+    "weight": "Ağırlık",
+    "raw_weight": "HamAğırlık",
+    "val_WAPE": "DoğrulamaWAPE",
+    "val_sMAPE": "DoğrulamasMAPE",
+    "ro_WAPE": "RollingWAPE",
+    "ro_MAE": "RollingMAE",
+    "strategy": "Strateji",
+    "backend_name": "ArkaUç",
+    "used_feature_count": "KullanılanÖzellikSayısı",
+    "fallback_used": "FallbackKullanıldı",
+    "fallback_method": "FallbackYöntemi",
+    "champion": "Şampiyon",
+    "challenger": "MeydanOkuyan",
+    "karar_kademesi": "KararKademesi",
+}
+
+TURKCE_DEGER_HARITASI = {
+    "eligible": "uygun",
+    "challenger_only": "yalnız_meydan_okuyan",
+    "reject": "reddet",
+    "guarded_fallback": "korumalı_fallback",
+    "guarded_use_only": "yalnız_korumalı_kullanım",
+    "eligible_for_guarded_production": "korumalı_üretime_uygun",
+    "champion_challenger_parallel_run": "şampiyon_meydan_okuyan_paralel_çalıştır",
+    "shadow_mode_required": "gölge_mod_zorunlu",
+    "high": "yüksek",
+    "medium": "orta",
+    "bias_alert": "sapma_alarmı",
+    "under_forecast_alert": "eksik_tahmin_alarmı",
+    "peak_capture_alert": "tepe_yakalama_alarmı",
+    "forecast_drift_alert": "tahmin_drift_alarmı",
+    "feature_contract_alert": "özellik_sözleşmesi_alarmı",
+    "service_level_alert": "servis_seviyesi_alarmı",
+    "fallback_rate_alert": "fallback_oranı_alarmı",
+}
+
+
+def _turkcelestir_df_kolonlari(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [TURKCE_KOLON_HARITASI.get(str(c), str(c)) for c in out.columns]
+    return out
+
+
 def style_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Format only numeric-like columns while preserving datetimes, strings and nested objects."""
+    """Sayıları biçimlendirir, durum alanlarını Türkçeleştirir ve veri çerçevesini gösterime hazırlar."""
     out = df.copy()
     for c in out.columns:
         s = out[c]
@@ -5618,20 +5717,21 @@ def style_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             if isinstance(x, (list, tuple, dict, set)):
                 return json.dumps(list(x) if isinstance(x, set) else x, ensure_ascii=False)
             if isinstance(x, str):
+                xv = TURKCE_DEGER_HARITASI.get(x.strip(), x)
                 try:
-                    stripped = x.strip()
+                    stripped = xv.strip()
                     if stripped == "":
-                        return x
+                        return xv
                     return round(float(stripped), 4)
                 except Exception:
-                    return x
+                    return xv
             try:
                 return round(float(x), 4)
             except Exception:
-                return x
+                return TURKCE_DEGER_HARITASI.get(str(x), x)
 
         out[c] = s.map(_safe_fmt)
-    return out
+    return _turkcelestir_df_kolonlari(out)
 
 def dataframe_to_download_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
@@ -5654,7 +5754,7 @@ def build_acf_pacf_figure(train_df: pd.DataFrame, target_col: str):
 def plot_forecast_results(train_df: pd.DataFrame, test_df: pd.DataFrame, predictions: Dict[str, np.ndarray], title: str):
     if HAS_PLOTLY:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=train_df["ds"], y=train_df["y"], mode="lines+markers", name="Train"))
+        fig.add_trace(go.Scatter(x=train_df["ds"], y=train_df["y"], mode="lines+markers", name="Eğitim"))
         fig.add_trace(go.Scatter(x=test_df["ds"], y=test_df["y"], mode="lines+markers", name="Gerçek"))
         for name, pred in predictions.items():
             fig.add_trace(go.Scatter(x=test_df["ds"], y=pred, mode="lines+markers", name=name))
@@ -7229,9 +7329,72 @@ def build_champion_challenger(metrics_df: pd.DataFrame) -> Dict[str, Any]:
     ranked = metrics_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
     champion = ranked.iloc[0]["model"] if len(ranked) >= 1 else None
     challenger = ranked.iloc[1]["model"] if len(ranked) >= 2 else None
-    return {"champion": champion, "challenger": challenger, "ranking": ranked}
+    return {"champion": champion, "challenger": challenger, "holdout_winner": champion, "ranking": ranked}
 
 
+def build_weighted_ensemble(pred_map: Dict[str, np.ndarray], metrics_df: pd.DataFrame, validation_df: Optional[pd.DataFrame] = None) -> Tuple[np.ndarray, pd.DataFrame]:
+    if validation_df is not None and len(validation_df) > 0:
+        use_df = validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy()
+        score_cols = ["val_WAPE", "val_sMAPE"]
+        sort_cols = score_cols
+    else:
+        use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
+        score_cols = ["WAPE", "sMAPE"]
+        sort_cols = ["WAPE", "sMAPE", "RMSE"]
+    if len(use_df) == 0:
+        raise ValueError("Ensemble için model yok.")
+    use_df = use_df.sort_values(sort_cols, ascending=[True] * len(sort_cols), na_position="last").reset_index(drop=True)
+    primary_col = score_cols[0]
+    best_score = float(pd.to_numeric(pd.Series([use_df.iloc[0][primary_col]]), errors="coerce").iloc[0])
+    if not np.isfinite(best_score):
+        best_score = 1e6
+
+    filtered = use_df.copy()
+    if "Prophet" in filtered["model"].tolist():
+        pr = filtered.loc[filtered["model"] == "Prophet"].head(1)
+        if len(pr):
+            pscore = float(pd.to_numeric(pr.iloc[0].get(primary_col, np.nan), errors="coerce"))
+            if pd.notna(pscore) and pscore > min(best_score * 1.15, best_score + 1.0):
+                filtered = filtered.loc[filtered["model"] != "Prophet"].copy()
+    if "Intermittent" in filtered["model"].tolist() and len(filtered) > 2:
+        ir = filtered.loc[filtered["model"] == "Intermittent"].head(1)
+        if len(ir):
+            iscore = float(pd.to_numeric(ir.iloc[0].get(primary_col, np.nan), errors="coerce"))
+            if pd.notna(iscore) and iscore > min(best_score * 1.10, best_score + 0.75):
+                filtered = filtered.loc[filtered["model"] != "Intermittent"].copy()
+
+    prune_threshold = min(best_score * 1.20, best_score + 1.25)
+    pruned = filtered.loc[pd.to_numeric(filtered[primary_col], errors="coerce") <= prune_threshold].copy()
+    if len(pruned) < 2:
+        pruned = filtered.head(min(2, len(filtered))).copy()
+    if len(pruned) > 3:
+        pruned = pruned.head(3).copy()
+
+    rel_gap = (pd.to_numeric(pruned[primary_col], errors="coerce") - best_score).clip(lower=0.0)
+    pruned["raw_weight"] = np.exp(-2.75 * rel_gap)
+    pruned = pruned.sort_values(primary_col, ascending=True).reset_index(drop=True)
+    w = pruned["raw_weight"].astype(float).values
+    if np.sum(w) <= 0:
+        w = np.ones_like(w)
+    w = w / np.sum(w)
+    if len(w) >= 2 and w[0] < 0.50:
+        deficit = 0.50 - w[0]
+        w[0] = 0.50
+        rest = w[1:]
+        rest = rest / max(rest.sum(), 1e-9)
+        w[1:] = np.maximum(0.0, w[1:] - deficit * rest)
+        w = w / max(w.sum(), 1e-9)
+    pruned["weight"] = w
+    ensemble = None
+    for _, row in pruned.iterrows():
+        pred = np.asarray(pred_map[row["model"]], dtype=float)
+        ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
+    out_cols = ["model"]
+    for c in ["val_WAPE", "val_sMAPE", "WAPE", "sMAPE"]:
+        if c in pruned.columns:
+            out_cols.append(c)
+    out_cols += ["raw_weight", "weight"]
+    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[out_cols]
 def build_weighted_ensemble(pred_map: Dict[str, np.ndarray], metrics_df: pd.DataFrame, validation_df: Optional[pd.DataFrame] = None) -> Tuple[np.ndarray, pd.DataFrame]:
     if validation_df is not None and len(validation_df) > 0:
         use_df = validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy()
@@ -7444,6 +7607,9 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
     bias_df = build_bias_dashboard(outputs)
     peak_df = build_peak_event_dashboard(outputs)
     metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
+    robt = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    best_val = float(pd.to_numeric(val_df.get("val_WAPE"), errors="coerce").min()) if len(val_df) else np.nan
+    best_ro = float(pd.to_numeric(robt.get("WAPE"), errors="coerce").min()) if len(robt) else np.nan
     risk_by_area = {}
     if isinstance(feature_audit_df, pd.DataFrame) and len(feature_audit_df) > 0 and "used_in" in feature_audit_df.columns:
         for area in ["statistical", "prophet", "ml"]:
@@ -7462,66 +7628,94 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
             area_risk = risk_by_area.get("ml", 0.0)
         score -= 20.0 * area_risk
         if area_risk >= 0.60:
-            reasons.append("Future-known olmayan feature bağımlılığı yüksek.")
+            reasons.append("Gelecekte hazır olmayabilecek özellik bağımlılığı yüksek.")
         val_row = val_df.loc[val_df["model"] == model_name] if len(val_df) else pd.DataFrame()
         val_wape = float(pd.to_numeric(val_row.iloc[0].get("val_WAPE", np.nan), errors="coerce")) if len(val_row) else np.nan
         if pd.notna(val_wape):
             score -= min(max(val_wape - 8.0, 0.0), 40.0)
             if val_wape > 22.0:
-                reasons.append("Validation WAPE yüksek.")
+                reasons.append("Doğrulama WAPE yüksek.")
+            if pd.notna(best_val) and val_wape > min(best_val * 1.12, best_val + 1.0):
+                score -= 8.0
+                reasons.append("Doğrulama performansı lider modele göre belirgin zayıf.")
+        ro_row = robt.loc[robt["model"] == model_name] if len(robt) else pd.DataFrame()
+        ro_wape = float(pd.to_numeric(ro_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(ro_row) else np.nan
+        if pd.notna(ro_wape):
+            score -= min(max(ro_wape - 8.0, 0.0) * 1.3, 35.0)
+            if pd.notna(best_ro) and ro_wape > min(best_ro * 1.08, best_ro + 0.75):
+                score -= 10.0
+                reasons.append("Rolling-origin performansı lider modele göre zayıf.")
         bias_row = bias_df.loc[bias_df["model"] == model_name] if len(bias_df) else pd.DataFrame()
         bias_pct = float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan
         if pd.notna(bias_pct):
             score -= min(abs(bias_pct) * 0.8, 20.0)
             if abs(bias_pct) > 12.0:
-                reasons.append("Bias yüksek.")
+                reasons.append("Sapma yüksek.")
         peak_row = peak_df.loc[peak_df["model"] == model_name] if len(peak_df) else pd.DataFrame()
         peak_score = float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan
         if pd.notna(peak_score):
-            score -= 15.0 * max(0.0, 0.35 - peak_score)
-            if peak_score < 0.20:
-                reasons.append("Peak event yakalama zayıf.")
+            score -= 15.0 * max(0.0, 0.45 - peak_score)
+            if peak_score < 0.35:
+                reasons.append("Tepe dönem yakalama zayıf.")
         if model_name == "Prophet":
-            if n_obs < 36:
-                score -= 12.0
-                reasons.append("Kısa seri için Prophet kırılgan olabilir.")
-            if intermittency >= 0.25:
+            if n_obs < 84:
+                score -= 16.0
+                reasons.append("Kısa aylık seri için Prophet kırılgan olabilir.")
+            if intermittency >= 0.20:
+                score -= 20.0
+                reasons.append("Aralıklı yapı Prophet için zayıf uyumlu.")
+            if seasonality < 0.18 and trend_strength < 0.10:
+                score -= 14.0
+                reasons.append("Trend/sezonsallık sinyali Prophet için sınırlı.")
+            if bool((outputs.get("prophet") or {}).get("fallback_used", False)):
                 score -= 18.0
-                reasons.append("Intermittent yapı Prophet için zayıf uyumlu.")
-            if seasonality < 0.15 and trend_strength < 0.08:
-                score -= 10.0
-                reasons.append("Trend/sezonsallık sinyali Prophet için zayıf.")
+                reasons.append("Prophet fallback ile çalıştı; üretim için güven zayıf.")
+            hold_row = metrics_df.loc[metrics_df["model"] == "Prophet"] if len(metrics_df) else pd.DataFrame()
+            hold_wape = float(pd.to_numeric(hold_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(hold_row) else np.nan
+            best_hold = float(pd.to_numeric(metrics_df.get("WAPE"), errors="coerce").min()) if len(metrics_df) else np.nan
+            if pd.notna(hold_wape) and pd.notna(best_hold) and hold_wape > min(best_hold * 1.15, best_hold + 1.0):
+                score -= 12.0
+                reasons.append("Holdout performansı lider modele göre zayıf.")
         if model_name == "Intermittent" and intermittency < 0.20:
             score -= 25.0
             reasons.append("Intermittent model, düzenli seri için birincil aday değil.")
         if model_name == "XGBoost" and n_obs < 30:
             score -= 15.0
-            reasons.append("ML model için gözlem sayısı sınırlı.")
+            reasons.append("Makine öğrenmesi için gözlem sayısı sınırlı.")
         if model_name == "Ensemble":
             metric_row = metrics_df.loc[metrics_df["model"] == model_name] if len(metrics_df) else pd.DataFrame()
-            champion_row = metrics_df.head(1)
+            champion_row = metrics_df.sort_values(["WAPE", "sMAPE"], ascending=[True, True]).head(1)
             if len(metric_row) and len(champion_row):
                 ens_wape = float(pd.to_numeric(metric_row.iloc[0].get("WAPE", np.nan), errors="coerce"))
                 champ_wape = float(pd.to_numeric(champion_row.iloc[0].get("WAPE", np.nan), errors="coerce"))
-                if pd.notna(ens_wape) and pd.notna(champ_wape) and ens_wape > champ_wape + 0.75:
-                    score -= 20.0
-                    reasons.append("Ensemble champion modele göre anlamlı üstünlük sağlamıyor.")
+                if pd.notna(ens_wape) and pd.notna(champ_wape) and ens_wape > champ_wape + 0.50:
+                    score -= 24.0
+                    reasons.append("Ansambl, lider modelin üzerine çıkamıyor.")
         status = "eligible"
-        if score < 72.0:
+        if model_name == "Prophet" and score < 82.0:
             status = "challenger_only"
-        if score < 55.0:
+        elif score < 75.0:
+            status = "challenger_only"
+        if model_name == "Prophet" and score < 68.0:
+            status = "reject"
+        elif score < 58.0:
             status = "reject"
         rows_out.append({
             "model": model_name,
             "eligibility_score": float(np.clip(score, 0.0, 100.0)),
             "status": status,
             "validation_wape": val_wape,
+            "rolling_wape": ro_wape,
             "bias_pct": bias_pct,
             "peak_event_score": peak_score,
             "feature_availability_risk": area_risk,
             "reasons": " | ".join(reasons) if reasons else "Uygunluk açısından belirgin kırmızı bayrak yok.",
         })
-    return pd.DataFrame(rows_out).sort_values(["status", "eligibility_score"], ascending=[True, False]).reset_index(drop=True)
+    rank_map = {"eligible": 0, "challenger_only": 1, "reject": 2}
+    out = pd.DataFrame(rows_out)
+    out["status_rank"] = out["status"].map(rank_map).fillna(9)
+    out = out.sort_values(["status_rank", "eligibility_score"], ascending=[True, False]).drop(columns=["status_rank"]).reset_index(drop=True)
+    return out
 
 
 def build_forecast_value_add(outputs: Dict[str, Any], freq_alias: str) -> pd.DataFrame:
@@ -8166,11 +8360,20 @@ def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Di
     ranked["under_penalty"] = (pd.to_numeric(ranked.get("under_forecast_rate"), errors="coerce").fillna(0.0) - 0.50).clip(lower=0.0)
     ranked["peak_penalty"] = (0.45 - pd.to_numeric(ranked.get("peak_event_score"), errors="coerce").fillna(0.0)).clip(lower=0.0)
     ranked["service_penalty"] = pd.to_numeric(ranked.get("service_gap"), errors="coerce").fillna(0.0)
-    sort_cols = ["status_rank", "WAPE", "sMAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
+    ranked["ro_WAPE_norm"] = pd.to_numeric(ranked.get("ro_WAPE"), errors="coerce")
+    ranked["hold_WAPE_norm"] = pd.to_numeric(ranked.get("WAPE"), errors="coerce")
+    ranked["operasyonel_skor"] = (
+        ranked["status_rank"].fillna(9.0) * 1000.0
+        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.55
+        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.20
+        + ranked["service_penalty"].fillna(0.0) * 18.0
+        + ranked["under_penalty"].fillna(0.0) * 12.0
+        + ranked["bias_penalty"].fillna(0.0) * 1.2
+        + ranked["peak_penalty"].fillna(0.0) * 10.0
+        - pd.to_numeric(ranked.get("eligibility_score"), errors="coerce").fillna(0.0) * 0.03
+    )
+    sort_cols = ["operasyonel_skor", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
     asc = [True, True, True, True, True, True, True, False]
-    if "ro_WAPE" in ranked.columns:
-        sort_cols = ["status_rank", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
-        asc = [True, True, True, True, True, True, True, False]
     ranked = ranked.sort_values(sort_cols, ascending=asc, na_position="last").reset_index(drop=True)
     production_model = ranked.iloc[0]["model"] if len(ranked) else outputs.get("best_model")
     production_status = ranked.iloc[0]["status"] if len(ranked) else "eligible"
@@ -8200,7 +8403,7 @@ def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics
             alerts_df = live_pack.get("alerts", pd.DataFrame()) if isinstance(live_pack, dict) else pd.DataFrame()
             if len(gate_df):
                 top = gate_df.sort_values(["status", "eligibility_score"], ascending=[True, False]).iloc[0]
-                notes.append(f"Production gate: {top['model']} -> {top['status']} (score={safe_float(top.get('eligibility_score')):.1f})")
+                notes.append(f"Üretim kapısı: {top['model']} -> {TURKCE_DEGER_HARITASI.get(str(top['status']), top['status'])} (skor={safe_float(top.get('eligibility_score')):.1f})")
             if len(alerts_df):
                 notes.append(f"Canlı izleme için {len(alerts_df)} alarm üretildi; kör tam otomasyon öncesi shadow-mode zorunlu.")
         if not profile_df.empty and "series" in profile_df.columns:
@@ -8234,16 +8437,33 @@ def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics
         notes.append("Bu çıktı tez ve analitik inceleme için uygundur; tam otomatik gerçek hayat kullanımı için ek doğrulama gerekir.")
     return {"status": status, "notes": notes}
 
+def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
+    satirlar = []
+    hold_df = outputs.get("metrics_df", pd.DataFrame())
+    val_df = outputs.get("validation_metrics_df", pd.DataFrame())
+    ro_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    prod_pack = outputs.get("production_governance", {}) or {}
+    prod_rank = prod_pack.get("production_ranking", pd.DataFrame())
+    hold_winner = hold_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).iloc[0]["model"] if len(hold_df) else None
+    val_winner = val_df.sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True]).iloc[0]["model"] if len(val_df) else None
+    ro_winner = ro_df.sort_values(["WAPE", "MAE"], ascending=[True, True]).iloc[0]["model"] if len(ro_df) else None
+    prod_winner = prod_rank.iloc[0]["model"] if len(prod_rank) else outputs.get("production_model")
+    satirlar.append({"karar_kademesi": "Holdout kazananı", "model": hold_winner})
+    satirlar.append({"karar_kademesi": "Doğrulama kazananı", "model": val_winner})
+    satirlar.append({"karar_kademesi": "Rolling-origin kazananı", "model": ro_winner})
+    satirlar.append({"karar_kademesi": "Üretim kazananı", "model": prod_winner})
+    return pd.DataFrame(satirlar)
+
 def render_streamlit_app():
     st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
     st.title("Talep Tahminleme Studio")
-    st.caption("Production-grade veri önişleme + ileri seviye champion-challenger + ensemble + batch forecasting")
+    st.caption("Üretim sınıfı veri önişleme + ileri seviye şampiyon-meydan okuyan + ansambl + toplu tahminleme")
 
     with st.sidebar:
         st.subheader("Girdi")
         uploaded_excel = st.file_uploader("Excel dosyası yükle", type=["xlsx", "xls"])
-        st.markdown("Bu uygulama mevcut production-grade veri önişleme mantığını korur; üstüne SARIMA/SARIMAX, Prophet, XGBoost, ensemble, ABC/XYZ ve batch forecasting ekler.")
-        st.info("İnteraktif hız modu açık: özellikle kısa aylık serilerde SARIMAX exog ve Prophet tuning otomatik daraltılır. Amaç, Streamlit ekranında takılmayı önlemek ve yanıt süresini düşürmektir.")
+        st.markdown("Bu uygulama mevcut üretim sınıfı veri önişleme mantığını korur; üstüne SARIMA/SARIMAX, Prophet, XGBoost, ansambl, ABC/XYZ ve toplu tahminleme ekler.")
+        st.info("İnteraktif hız modu açık: özellikle kısa aylık serilerde SARIMAX açıklayıcı değişken ve Prophet ayar araması otomatik daraltılır. Amaç, Streamlit ekranında takılmayı önlemek ve yanıt süresini düşürmektir.")
 
     if uploaded_excel is None:
         st.info("Başlamak için Excel dosyanı yükle.")
@@ -8398,12 +8618,14 @@ def render_streamlit_app():
             st.write(f"- {note}")
         gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
         if isinstance(gate_df, pd.DataFrame) and len(gate_df) > 0:
-            st.markdown("**Automatic model eligibility gate**")
+            st.markdown("**Otomatik model uygunluk kapısı**")
             st.dataframe(style_metric_dataframe(gate_df), width="stretch")
 
     cc = outputs.get("champion_challenger", {})
     if cc.get("champion"):
-        st.success(f"Champion model: {cc['champion']} | Challenger: {cc.get('challenger', '-')}")
+        st.success(f"Şampiyon model: {cc['champion']} | Meydan okuyan: {cc.get('challenger', '-')}")
+    st.markdown("**Karar kademelerine göre model liderleri**")
+    st.dataframe(style_metric_dataframe(build_model_liderleri(outputs)), width="stretch")
     if outputs.get("model_errors"):
         with st.expander("Model hata / fallback özeti"):
             err_df = pd.DataFrame([{"model": k, "message": v} for k, v in outputs.get("model_errors", {}).items()])
@@ -8414,14 +8636,14 @@ def render_streamlit_app():
     if fig is not None:
         st.plotly_chart(fig, width="stretch")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Champion-Challenger & Ensemble", "Gerçek vs Tahmin", "Backtest Dashboard", "Production Governance", "Önişleme Denetimleri", "Akıllı Yorumlar"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Şampiyon-Meydan Okuyan ve Ansambl", "Gerçek vs Tahmin", "Geri Test Panosu", "Üretim Yönetişimi", "Önişleme Denetimleri", "Akıllı Değerlendirmeler"])
 
     with tab1:
         sarima = outputs.get("sarima")
         if sarima is None:
             st.warning(outputs.get("model_errors", {}).get("SARIMA/SARIMAX", "SARIMA/SARIMAX sonucu üretilemedi."))
         else:
-            st.json({"order": sarima.get("order"), "seasonal_order": sarima.get("seasonal_order"), "trend": sarima.get("trend"), "AIC": sarima.get("aic"), "BIC": sarima.get("bic"), "Ljung-Box p-value": sarima.get("ljung_box_pvalue"), "d": sarima.get("d"), "D": sarima.get("D"), "transform": sarima.get("transform"), "white_noise_ok": sarima.get("residual_white_noise_ok"), "fallback_used": sarima.get("fallback_used"), "fallback_method": sarima.get("fallback_method")})
+            st.json({"order": sarima.get("order"), "seasonal_order": sarima.get("seasonal_order"), "trend": sarima.get("trend"), "AIC": sarima.get("aic"), "BIC": sarima.get("bic"), "Ljung-Box p-değeri": sarima.get("ljung_box_pvalue"), "d": sarima.get("d"), "D": sarima.get("D"), "transform": sarima.get("transform"), "white_noise_ok": sarima.get("residual_white_noise_ok"), "fallback_used": sarima.get("fallback_used"), "fallback_method": sarima.get("fallback_method")})
             if "SARIMA/SARIMAX" in outputs["tables"]:
                 st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), width="stretch")
                 fig_sarima = plot_forecast_results(outputs["train"], outputs["test"], {"SARIMA/SARIMAX": outputs["predictions"]["SARIMA/SARIMAX"]}, f"{target_col} - SARIMA/SARIMAX")
@@ -8462,9 +8684,9 @@ def render_streamlit_app():
 
     with tab4:
         st.dataframe(style_metric_dataframe(outputs["champion_challenger"]["ranking"]), width="stretch")
-        st.markdown("**Ensemble ağırlıkları (validation-temelli)**")
+        st.markdown("**Ansambl ağırlıkları (doğrulama-temelli)**")
         st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), width="stretch")
-        st.markdown("**Ensemble gerçek vs tahmin**")
+        st.markdown("**Ansambl gerçek ve tahmin**")
         st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), width="stretch")
         fig_ens = plot_forecast_results(outputs["train"], outputs["test"], {"Ensemble": outputs["predictions"]["Ensemble"]}, f"{target_col} - Ensemble")
         if fig_ens is not None:
@@ -8477,10 +8699,10 @@ def render_streamlit_app():
 
     with tab6:
         if "rolling_origin_backtest" in outputs and len(outputs["rolling_origin_backtest"]) > 0:
-            st.markdown("**Rolling-origin backtest (tam katman)**")
+            st.markdown("**Rolling-origin geri test (tam katman)**")
             st.dataframe(style_metric_dataframe(outputs["rolling_origin_backtest"]), width="stretch")
         if "validation_metrics_df" in outputs and len(outputs["validation_metrics_df"]) > 0:
-            st.markdown("**Validation-temelli model kalitesi**")
+            st.markdown("**Doğrulama temelli model kalitesi**")
             st.dataframe(style_metric_dataframe(outputs["validation_metrics_df"]), width="stretch")
         if "proxy_backtest_report" in export_payload and len(export_payload["proxy_backtest_report"]) > 0:
             st.markdown("**Proxy backtest raporu**")
@@ -8495,21 +8717,23 @@ def render_streamlit_app():
         prod_pack = outputs.get("production_governance", {}) or {}
         st.markdown("**Bias dashboard**")
         st.dataframe(style_metric_dataframe(prod_pack.get("bias_dashboard", pd.DataFrame())), width="stretch")
-        st.markdown("**Peak-event detection score**")
+        st.markdown("**Tepe olay yakalama skoru**")
         st.dataframe(style_metric_dataframe(prod_pack.get("peak_event_dashboard", pd.DataFrame())), width="stretch")
-        st.markdown("**Forecast Value Add (baseline'e göre)**")
+        st.markdown("**Tahmin Katkı Değeri (baseline'a göre)**")
         st.dataframe(style_metric_dataframe(prod_pack.get("forecast_value_add", pd.DataFrame())), width="stretch")
-        st.markdown("**Production feature availability audit**")
+        st.markdown("**Üretim özellik erişilebilirlik denetimi**")
         st.dataframe(style_metric_dataframe(prod_pack.get("feature_availability_audit", pd.DataFrame())), width="stretch")
         st.markdown("**Üretim modeli için prediction interval / quantile forecast**")
         st.dataframe(style_metric_dataframe(prod_pack.get("production_interval_table", pd.DataFrame())), width="stretch")
-        st.markdown("**Service-level / stok etkisi simülasyonu**")
+        st.markdown("**Servis seviyesi / stok etkisi simülasyonu**")
         st.dataframe(style_metric_dataframe(prod_pack.get("production_service_table", pd.DataFrame())), width="stretch")
-        st.markdown("**Live monitoring pack**")
+        st.markdown("**Üretim sıralaması (holdout, doğrulama ve rolling-origin birlikte)**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("production_ranking", pd.DataFrame())), width="stretch")
+        st.markdown("**Canlı izleme paketi**")
         live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
         st.dataframe(style_metric_dataframe(live_pack.get("summary", pd.DataFrame())), width="stretch")
         if isinstance(live_pack.get("alerts"), pd.DataFrame) and len(live_pack.get("alerts")) > 0:
-            st.markdown("**Production alerts**")
+            st.markdown("**Üretim alarmları**")
             st.dataframe(style_metric_dataframe(live_pack.get("alerts", pd.DataFrame())), width="stretch")
 
     with tab8:
