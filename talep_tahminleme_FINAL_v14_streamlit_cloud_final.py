@@ -4680,7 +4680,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 @dataclass
 class ForecastRuntimeConfig:
@@ -5711,31 +5711,135 @@ def build_prophet_country_holidays() -> Optional[pd.DataFrame]:
         return None
 
 
+def _sanitize_prophet_regressor_name(name: str) -> str:
+    clean = re.sub(r"[^0-9A-Za-z_]+", "_", str(name).strip())
+    clean = re.sub(r"_+", "_", clean).strip("_")
+    return clean or "regressor"
+
+
+def _prepare_prophet_design_matrices(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    exog_train: Optional[pd.DataFrame],
+    exog_test: Optional[pd.DataFrame]
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str], Dict[str, str]]:
+    tr, te, exog_cols = make_prophet_features(train_df, test_df, exog_train, exog_test)
+    tr = tr.copy()
+    te = te.copy()
+    tr["ds"] = pd.to_datetime(tr["ds"], errors="coerce")
+    te["ds"] = pd.to_datetime(te["ds"], errors="coerce")
+    tr["y"] = pd.to_numeric(tr["y"], errors="coerce").astype(float)
+    te["y"] = pd.to_numeric(te["y"], errors="coerce").astype(float)
+    tr = tr.replace([np.inf, -np.inf], np.nan).dropna(subset=["ds", "y"]).reset_index(drop=True)
+    te = te.replace([np.inf, -np.inf], np.nan).dropna(subset=["ds"]).reset_index(drop=True)
+
+    valid_cols: List[str] = []
+    dropped_cols: List[str] = []
+    rename_map: Dict[str, str] = {}
+
+    for c in list(exog_cols):
+        s_tr = pd.to_numeric(tr[c], errors="coerce").astype(float) if c in tr.columns else pd.Series(dtype=float)
+        s_te = pd.to_numeric(te[c], errors="coerce").astype(float) if c in te.columns else pd.Series(dtype=float)
+        if len(s_tr) == 0:
+            dropped_cols.append(c)
+            continue
+        med = safe_float(np.nanmedian(s_tr.values)) if s_tr.notna().any() else 0.0
+        med = 0.0 if pd.isna(med) else med
+        s_tr = s_tr.replace([np.inf, -np.inf], np.nan).fillna(med)
+        s_te = s_te.replace([np.inf, -np.inf], np.nan).fillna(med)
+        if s_tr.nunique(dropna=False) <= 1:
+            dropped_cols.append(c)
+            tr.drop(columns=[c], inplace=True, errors="ignore")
+            te.drop(columns=[c], inplace=True, errors="ignore")
+            continue
+        clean_name = _sanitize_prophet_regressor_name(c)
+        suffix = 1
+        base_name = clean_name
+        while clean_name in rename_map.values() or clean_name in ["ds", "y", "cap", "floor"]:
+            clean_name = f"{base_name}_{suffix}"
+            suffix += 1
+        tr[c] = s_tr.values
+        te[c] = s_te.values
+        if clean_name != c:
+            tr.rename(columns={c: clean_name}, inplace=True)
+            te.rename(columns={c: clean_name}, inplace=True)
+        rename_map[c] = clean_name
+        valid_cols.append(clean_name)
+
+    return tr, te, valid_cols, dropped_cols, rename_map
+
+
+def _fit_predict_prophet_once(
+    tr_fit: pd.DataFrame,
+    future_fit: pd.DataFrame,
+    freq_alias: str,
+    cfg: Dict[str, Any],
+    regressor_cols: List[str],
+    use_holidays: bool,
+    add_custom_seasonality: bool = True
+) -> Tuple[Any, pd.DataFrame, np.ndarray]:
+    m = Prophet(
+        growth=cfg.get("growth", "linear"),
+        yearly_seasonality=(freq_alias == "M"),
+        weekly_seasonality=(freq_alias in ["D", "H"]),
+        daily_seasonality=(freq_alias == "H"),
+        seasonality_mode=cfg.get("seasonality_mode", "additive"),
+        changepoint_prior_scale=cfg.get("changepoint_prior_scale", 0.05),
+        seasonality_prior_scale=cfg.get("seasonality_prior_scale", 1.0)
+    )
+    if use_holidays:
+        try:
+            m.add_country_holidays(country_name="Turkey")
+        except Exception:
+            pass
+    if add_custom_seasonality:
+        if freq_alias == "M" and len(tr_fit) >= 24:
+            m.add_seasonality(name="month_cycle", period=365.25, fourier_order=4)
+        if freq_alias == "W" and len(tr_fit) >= 52:
+            m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=6)
+    for c in regressor_cols:
+        if c in tr_fit.columns:
+            m.add_regressor(c)
+    m.fit(tr_fit)
+    future = future_fit.drop(columns=["y"], errors="ignore").copy()
+    fc = m.predict(future)
+    pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
+    return m, fc, pred
+
+
 
 def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if not HAS_PROPHET:
         raise ImportError("prophet paketi bulunamadı.")
 
     y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
-    prop_xtr, prop_xte, used_exog_cols, dropped_exog = reduce_exog_feature_set(
+    prop_xtr, prop_xte, _used_exog_cols, dropped_exog = reduce_exog_feature_set(
         exog_train,
         exog_test,
         y_train,
         max_cols=FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols
     )
 
-    tr_full, te_full, exog_cols = make_prophet_features(train_df, test_df, prop_xtr, prop_xte)
+    tr_full, te_full, exog_cols, prep_dropped, rename_map = _prepare_prophet_design_matrices(train_df, test_df, prop_xtr, prop_xte)
+    dropped_exog.extend(prep_dropped)
+
     tr_inner, val_inner = make_inner_train_val_split(train_df)
-    inner_xtr = prop_xtr.iloc[:len(tr_inner)] if prop_xtr is not None else None
-    inner_xva = prop_xtr.iloc[len(tr_inner):len(tr_inner)+len(val_inner)] if prop_xtr is not None else None
-    tr, val, _ = make_prophet_features(tr_inner, val_inner, inner_xtr, inner_xva)
+    inner_xtr = prop_xtr.iloc[:len(tr_inner)].copy() if prop_xtr is not None else None
+    inner_xva = prop_xtr.iloc[len(tr_inner):len(tr_inner)+len(val_inner)].copy() if prop_xtr is not None else None
+    tr, val, inner_exog_cols, inner_dropped, _ = _prepare_prophet_design_matrices(tr_inner, val_inner, inner_xtr, inner_xva)
+    dropped_exog.extend(inner_dropped)
 
     seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
-    primary_mode = "multiplicative" if pd.notna(seasonality_strength) and seasonality_strength >= 0.30 else "additive"
-    mode_candidates = [primary_mode] + (["additive"] if primary_mode == "multiplicative" else ["multiplicative"])
+    strictly_positive = bool((y_train > 0).all())
+    primary_mode = "multiplicative" if strictly_positive and pd.notna(seasonality_strength) and seasonality_strength >= 0.35 else "additive"
+    mode_candidates = [primary_mode]
+    if strictly_positive and primary_mode != "additive":
+        mode_candidates.append("additive")
+    elif strictly_positive and primary_mode == "additive" and pd.notna(seasonality_strength) and seasonality_strength >= 0.50:
+        mode_candidates.append("multiplicative")
+
     cps_candidates = [0.03, 0.08] if pd.isna(seasonality_strength) or seasonality_strength < 0.50 else [0.05, 0.15]
     sps_candidates = [1.0, 3.0]
-
     configs = []
     for mode in mode_candidates:
         for cps in cps_candidates:
@@ -5752,97 +5856,194 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
     else:
         configs = configs[:max(2, FORECAST_RUNTIME_CONFIG.prophet_max_configs)]
 
-    best = None
-    rows = []
-    best_score = np.inf
     use_holidays = should_use_prophet_holidays(freq_alias, len(train_df))
+    best = None
+    best_score = np.inf
+    rows = []
+    fit_errors: List[str] = []
 
+    plan_candidates: List[Dict[str, Any]] = []
     for cfg in configs:
+        plan_candidates.append({
+            "cfg": cfg,
+            "use_exog": len(inner_exog_cols) > 0,
+            "use_holidays": use_holidays,
+            "add_custom_seasonality": True,
+            "plan_name": "primary"
+        })
+        if len(inner_exog_cols) > 0:
+            plan_candidates.append({
+                "cfg": cfg,
+                "use_exog": False,
+                "use_holidays": use_holidays,
+                "add_custom_seasonality": True,
+                "plan_name": "no_exog_retry"
+            })
+        if use_holidays:
+            plan_candidates.append({
+                "cfg": cfg,
+                "use_exog": False,
+                "use_holidays": False,
+                "add_custom_seasonality": True,
+                "plan_name": "no_exog_no_holiday_retry"
+            })
+
+    if str(freq_alias).upper() == "M" and len(train_df) <= 72:
+        plan_candidates.append({
+            "cfg": {
+                "seasonality_mode": "additive",
+                "changepoint_prior_scale": 0.03,
+                "seasonality_prior_scale": 1.0,
+                "growth": "linear"
+            },
+            "use_exog": False,
+            "use_holidays": False,
+            "add_custom_seasonality": False,
+            "plan_name": "short_monthly_safe_mode"
+        })
+
+    seen_keys = set()
+    deduped_plans = []
+    for plan in plan_candidates:
+        key = (
+            plan["cfg"]["seasonality_mode"],
+            float(plan["cfg"]["changepoint_prior_scale"]),
+            float(plan["cfg"]["seasonality_prior_scale"]),
+            plan["cfg"].get("growth", "linear"),
+            bool(plan["use_exog"]),
+            bool(plan["use_holidays"]),
+            bool(plan["add_custom_seasonality"]),
+            plan["plan_name"]
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_plans.append(plan)
+
+    for plan in deduped_plans:
+        cfg = plan["cfg"]
+        cols_now = inner_exog_cols if plan["use_exog"] else []
         try:
-            tr_fit = tr.copy()
-            val_fit = val.copy()
-            m = Prophet(
-                growth=cfg["growth"],
-                yearly_seasonality=(freq_alias == "M"),
-                weekly_seasonality=(freq_alias in ["D", "H"]),
-                daily_seasonality=(freq_alias == "H"),
-                seasonality_mode=cfg["seasonality_mode"],
-                changepoint_prior_scale=cfg["changepoint_prior_scale"],
-                seasonality_prior_scale=cfg["seasonality_prior_scale"]
+            _, _, pred = _fit_predict_prophet_once(
+                tr.copy(),
+                val.copy(),
+                freq_alias,
+                cfg,
+                cols_now,
+                use_holidays=plan["use_holidays"],
+                add_custom_seasonality=plan["add_custom_seasonality"]
             )
-            if use_holidays:
-                try:
-                    m.add_country_holidays(country_name="Turkey")
-                except Exception:
-                    pass
-            if freq_alias == "M" and len(train_df) >= 24:
-                m.add_seasonality(name="month_cycle", period=365.25, fourier_order=4)
-            if freq_alias == "W" and len(train_df) >= 52:
-                m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=6)
-            for c in exog_cols:
-                m.add_regressor(c)
-            m.fit(tr_fit)
-            future = val_fit.drop(columns=["y"]).copy()
-            fc = m.predict(future)
-            pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
-            val_wape = wape(val_fit["y"].values, pred)
-            val_smape = smape(val_fit["y"].values, pred)
-            complexity_penalty = 0.10 * len(exog_cols)
-            composite = val_wape + 0.35 * val_smape + complexity_penalty
-            rows.append({**cfg, "val_wape": val_wape, "val_smape": val_smape, "composite_score": composite})
+            val_wape = wape(val["y"].values, pred)
+            val_smape = smape(val["y"].values, pred)
+            complexity_penalty = 0.10 * len(cols_now)
+            if not plan["add_custom_seasonality"]:
+                complexity_penalty -= 0.02
+            composite = val_wape + 0.35 * val_smape + max(complexity_penalty, 0.0)
+            rows.append({
+                **cfg,
+                "plan_name": plan["plan_name"],
+                "use_exog": bool(cols_now),
+                "use_holidays": bool(plan["use_holidays"]),
+                "custom_seasonality": bool(plan["add_custom_seasonality"]),
+                "val_wape": val_wape,
+                "val_smape": val_smape,
+                "composite_score": composite
+            })
             if composite < best_score:
                 best_score = composite
-                best = cfg
+                best = {
+                    "cfg": dict(cfg),
+                    "use_exog": bool(cols_now),
+                    "use_holidays": bool(plan["use_holidays"]),
+                    "add_custom_seasonality": bool(plan["add_custom_seasonality"]),
+                    "plan_name": plan["plan_name"]
+                }
         except Exception as e:
-            rows.append({**cfg, "val_wape": np.nan, "val_smape": np.nan, "composite_score": np.nan, "fit_error": str(e)[:200]})
+            err = str(e).strip() or repr(e)
+            fit_errors.append(f"{plan['plan_name']}: {err}")
+            rows.append({
+                **cfg,
+                "plan_name": plan["plan_name"],
+                "use_exog": bool(cols_now),
+                "use_holidays": bool(plan["use_holidays"]),
+                "custom_seasonality": bool(plan["add_custom_seasonality"]),
+                "val_wape": np.nan,
+                "val_smape": np.nan,
+                "composite_score": np.nan,
+                "fit_error": err[:250]
+            })
             continue
 
     if best is None:
-        raise RuntimeError("Prophet modeli kurulamadı.")
+        diag = "; ".join(fit_errors[:3]) if fit_errors else "bilinmeyen hata"
+        raise RuntimeError(f"Prophet modeli kurulamadı. İlk hatalar: {diag}")
 
-    tr_fit = tr_full.copy()
-    te_fit = te_full.copy()
-    m = Prophet(
-        growth=best["growth"],
-        yearly_seasonality=(freq_alias == "M"),
-        weekly_seasonality=(freq_alias in ["D", "H"]),
-        daily_seasonality=(freq_alias == "H"),
-        seasonality_mode=best["seasonality_mode"],
-        changepoint_prior_scale=best["changepoint_prior_scale"],
-        seasonality_prior_scale=best["seasonality_prior_scale"]
-    )
-    if use_holidays:
-        try:
-            m.add_country_holidays(country_name="Turkey")
-        except Exception:
-            pass
-    if freq_alias == "M" and len(train_df) >= 24:
-        m.add_seasonality(name="month_cycle", period=365.25, fourier_order=4)
-    if freq_alias == "W" and len(train_df) >= 52:
-        m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=6)
-    for c in exog_cols:
-        m.add_regressor(c)
-    m.fit(tr_fit)
-    future = te_fit.drop(columns=["y"]).copy()
-    fc = m.predict(future)
-    pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
+    final_cols = exog_cols if best["use_exog"] else []
+    final_tr = tr_full.copy()
+    final_te = te_full.copy()
+
+    try:
+        m, fc, pred = _fit_predict_prophet_once(
+            final_tr,
+            final_te,
+            freq_alias,
+            best["cfg"],
+            final_cols,
+            use_holidays=best["use_holidays"],
+            add_custom_seasonality=best["add_custom_seasonality"]
+        )
+        final_retry_used = False
+    except Exception as final_e:
+        fit_errors.append(f"final_primary: {str(final_e)}")
+        m, fc, pred = _fit_predict_prophet_once(
+            final_tr,
+            final_te,
+            freq_alias,
+            {
+                "seasonality_mode": "additive",
+                "changepoint_prior_scale": 0.03,
+                "seasonality_prior_scale": 1.0,
+                "growth": "linear"
+            },
+            [],
+            use_holidays=False,
+            add_custom_seasonality=False
+        )
+        best = {
+            "cfg": {
+                "seasonality_mode": "additive",
+                "changepoint_prior_scale": 0.03,
+                "seasonality_prior_scale": 1.0,
+                "growth": "linear"
+            },
+            "use_exog": False,
+            "use_holidays": False,
+            "add_custom_seasonality": False,
+            "plan_name": "final_safe_retry"
+        }
+        final_cols = []
+        final_retry_used = True
 
     comp_summary = {
         "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,
         "seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if "yearly" in fc else np.nan,
         "seasonality_present": bool("yearly" in fc or "weekly" in fc),
-        "used_exog_cols": exog_cols,
-        "dropped_exog_cols": dropped_exog
+        "used_exog_cols": final_cols,
+        "dropped_exog_cols": sorted(set(dropped_exog)),
+        "final_retry_used": final_retry_used,
+        "rename_map": rename_map,
+        "fit_error_samples": fit_errors[:5]
     }
     return {
         "model": m,
         "forecast_df": fc,
         "forecast": pred,
-        "config": best,
+        "config": best["cfg"],
+        "selected_plan": best,
         "component_validation": comp_summary,
-        "used_exog_cols": exog_cols,
-        "dropped_exog_cols": dropped_exog,
-        "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True]).reset_index(drop=True)
+        "used_exog_cols": final_cols,
+        "dropped_exog_cols": sorted(set(dropped_exog)),
+        "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True)
     }
 
 
