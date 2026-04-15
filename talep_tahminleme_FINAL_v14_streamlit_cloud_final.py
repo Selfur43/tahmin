@@ -4795,7 +4795,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 
@@ -5116,6 +5116,33 @@ def detect_ml_feature_columns(df_features: pd.DataFrame, target_col: str, date_c
     return sorted(set(cols))
 
 
+
+def detect_safe_ml_exog_columns(df_features: pd.DataFrame, target_col: str, date_col: str) -> List[str]:
+    """
+    Leak-safe external features for ML models.
+    Internal lag/rolling features for the target are generated inside the ML branch
+    from the training history only. Therefore precomputed target-derived columns from
+    the global feature pack must never be passed as exogenous inputs.
+    """
+    safe_cols = []
+    banned_keywords = [
+        "exclude_from_training", "review_required", "structural_event_flag", "incomplete_period_flag",
+        "anomaly_flag", "scaled", "log1p", "target_h", "future", "lead", "shift(-",
+        "lag_", "roll_", "ewm_", "diff_", "seasonal_lag"
+    ]
+    for c in df_features.columns:
+        if c == date_col or c == target_col:
+            continue
+        lc = str(c).lower()
+        if c.startswith(f"{target_col}_"):
+            continue
+        if any(b in lc for b in banned_keywords):
+            continue
+        if pd.api.types.is_numeric_dtype(df_features[c]):
+            safe_cols.append(c)
+    return sorted(set(safe_cols))
+
+
 def make_series_analysis_frame(export_payload: Dict[str, pd.DataFrame], target_col: str) -> pd.DataFrame:
     df_clean = export_payload["clean_model_input"].copy()
     df_feat = export_payload["features"].copy()
@@ -5332,6 +5359,160 @@ def make_prophet_features(train_df: pd.DataFrame, test_df: pd.DataFrame, exog_tr
             te[c] = pd.to_numeric(exog_test[c], errors="coerce").values
             used.append(c)
     return tr, te, used
+
+
+
+def _safe_prophet_regressor_name(name: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_]+", "_", str(name)).strip("_")
+    if not safe:
+        safe = "regressor"
+    if not safe[0].isalpha():
+        safe = f"reg_{safe}"
+    return safe[:60]
+
+
+def _prepare_prophet_design_matrices(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    exog_train: Optional[pd.DataFrame],
+    exog_test: Optional[pd.DataFrame]
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str], Dict[str, str]]:
+    tr = train_df[["ds", "y"]].copy().reset_index(drop=True)
+    te = test_df[["ds", "y"]].copy().reset_index(drop=True)
+    tr["ds"] = pd.to_datetime(tr["ds"])
+    te["ds"] = pd.to_datetime(te["ds"])
+    used_cols: List[str] = []
+    dropped_cols: List[str] = []
+    rename_map: Dict[str, str] = {}
+
+    if exog_train is None or exog_test is None or len(exog_train.columns) == 0:
+        return tr, te, used_cols, dropped_cols, rename_map
+
+    xtr = exog_train.copy().reset_index(drop=True)
+    xte = exog_test.copy().reset_index(drop=True)
+    common_cols = [c for c in xtr.columns if c in xte.columns]
+    used_safe_names = set()
+
+    for c in common_cols:
+        s_tr = pd.to_numeric(xtr[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        s_te = pd.to_numeric(xte[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if s_tr.notna().sum() < max(5, len(s_tr) // 5):
+            dropped_cols.append(c)
+            continue
+        if s_te.notna().sum() == 0:
+            dropped_cols.append(c)
+            continue
+        if s_tr.dropna().nunique() <= 1:
+            dropped_cols.append(c)
+            continue
+        safe_name = _safe_prophet_regressor_name(c)
+        while safe_name in used_safe_names or safe_name in ["ds", "y", "cap", "floor"]:
+            safe_name = f"{safe_name}_x"
+        used_safe_names.add(safe_name)
+        fill_val = safe_float(s_tr.median())
+        if pd.isna(fill_val):
+            fill_val = 0.0
+        tr[safe_name] = s_tr.fillna(fill_val).fillna(0.0).astype(float).values
+        te[safe_name] = s_te.fillna(fill_val).fillna(0.0).astype(float).values
+        used_cols.append(safe_name)
+        rename_map[str(c)] = safe_name
+
+    return tr, te, used_cols, dropped_cols, rename_map
+
+
+def _build_prophet_holidays_df(train_df: pd.DataFrame, test_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    try:
+        import holidays as holidays_pkg
+    except Exception:
+        return None
+    years = sorted(set(pd.to_datetime(pd.concat([train_df["ds"], test_df["ds"]], axis=0)).dt.year.dropna().astype(int).tolist()))
+    if not years:
+        return None
+    try:
+        tr_holidays = holidays_pkg.country_holidays("TR", years=years)
+    except Exception:
+        return None
+    rows = []
+    for d, name in tr_holidays.items():
+        rows.append({"ds": pd.Timestamp(d), "holiday": str(name)})
+    if not rows:
+        return None
+    return pd.DataFrame(rows).drop_duplicates(subset=["ds", "holiday"]).sort_values(["ds", "holiday"]).reset_index(drop=True)
+
+
+def _fit_predict_prophet_once(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    freq_alias: str,
+    cfg: Dict[str, Any],
+    exog_cols: List[str],
+    use_holidays: bool = False,
+    add_custom_seasonality: bool = True,
+    transform_cfg: Optional[Dict[str, Any]] = None
+) -> Tuple[Any, pd.DataFrame, np.ndarray]:
+    if not HAS_PROPHET or Prophet is None:
+        raise ImportError("prophet package unavailable")
+
+    tr = train_df.copy().reset_index(drop=True)
+    te = test_df.copy().reset_index(drop=True)
+    tr["ds"] = pd.to_datetime(tr["ds"])
+    te["ds"] = pd.to_datetime(te["ds"])
+
+    transform_cfg = dict(transform_cfg or {"name": "none", "lambda": None, "shift": 0.0})
+    y_raw = pd.to_numeric(tr["y"], errors="coerce").astype(float).fillna(0.0)
+    y_transformed, applied_cfg = apply_target_transform(y_raw, transform_cfg)
+    tr["y"] = pd.to_numeric(y_transformed, errors="coerce").astype(float).fillna(0.0)
+
+    yearly = bool(str(freq_alias).upper() in ["M", "W", "D"])
+    weekly = bool(str(freq_alias).upper() in ["D", "H"])
+    daily = bool(str(freq_alias).upper() == "H")
+    seasonality_mode = str(cfg.get("seasonality_mode", "additive"))
+    seasonality_prior_scale = float(cfg.get("seasonality_prior_scale", 5.0))
+
+    holidays_df = _build_prophet_holidays_df(tr, te) if use_holidays else None
+    constructor_kwargs = {
+        "seasonality_mode": seasonality_mode,
+        "changepoint_prior_scale": float(cfg.get("changepoint_prior_scale", 0.05)),
+        "seasonality_prior_scale": seasonality_prior_scale,
+        "changepoint_range": float(cfg.get("changepoint_range", 0.9)),
+        "n_changepoints": int(cfg.get("n_changepoints", 12)),
+        "growth": "linear",
+        "yearly_seasonality": yearly,
+        "weekly_seasonality": weekly,
+        "daily_seasonality": daily,
+        "uncertainty_samples": 0
+    }
+    if holidays_df is not None and len(holidays_df) > 0:
+        constructor_kwargs["holidays"] = holidays_df
+
+    model = Prophet(**constructor_kwargs)
+
+    if add_custom_seasonality:
+        if str(freq_alias).upper() == "M":
+            model.add_seasonality(name="quarterly", period=365.25 / 4.0, fourier_order=3, prior_scale=seasonality_prior_scale)
+        elif str(freq_alias).upper() == "W":
+            model.add_seasonality(name="monthly_proxy", period=30.5, fourier_order=4, prior_scale=seasonality_prior_scale)
+            model.add_seasonality(name="year_end", period=365.25, fourier_order=6, prior_scale=seasonality_prior_scale)
+        elif str(freq_alias).upper() == "D":
+            model.add_seasonality(name="monthly_proxy", period=30.5, fourier_order=5, prior_scale=seasonality_prior_scale)
+            model.add_seasonality(name="year_end", period=365.25, fourier_order=8, prior_scale=seasonality_prior_scale)
+
+    for c in exog_cols:
+        if c in tr.columns and c in te.columns:
+            model.add_regressor(c, standardize=True)
+
+    fit_cols = ["ds", "y"] + [c for c in exog_cols if c in tr.columns]
+    fit_df = tr[fit_cols].copy().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    future_df = te[["ds"] + [c for c in exog_cols if c in te.columns]].copy().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    model.fit(fit_df)
+    fc = model.predict(future_df)
+    yhat = pd.to_numeric(fc["yhat"], errors="coerce").astype(float).fillna(0.0).values
+    pred = inverse_target_transform(yhat, applied_cfg)
+    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    fc = fc.copy().reset_index(drop=True)
+    fc["yhat"] = pred
+    return model, fc, pred
 
 
 def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[pd.DataFrame], freq_alias: str) -> Tuple[pd.DataFrame, List[str]]:
@@ -5703,6 +5884,25 @@ def build_fallback_forecast(y_train: pd.Series, y_test: pd.Series, freq_alias: s
             best_pred = pred
     return best_pred, best_name
 
+
+
+
+def forecast_with_baseline_name(y_train: pd.Series, horizon: int, freq_alias: str, season_length: int, baseline_name: str) -> np.ndarray:
+    y_train = pd.to_numeric(y_train, errors="coerce").dropna().astype(float).reset_index(drop=True)
+    h = int(horizon)
+    if h <= 0:
+        return np.array([], dtype=float)
+    name = str(baseline_name or "last_value")
+    if name == "seasonal_naive" and season_length > 1 and len(y_train) >= season_length:
+        seasonal_vals = y_train.iloc[-season_length:].tolist()
+        pred = np.array([seasonal_vals[i % season_length] for i in range(h)], dtype=float)
+    elif name == "drift" and len(y_train) >= 2:
+        pred = drift_forecast(y_train, h)
+    elif name == "mean" and len(y_train) >= 1:
+        pred = np.repeat(float(y_train.mean()), h)
+    else:
+        pred = np.repeat(float(y_train.iloc[-1]) if len(y_train) else 0.0, h)
+    return np.maximum(np.asarray(pred, dtype=float), 0.0)
 
 
 def _safe_abs_corr(a: pd.Series, b: pd.Series) -> float:
@@ -6674,7 +6874,8 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
             SEARCH_ACCELERATOR.put_result(cache_key, result)
             return result
 
-    baseline_test_pred, baseline_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, season_length)
+    baseline_name = str(best.get("blend_baseline", "last_value"))
+    baseline_test_pred = forecast_with_baseline_name(train_df["y"], len(test_df), freq_alias, season_length, baseline_name)
     alpha = float(best.get("blend_alpha", 1.0))
     pred = np.maximum(alpha * np.asarray(pred, dtype=float) + (1.0 - alpha) * np.asarray(baseline_test_pred, dtype=float), 0.0)
     if "yhat" in fc:
@@ -6799,8 +7000,8 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
                 for h in range(1, len(val_inner)+1):
                     feat_shifted = feat_inner.copy()
                     feat_shifted["target_h"] = feat_shifted["y"].shift(-h)
-                    train_mask = np.arange(len(feat_shifted)) < len(tr_inner)
-                    ds_train = feat_shifted.loc[train_mask, inner_cols + ["target_h"]].dropna().copy()
+                    train_rows = max(0, len(tr_inner) - h)
+                    ds_train = feat_shifted.iloc[:train_rows][inner_cols + ["target_h"]].dropna().copy()
                     if len(ds_train) < 8:
                         raise ValueError("Direct strategy için yeterli gözlem yok.")
                     X_h = ds_train[inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
@@ -6868,7 +7069,8 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         for h in range(1, len(future_df)+1):
             feat_shifted = feat_train_test.copy()
             feat_shifted["target_h"] = feat_shifted["y"].shift(-h)
-            ds_train = feat_shifted.iloc[:train_cut][feature_cols + ["target_h"]].dropna().copy()
+            train_rows = max(0, train_cut - h)
+            ds_train = feat_shifted.iloc[:train_rows][feature_cols + ["target_h"]].dropna().copy()
             X_h = ds_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
             y_h_raw = ds_train["target_h"].astype(float).values
             y_h = apply_target_transform(pd.Series(y_h_raw), best["transform_cfg"])[0].values.astype(float)
@@ -6902,6 +7104,8 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         "fallback_used": False,
         "fallback_method": None,
         "backend_name": backend_name,
+        "validation_wape": safe_float(best_score),
+        "validation_smape": safe_float(pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True], na_position="last").head(1)["val_smape"].iloc[0]) if len(search_rows) else np.nan,
         "search_accelerator_cache_hit": False,
     }
     SEARCH_ACCELERATOR.put_result(cache_key, result)
@@ -6970,13 +7174,20 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
     task_results = SEARCH_ACCELERATOR.run_parallel_tasks({"recursive": _run_recursive, "direct": _run_direct}, max_workers=min(2, FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers))
     recursive_res = task_results["recursive"]
     direct_res = task_results["direct"]
-    rec_wape = wape(test_df["y"].values, recursive_res["forecast"])
-    dir_wape = wape(test_df["y"].values, direct_res["forecast"])
-    best = recursive_res if rec_wape <= dir_wape else direct_res
+    rec_val_wape = safe_float(recursive_res.get("validation_wape", np.nan))
+    dir_val_wape = safe_float(direct_res.get("validation_wape", np.nan))
+    rec_val_smape = safe_float(recursive_res.get("validation_smape", np.nan))
+    dir_val_smape = safe_float(direct_res.get("validation_smape", np.nan))
+    if pd.notna(rec_val_wape) and pd.notna(dir_val_wape):
+        best = recursive_res if (rec_val_wape, rec_val_smape) <= (dir_val_wape, dir_val_smape) else direct_res
+    else:
+        rec_wape = wape(test_df["y"].values, recursive_res["forecast"])
+        dir_wape = wape(test_df["y"].values, direct_res["forecast"])
+        best = recursive_res if rec_wape <= dir_wape else direct_res
     best["strategy_comparison"] = pd.DataFrame([
-        {"strategy": "recursive", "WAPE": rec_wape, "sMAPE": smape(test_df["y"].values, recursive_res["forecast"]), "used_feature_count": recursive_res.get("used_feature_count", np.nan), "backend_name": recursive_res.get("backend_name")},
-        {"strategy": "direct", "WAPE": dir_wape, "sMAPE": smape(test_df["y"].values, direct_res["forecast"]), "used_feature_count": direct_res.get("used_feature_count", np.nan), "backend_name": direct_res.get("backend_name")},
-    ]).sort_values(["WAPE", "sMAPE"], ascending=[True, True]).reset_index(drop=True)
+        {"strategy": "recursive", "val_WAPE": rec_val_wape, "val_sMAPE": rec_val_smape, "used_feature_count": recursive_res.get("used_feature_count", np.nan), "backend_name": recursive_res.get("backend_name")},
+        {"strategy": "direct", "val_WAPE": dir_val_wape, "val_sMAPE": dir_val_smape, "used_feature_count": direct_res.get("used_feature_count", np.nan), "backend_name": direct_res.get("backend_name")},
+    ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
     best["search_accelerator_cache_hit"] = False
     SEARCH_ACCELERATOR.put_result(cache_key, best)
     return best
@@ -7083,7 +7294,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         test_feat = feature_subset.iloc[len(train_df):len(train_df)+len(test_df)].copy().reset_index(drop=True)
         stat_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_stat_models else []
         prophet_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_prophet else []
-        ml_feature_cols = detect_ml_feature_columns(df_features, target_col, date_col)
+        ml_feature_cols = detect_safe_ml_exog_columns(df_features, target_col, date_col)
         return {
             "train_df": train_df,
             "test_df": test_df,
@@ -7093,6 +7304,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
             "stat_exog_cols": stat_exog_cols,
             "prophet_exog_cols": prophet_exog_cols,
             "ml_feature_cols": ml_feature_cols,
+            "ml_exog_safe_mode": True,
         }
 
     bundle = SEARCH_ACCELERATOR.get_or_compute_artifact(bundle_key, _build_pipeline_bundle)
@@ -7125,6 +7337,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
             "stat_exog_cols": stat_exog_cols,
             "prophet_exog_cols": prophet_exog_cols,
             "ml_feature_cols": ml_feature_cols,
+            "ml_exog_safe_mode": True,
             "runtime_guardrails": build_runtime_guardrail_notes(freq_alias, len(train_df), horizon, stat_exog_cols, prophet_exog_cols),
             "train_n": int(len(train_df)),
             "test_n": int(len(test_df)),
