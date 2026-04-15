@@ -61,12 +61,18 @@ from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except Exception:
+    plt = None
+    HAS_MATPLOTLIB = False
 
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.impute import KNNImputer
 
-# GUI (desktop optional; Streamlit Cloud/mobile does not use tkinter)
+# Desktop GUI is optional. Streamlit Cloud/mobile deployments do not support tkinter.
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog
@@ -91,6 +97,14 @@ except Exception:
     HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore")
+
+
+def ensure_matplotlib():
+    if not HAS_MATPLOTLIB:
+        raise ImportError(
+            "matplotlib kurulamadı. requirements.txt içine matplotlib ekleyip Streamlit Cloud'da Reboot app yapın."
+        )
+
 
 
 # =========================================================
@@ -310,7 +324,7 @@ def normalize_colname(col: str) -> str:
 
 def _choose_item_from_list(title: str, prompt: str, items: List[str]) -> str:
     if not HAS_TKINTER:
-        raise RuntimeError('Bu seçim ekranı tkinter gerektirir. Streamlit/telefon kullanımında dosya ve sheet seçimi uygulama arayüzünden yapılmalıdır.')
+        raise RuntimeError("Bu masaüstü seçim fonksiyonu tkinter gerektirir. Streamlit sürümünde st.selectbox kullanılır.")
     root = tk.Tk()
     root.withdraw()
 
@@ -384,7 +398,7 @@ def _extract_excel_from_archive(archive_path: str, member_name: str) -> Tuple[st
 
 def choose_excel_file() -> Dict[str, Optional[str]]:
     if not HAS_TKINTER:
-        raise RuntimeError('Tkinter bu ortamda kullanılamıyor. Streamlit dosya yükleme akışını kullanın.')
+        raise RuntimeError("Bu masaüstü dosya seçimi tkinter gerektirir. Streamlit sürümünde st.file_uploader kullanılır.")
     root = tk.Tk()
     root.withdraw()
     selected_path = filedialog.askopenfilename(
@@ -433,7 +447,7 @@ def choose_excel_file() -> Dict[str, Optional[str]]:
 
 def choose_sheets(sheet_names: List[str]) -> List[str]:
     if not HAS_TKINTER:
-        raise RuntimeError('Tkinter bu ortamda kullanılamıyor. Streamlit sheet seçimini kullanın.')
+        raise RuntimeError("Bu masaüstü sheet seçimi tkinter gerektirir. Streamlit sürümünde st.selectbox kullanılır.")
     root = tk.Tk()
     root.withdraw()
 
@@ -502,45 +516,6 @@ def save_uploaded_file(uploaded_file) -> str:
 
     return save_path
 
-
-
-def _check_optional_excel_dependency(ext: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    ext = str(ext).lower()
-    if ext == '.xlsx':
-        try:
-            import openpyxl  # noqa: F401
-            return True, 'openpyxl', None
-        except Exception as e:
-            return False, None, f".xlsx dosyalarını okumak için openpyxl gerekir: {e}"
-    if ext == '.xls':
-        try:
-            import xlrd  # noqa: F401
-            return True, 'xlrd', None
-        except Exception as e:
-            return False, None, f".xls dosyalarını okumak için xlrd gerekir: {e}"
-    return False, None, f"Desteklenmeyen Excel uzantısı: {ext}"
-
-
-def safe_excel_file(excel_path: str) -> pd.ExcelFile:
-    ext = os.path.splitext(str(excel_path))[1].lower()
-    ok, engine, msg = _check_optional_excel_dependency(ext)
-    if not ok:
-        raise ImportError(msg)
-    try:
-        return pd.ExcelFile(excel_path, engine=engine)
-    except Exception as e:
-        raise ImportError(f"Excel dosyası açılamadı ({os.path.basename(excel_path)}): {e}")
-
-
-def safe_read_excel(excel_path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-    ext = os.path.splitext(str(excel_path))[1].lower()
-    ok, engine, msg = _check_optional_excel_dependency(ext)
-    if not ok:
-        raise ImportError(msg)
-    try:
-        return pd.read_excel(excel_path, sheet_name=sheet_name, engine=engine)
-    except Exception as e:
-        raise ImportError(f"Excel sayfası okunamadı ({os.path.basename(excel_path)} / {sheet_name}): {e}")
 
 def run_preprocessing_for_sheet(excel_path: str, sheet_name: str, output_dir: str) -> Dict[str, pd.DataFrame]:
     """Streamlit için tek sheet preprocessing wrapper'ı."""
@@ -4576,7 +4551,7 @@ def main():
         source_path = input_info["source_path"]
         excel_path = input_info["excel_path"]
 
-        xls = safe_excel_file(excel_path)
+        xls = pd.ExcelFile(excel_path)
         selected_sheets = choose_sheets(xls.sheet_names)
         output_dir = create_output_dir(source_path, config.output_dir_name)
 
@@ -4593,9 +4568,10 @@ def main():
 
         preprocessor.save_global_metadata(output_dir)
 
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo(
+        if HAS_TKINTER:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(
             "Başarılı",
             "Veri önişleme + anomaly governance + validation + QA modülleri tamamlandı.\n"
             f"Çıktılar şu klasöre kaydedildi:\n{output_dir}"
@@ -4606,9 +4582,10 @@ def main():
     except Exception as e:
         print(f"[ERROR] {str(e)}")
         print(traceback.format_exc())
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Hata", str(e))
+        if HAS_TKINTER:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Hata", str(e))
 
 
 
@@ -6003,12 +5980,8 @@ def render_streamlit_app():
         st.info("Başlamak için Excel dosyanı yükle.")
         return
 
-    try:
-        excel_path = save_uploaded_file(uploaded_excel)
-        xls = safe_excel_file(excel_path)
-    except Exception as e:
-        st.error(f"Excel dosyası yüklenemedi/açılamadı: {e}")
-        return
+    excel_path = save_uploaded_file(uploaded_excel)
+    xls = pd.ExcelFile(excel_path)
     selected_sheet = st.sidebar.selectbox("Sheet seç", xls.sheet_names)
     output_base_dir = os.path.join(os.path.dirname(excel_path), "streamlit_outputs")
     os.makedirs(output_base_dir, exist_ok=True)
@@ -6019,17 +5992,9 @@ def render_streamlit_app():
 
     if st.sidebar.button("Önişleme + Tahminleme için hazırla", type="primary") or cache_key not in st.session_state["preprocess_cache"]:
         with st.spinner("Veri önişleme ve yönetişim çalışıyor..."):
-            try:
-                export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
-                st.session_state["preprocess_cache"][cache_key] = export_payload
-            except Exception as e:
-                st.error(f"Önişleme sırasında hata oluştu: {e}")
-                st.exception(e)
-                return
-    export_payload = st.session_state["preprocess_cache"].get(cache_key)
-    if export_payload is None:
-        st.info("Önişleme sonucu üretilemedi.")
-        return
+            export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
+            st.session_state["preprocess_cache"][cache_key] = export_payload
+    export_payload = st.session_state["preprocess_cache"][cache_key]
 
     manifest = export_payload["manifest"]
     freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
@@ -6229,8 +6194,4 @@ def render_streamlit_app():
 if __name__ == "__main__":
     if st is None:
         raise ImportError("Bu dosya Streamlit uygulamasıdır. Çalıştırmak için: streamlit run <dosya_adı>.py")
-    try:
-        render_streamlit_app()
-    except Exception as e:
-        st.error(f"Beklenmeyen uygulama hatası: {e}")
-        st.exception(e)
+    render_streamlit_app()
