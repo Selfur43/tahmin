@@ -43,6 +43,8 @@ Main capabilities:
 """
 
 import os
+os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 import re
 import io
 import json
@@ -4795,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "2.0.0"
 
 
 
@@ -5119,16 +5121,26 @@ def detect_ml_feature_columns(df_features: pd.DataFrame, target_col: str, date_c
 
 def detect_safe_ml_exog_columns(df_features: pd.DataFrame, target_col: str, date_col: str) -> List[str]:
     """
-    Leak-safe external features for ML models.
-    Internal lag/rolling features for the target are generated inside the ML branch
-    from the training history only. Therefore precomputed target-derived columns from
-    the global feature pack must never be passed as exogenous inputs.
+    Production-safe external features for ML models.
+    Only keep calendar / explicitly plan-known / future-known variables.
+    Unknown contemporaneous signals from other products are excluded because
+    they are not guaranteed to be available at planning time.
     """
-    safe_cols = []
+    safe_cols: List[str] = []
+    future_known_keywords = [
+        "month", "quarter", "year", "weekofyear", "dayofweek", "dayofmonth",
+        "month_sin", "month_cos", "quarter_sin", "quarter_cos",
+        "is_month_start", "is_month_end", "is_quarter_start", "is_quarter_end",
+        "is_year_start", "is_year_end", "holiday", "ramadan", "bayram"
+    ]
+    explicit_plan_keywords = [
+        "plan_", "planned_", "budget_", "target_", "promo_plan", "campaign_plan",
+        "price_plan", "forecast_", "schedule_"
+    ]
     banned_keywords = [
         "exclude_from_training", "review_required", "structural_event_flag", "incomplete_period_flag",
         "anomaly_flag", "scaled", "log1p", "target_h", "future", "lead", "shift(-",
-        "lag_", "roll_", "ewm_", "diff_", "seasonal_lag"
+        "lag_", "roll_", "ewm_", "diff_", "seasonal_lag", "prediction", "actual"
     ]
     for c in df_features.columns:
         if c == date_col or c == target_col:
@@ -5138,11 +5150,12 @@ def detect_safe_ml_exog_columns(df_features: pd.DataFrame, target_col: str, date
             continue
         if any(b in lc for b in banned_keywords):
             continue
-        if pd.api.types.is_numeric_dtype(df_features[c]):
+        if not pd.api.types.is_numeric_dtype(df_features[c]):
+            continue
+        is_future_known = any(k == lc or k in lc for k in future_known_keywords) or any(k in lc for k in explicit_plan_keywords)
+        if is_future_known:
             safe_cols.append(c)
     return sorted(set(safe_cols))
-
-
 def make_series_analysis_frame(export_payload: Dict[str, pd.DataFrame], target_col: str) -> pd.DataFrame:
     df_clean = export_payload["clean_model_input"].copy()
     df_feat = export_payload["features"].copy()
@@ -7633,6 +7646,14 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
             res = fn()
         except Exception as e:
             error = str(e); res = build_model_level_fallback(label, train_df, test_df, freq_alias, error)
+        raw_forecast = np.asarray(res.get("forecast", np.array([])), dtype=float)
+        res["raw_forecast"] = raw_forecast.copy()
+        res["forecast"] = operational_bias_peak_postprocess(train_df["y"], raw_forecast, freq_alias=freq_alias, model_name=label, profile=profile)
+        if "static_forecast" in res:
+            try:
+                res["static_forecast"] = operational_bias_peak_postprocess(train_df["y"], np.asarray(res.get("static_forecast"), dtype=float), freq_alias=freq_alias, model_name=label, profile=profile)
+            except Exception:
+                pass
         metric = build_model_metrics(label, train_df["y"].values, test_df["y"].values, res["forecast"])
         table = build_actual_vs_pred_df(test_df, res["forecast"], label)
         return {"name": label, "result": res, "metric": metric, "table": table, "error": error, "timing": time.perf_counter() - start}
@@ -7677,7 +7698,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     outputs["model_errors"] = model_errors
     outputs["stage_timings"] = stage_timings
     outputs["stage_timing_table"] = build_stage_timer_rows(stage_timings)
-    outputs["rolling_origin_backtest"] = run_rolling_origin_backtest_light(df_series.loc[df_series["is_usable"], ["ds", "y"]].copy(), outputs, freq_alias, max_folds=3, horizon=min(max(2, int(horizon)), 3))
+    outputs["rolling_origin_backtest"] = run_rolling_origin_backtest_full(export_payload, target_col, outputs, freq_alias, horizon=min(max(2, int(horizon)), 3), use_exog_for_stat_models=use_exog_for_stat_models, use_exog_for_prophet=use_exog_for_prophet, max_folds=3)
     outputs["production_governance"] = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
     outputs["production_model"] = outputs["production_governance"].get("production_model", outputs.get("best_model"))
     outputs["production_status"] = outputs["production_governance"].get("production_status", "eligible")
@@ -7715,28 +7736,351 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
     }
 
 
-def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics_df: pd.DataFrame, target_col: str) -> Dict[str, Any]:
+
+
+def _seasonal_naive_array(y_train: pd.Series, horizon: int, season_length: int) -> np.ndarray:
+    y_train = pd.to_numeric(y_train, errors="coerce").astype(float).dropna().reset_index(drop=True)
+    if horizon <= 0:
+        return np.array([], dtype=float)
+    if season_length > 1 and len(y_train) >= season_length:
+        vals = y_train.iloc[-season_length:].tolist()
+        return np.array([vals[i % season_length] for i in range(horizon)], dtype=float)
+    if len(y_train) == 0:
+        return np.zeros(horizon, dtype=float)
+    return np.repeat(float(y_train.iloc[-1]), horizon).astype(float)
+
+
+def operational_bias_peak_postprocess(train_y: pd.Series, pred: np.ndarray, freq_alias: str, model_name: str, profile: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    if pred.size == 0:
+        return pred
+    s = pd.to_numeric(train_y, errors="coerce").astype(float).dropna().reset_index(drop=True)
+    if len(s) == 0:
+        return pred
+    profile = profile or {}
+    season_length = infer_season_length_from_freq(freq_alias)
+    seasonal_naive = _seasonal_naive_array(s, len(pred), season_length)
+    recent_k = min(max(3, len(pred)), len(s))
+    recent_mean = float(s.iloc[-recent_k:].mean()) if recent_k > 0 else float(s.mean())
+    recent_std = float(s.iloc[-min(max(6, len(pred) * 2), len(s)):].std()) if len(s) else 0.0
+    pred_mean = float(np.mean(pred)) if len(pred) else 0.0
+    anchor_ratio = recent_mean / max(pred_mean, 1e-6)
+    trend_strength = float(profile.get("trend_strength", 0.0) or 0.0)
+    seasonality = float(profile.get("seasonality_strength", 0.0) or 0.0)
+    cv = float(profile.get("cv", 0.0) or 0.0)
+    if np.isfinite(anchor_ratio) and 1.03 <= anchor_ratio <= 1.18:
+        lift = 1.0 + 0.55 * (anchor_ratio - 1.0)
+        pred = pred * lift
+    if model_name == "Prophet":
+        pred = 0.50 * pred + 0.35 * seasonal_naive + 0.15 * np.repeat(recent_mean, len(pred))
+    elif model_name == "Ensemble":
+        pred = 0.75 * pred + 0.25 * seasonal_naive
+    else:
+        pred = 0.90 * pred + 0.10 * seasonal_naive
+    seasonal_peak = float(np.nanquantile(seasonal_naive, 0.80)) if len(seasonal_naive) else 0.0
+    if (seasonality >= 0.12 or trend_strength >= 0.10) and seasonal_peak > 0:
+        floor = 0.93 * seasonal_peak
+        pred = np.maximum(pred, np.minimum(np.repeat(floor, len(pred)), seasonal_naive * 1.08))
+    if recent_std > 0 and cv >= 0.10 and float(np.std(pred)) < 0.20 * recent_std:
+        ramp = np.linspace(-0.15, 0.15, len(pred)) * min(recent_std, recent_mean * 0.10)
+        pred = np.maximum(pred + ramp, 0.0)
+    return np.maximum(pred, 0.0)
+
+
+def compute_peak_event_score(y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, quantile: float = 0.75) -> Dict[str, Any]:
+    y_train = np.asarray(y_train, dtype=float)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    if len(y_true) == 0:
+        return {"peak_threshold": np.nan, "peak_precision": np.nan, "peak_recall": np.nan, "peak_f1": np.nan, "peak_event_score": np.nan}
+    base_hist = y_train[np.isfinite(y_train)] if np.isfinite(y_train).any() else y_true[np.isfinite(y_true)]
+    if len(base_hist) == 0:
+        threshold = float(np.nanmedian(y_true)) if len(y_true) else np.nan
+    else:
+        q = 0.70 if len(y_true) <= 6 else quantile
+        threshold = float(np.nanquantile(base_hist, q))
+    k = max(1, int(np.ceil(len(y_true) * 0.34)))
+    actual_idx = set(np.argsort(y_true)[-k:].tolist())
+    pred_idx = set(np.argsort(y_pred)[-k:].tolist())
+    soft_hits = 0
+    matched_pred = set()
+    for ai in sorted(actual_idx):
+        for pj in sorted(pred_idx):
+            if pj in matched_pred:
+                continue
+            if abs(int(ai) - int(pj)) <= 1:
+                soft_hits += 1
+                matched_pred.add(pj)
+                break
+    precision = float(soft_hits / max(len(pred_idx), 1))
+    recall = float(soft_hits / max(len(actual_idx), 1))
+    f1 = float(2 * precision * recall / max(precision + recall, 1e-12)) if (precision + recall) > 0 else 0.0
+    actual_peak_mass = float(np.sum(y_true[list(actual_idx)])) if actual_idx else 0.0
+    captured_mass = float(np.sum(y_pred[list(actual_idx)])) if actual_idx else 0.0
+    amplitude_capture = float(np.clip(captured_mass / max(actual_peak_mass, 1e-6), 0.0, 1.2)) if actual_peak_mass > 0 else 0.0
+    score = float(np.clip(0.70 * f1 + 0.30 * min(amplitude_capture, 1.0), 0.0, 1.0))
+    return {"peak_threshold": threshold, "peak_precision": precision, "peak_recall": recall, "peak_f1": f1, "peak_event_score": score, "actual_peak_count": int(len(actual_idx)), "pred_peak_count": int(len(pred_idx)), "peak_amplitude_capture": amplitude_capture}
+
+
+def run_rolling_origin_backtest_full(export_payload: Dict[str, pd.DataFrame], target_col: str, outputs: Dict[str, Any], freq_alias: str, horizon: int = 3, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True, max_folds: int = 3) -> pd.DataFrame:
+    df_series = make_series_analysis_frame(export_payload, target_col)
+    ds = df_series.loc[df_series["is_usable"], ["ds", "y"]].copy().sort_values("ds").reset_index(drop=True)
+    h = max(1, int(horizon))
+    min_train = max(24, h * 6) if str(freq_alias).upper() == "M" else max(30, h * 6)
+    if len(ds) < (min_train + h + 2):
+        return pd.DataFrame(columns=["fold", "step", "model", "WAPE", "sMAPE", "MAE", "actual", "prediction", "abs_error"])
+    date_col = export_payload["manifest"].loc[export_payload["manifest"]["key"] == "date_column", "value"].iloc[0]
+    df_features = export_payload.get("features", pd.DataFrame()).copy()
+    if date_col in df_features.columns:
+        df_features[date_col] = pd.to_datetime(df_features[date_col], errors="coerce")
+        df_features = df_features.sort_values(date_col).reset_index(drop=True)
+    profile = outputs.get("metadata", {}).get("profile", {}) or get_profile_row(export_payload, target_col)
+    stat_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_stat_models else []
+    prophet_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_prophet else []
+    ml_feature_cols = detect_safe_ml_exog_columns(df_features, target_col, date_col)
+    fold_ends: List[int] = []
+    end = len(ds) - h
+    while end >= min_train and len(fold_ends) < max_folds:
+        fold_ends.append(end)
+        end -= h
+    fold_ends = sorted(fold_ends)
+    rows: List[Dict[str, Any]] = []
+    for fold_no, train_end in enumerate(fold_ends, start=1):
+        tr = ds.iloc[:train_end].copy().reset_index(drop=True)
+        te = ds.iloc[train_end:train_end + h].copy().reset_index(drop=True)
+        usable_dates = pd.concat([tr[["ds"]], te[["ds"]]], axis=0)["ds"]
+        feat_subset = df_features[df_features[date_col].isin(usable_dates)].copy().sort_values(date_col).reset_index(drop=True) if len(df_features) else pd.DataFrame()
+        tr_feat = feat_subset.iloc[:len(tr)].copy().reset_index(drop=True) if len(feat_subset) else pd.DataFrame()
+        te_feat = feat_subset.iloc[len(tr):len(tr)+len(te)].copy().reset_index(drop=True) if len(feat_subset) else pd.DataFrame()
+        stat_tr = tr_feat[stat_exog_cols] if stat_exog_cols and len(tr_feat) else None
+        stat_te = te_feat[stat_exog_cols] if stat_exog_cols and len(te_feat) else None
+        pro_tr = tr_feat[prophet_exog_cols] if prophet_exog_cols and len(tr_feat) else None
+        pro_te = te_feat[prophet_exog_cols] if prophet_exog_cols and len(te_feat) else None
+        ml_tr = tr_feat[ml_feature_cols] if ml_feature_cols and len(tr_feat) else pd.DataFrame(index=tr_feat.index if len(tr_feat) else range(len(tr)))
+        ml_te = te_feat[ml_feature_cols] if ml_feature_cols and len(te_feat) else pd.DataFrame(index=te_feat.index if len(te_feat) else range(len(te)))
+        model_results: Dict[str, Dict[str, Any]] = {}
+        def _record(model_name: str, pred_arr: np.ndarray):
+            pred_arr = operational_bias_peak_postprocess(tr["y"], pred_arr, freq_alias=freq_alias, model_name=model_name, profile=profile)
+            actual = pd.to_numeric(te["y"], errors="coerce").astype(float).values
+            for step, (a, p) in enumerate(zip(actual, pred_arr), start=1):
+                rows.append({"fold": fold_no, "step": step, "model": model_name, "WAPE": wape(np.array([a]), np.array([p])), "sMAPE": smape(np.array([a]), np.array([p])), "MAE": mae(np.array([a]), np.array([p])), "actual": float(a), "prediction": float(p), "abs_error": float(abs(p - a))})
+        try:
+            res = fit_best_sarimax(tr, te, freq_alias, profile, stat_tr, stat_te)
+            model_results["SARIMA/SARIMAX"] = res
+            _record("SARIMA/SARIMAX", np.asarray(res["forecast"], dtype=float))
+        except Exception:
+            pass
+        try:
+            res = fit_best_arima(tr, te, freq_alias, profile)
+            model_results["ARIMA"] = res
+            _record("ARIMA", np.asarray(res["forecast"], dtype=float))
+        except Exception:
+            pass
+        try:
+            if HAS_PROPHET:
+                res = fit_best_prophet(tr, te, freq_alias, profile, pro_tr, pro_te)
+                model_results["Prophet"] = res
+                _record("Prophet", np.asarray(res["forecast"], dtype=float))
+        except Exception:
+            pass
+        try:
+            res = fit_best_intermittent(tr, te, freq_alias, profile)
+            model_results["Intermittent"] = res
+            _record("Intermittent", np.asarray(res["forecast"], dtype=float))
+        except Exception:
+            pass
+        try:
+            res = fit_xgboost_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias)
+            model_results["XGBoost"] = res
+            _record("XGBoost", np.asarray(res["forecast"], dtype=float))
+        except Exception:
+            pass
+        try:
+            pred_map = {k: operational_bias_peak_postprocess(tr["y"], np.asarray(v["forecast"], dtype=float), freq_alias=freq_alias, model_name=k, profile=profile) for k, v in model_results.items()}
+            metrics_rows = [build_model_metrics(k, tr["y"].values, te["y"].values, v) for k, v in pred_map.items()]
+            val_rows = [extract_validation_metrics_from_result(k, model_results[k]) for k in model_results.keys()]
+            ens_pred, _ = build_weighted_ensemble(pred_map, pd.DataFrame(metrics_rows), validation_df=pd.DataFrame(val_rows))
+            _record("Ensemble", ens_pred)
+        except Exception:
+            pass
+    return pd.DataFrame(rows)
+
+
+def summarize_full_backtest(backtest_df: pd.DataFrame) -> pd.DataFrame:
+    if backtest_df is None or len(backtest_df) == 0:
+        return pd.DataFrame(columns=["model", "folds", "WAPE", "sMAPE", "MAE", "MedianAE"])
+    g = backtest_df.groupby("model", dropna=False)
+    out = g.agg(folds=("fold", "nunique"), MAE=("abs_error", "mean"), MedianAE=("abs_error", "median")).reset_index()
+    rows = []
+    for model_name, part in g:
+        rows.append({"model": model_name, "WAPE": wape(part["actual"].values, part["prediction"].values), "sMAPE": smape(part["actual"].values, part["prediction"].values)})
+    score_df = pd.DataFrame(rows)
+    out = out.merge(score_df, on="model", how="left")
+    return out.sort_values(["WAPE", "sMAPE", "MAE"], ascending=[True, True, True]).reset_index(drop=True)
+
+
+def build_calibrated_prediction_interval_table(test_df: pd.DataFrame, pred: np.ndarray, model_name: str, backtest_df: pd.DataFrame, fallback_scale: float, coverage_levels: Tuple[float, ...] = (0.80, 0.90, 0.95)) -> pd.DataFrame:
+    if backtest_df is None or len(backtest_df) == 0 or model_name not in set(backtest_df.get("model", pd.Series(dtype=str)).astype(str)):
+        return build_prediction_interval_table(test_df, pred, fallback_scale, coverage_levels)
+    model_bt = backtest_df.loc[backtest_df["model"].astype(str) == str(model_name)].copy()
+    if len(model_bt) == 0 or "abs_error" not in model_bt.columns:
+        return build_prediction_interval_table(test_df, pred, fallback_scale, coverage_levels)
+    out = test_df[["ds", "y"]].copy().reset_index(drop=True)
+    out["q50"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    for level in coverage_levels:
+        widths = []
+        q = min(max(float(level), 0.50), 0.99)
+        for step in range(1, len(out) + 1):
+            part = model_bt.loc[model_bt["step"] == step, "abs_error"] if "step" in model_bt.columns else pd.Series(dtype=float)
+            if len(part.dropna()) < 2:
+                part = model_bt["abs_error"]
+            width = float(np.nanquantile(pd.to_numeric(part, errors="coerce").dropna(), q)) if len(part.dropna()) else float(fallback_scale)
+            widths.append(max(width, 1e-6))
+        widths = np.asarray(widths, dtype=float)
+        low = np.maximum(out["q50"].values - widths, 0.0)
+        high = np.maximum(out["q50"].values + widths, 0.0)
+        low_q = int(round(((1.0 - level) / 2.0) * 100.0))
+        high_q = int(round((1.0 - (1.0 - level) / 2.0) * 100.0))
+        out[f"q{low_q:02d}"] = low
+        out[f"q{high_q:02d}"] = high
+        out[f"coverage_{int(level*100)}"] = ((out["y"] >= low) & (out["y"] <= high)).astype(int)
+        out[f"avg_width_{int(level*100)}"] = float(np.mean(high - low)) if len(out) else np.nan
+    return out
+
+
+def enforce_hard_feature_contract_gate(eligibility_df: pd.DataFrame, feature_audit_df: pd.DataFrame) -> pd.DataFrame:
+    if eligibility_df is None or len(eligibility_df) == 0:
+        return pd.DataFrame(columns=["model", "status", "eligibility_score"])
+    out = eligibility_df.copy()
+    if feature_audit_df is None or len(feature_audit_df) == 0:
+        return out
+    def _has_unknown(area: str) -> bool:
+        part = feature_audit_df[feature_audit_df["used_in"].str.contains(area, na=False)]
+        if len(part) == 0:
+            return False
+        return bool((part["availability_status"].astype(str) != "future_known").any())
+    for model_name, area in [("XGBoost", "ml"), ("Prophet", "prophet")]:
+        idx = out.index[out["model"] == model_name]
+        if len(idx) == 0:
+            continue
+        i = idx[0]
+        if _has_unknown(area):
+            prev = str(out.loc[i, "status"])
+            out.loc[i, "status"] = "challenger_only" if prev == "eligible" else prev
+            out.loc[i, "eligibility_score"] = float(max(0.0, float(out.loc[i, "eligibility_score"]) - 12.0))
+            reason = str(out.loc[i, "rejection_or_limit_reason"] or "")
+            extra = "Hard feature contract gate: future-known olmayan feature var."
+            out.loc[i, "rejection_or_limit_reason"] = (reason + " | " + extra).strip(" |")
+    return out
+
+
+def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+    prod_model = production_pack.get("production_model", outputs.get("best_model"))
+    bias_df = production_pack.get("bias_dashboard", pd.DataFrame())
+    peak_df = production_pack.get("peak_event_dashboard", pd.DataFrame())
+    gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame())
+    interval_df = production_pack.get("production_interval_table", pd.DataFrame())
+    feature_df = production_pack.get("feature_availability_audit", pd.DataFrame())
+    rows = []
+    alerts = []
+    train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
+    prod_pred = np.asarray((outputs.get("predictions") or {}).get(prod_model, np.array([])), dtype=float)
+    drift_ratio = float(np.mean(prod_pred) / max(float(train_y.tail(min(6, len(train_y))).mean()) if len(train_y) else 1.0, 1e-6)) if len(prod_pred) else np.nan
+    bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
+    peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
+    gate_row = gate_df.loc[gate_df["model"] == prod_model].head(1) if len(gate_df) else pd.DataFrame()
+    rows.append({"production_model": prod_model, "production_status": production_pack.get("production_status", "eligible"), "bias_pct": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan, "under_forecast_rate": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan, "peak_event_score": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan, "eligibility_score": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan, "drift_ratio_vs_recent": drift_ratio, "coverage_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan, "coverage_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan, "max_feature_risk": float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max()) if len(feature_df) else np.nan})
+    r = rows[0]
+    if pd.notna(r["bias_pct"]) and abs(r["bias_pct"]) > 8.0:
+        alerts.append({"severity": "high", "alert": "bias_alert", "detail": f"Bias yüksek: {r['bias_pct']:.2f}%"})
+    if pd.notna(r["under_forecast_rate"]) and r["under_forecast_rate"] > 0.65:
+        alerts.append({"severity": "high", "alert": "under_forecast_alert", "detail": f"Under-forecast oranı yüksek: {r['under_forecast_rate']:.2f}"})
+    if pd.notna(r["peak_event_score"]) and r["peak_event_score"] < 0.20:
+        alerts.append({"severity": "high", "alert": "peak_capture_alert", "detail": f"Peak-event yakalama zayıf: {r['peak_event_score']:.2f}"})
+    if pd.notna(r["drift_ratio_vs_recent"]) and not (0.80 <= r["drift_ratio_vs_recent"] <= 1.25):
+        alerts.append({"severity": "medium", "alert": "forecast_drift_alert", "detail": f"Forecast/recent seviye oranı: {r['drift_ratio_vs_recent']:.2f}"})
+    if pd.notna(r["max_feature_risk"]) and r["max_feature_risk"] > 0.25:
+        alerts.append({"severity": "high", "alert": "feature_contract_alert", "detail": "Production feature contract tamamen güvenli değil."})
+    return {"summary": pd.DataFrame(rows), "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"]) }
+
+
+def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
+    feature_audit_df = build_feature_availability_audit(export_payload.get("features", pd.DataFrame()), export_payload.get("metadata", {}).get("date_col", "ds"), target_col, outputs.get("metadata", {}).get("stat_exog_cols", []) or [], outputs.get("metadata", {}).get("prophet_exog_cols", []) or [], outputs.get("metadata", {}).get("ml_feature_cols", []) or [])
+    bias_df = build_bias_dashboard(outputs)
+    peak_df = build_peak_event_dashboard(outputs)
+    eligibility_df = build_model_eligibility_gate(outputs, feature_audit_df)
+    eligibility_df = enforce_hard_feature_contract_gate(eligibility_df, feature_audit_df)
+    fva_df = build_forecast_value_add(outputs, freq_alias)
+    quantile_tables: Dict[str, pd.DataFrame] = {}
+    service_tables: Dict[str, pd.DataFrame] = {}
+    full_robt = outputs.get("rolling_origin_backtest", pd.DataFrame())
+    for model_name, pred in (outputs.get("predictions") or {}).items():
+        scale = estimate_model_interval_scale(outputs, model_name)
+        qdf = build_calibrated_prediction_interval_table(outputs["test"], pred, model_name, full_robt, fallback_scale=scale)
+        quantile_tables[model_name] = qdf
+        service_tables[model_name] = build_service_level_simulation(outputs["test"], pred, qdf)
+    metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
+    robt_summary = summarize_full_backtest(full_robt)
+    ranked = metrics_df.copy()
+    if len(robt_summary):
+        ranked = ranked.merge(robt_summary[["model", "WAPE", "MAE"]].rename(columns={"WAPE": "ro_WAPE", "MAE": "ro_MAE"}), on="model", how="left")
+    ranked = ranked.merge(eligibility_df[["model", "status", "eligibility_score"]], on="model", how="left")
+    bias_small = bias_df[["model", "bias_pct", "under_forecast_rate"]] if len(bias_df) else pd.DataFrame(columns=["model", "bias_pct", "under_forecast_rate"])
+    peak_small = peak_df[["model", "peak_event_score"]] if len(peak_df) else pd.DataFrame(columns=["model", "peak_event_score"])
+    ranked = ranked.merge(bias_small, on="model", how="left").merge(peak_small, on="model", how="left")
+    status_rank = {"eligible": 0, "challenger_only": 1, "reject": 2}
+    ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
+    ranked["bias_penalty"] = pd.to_numeric(ranked.get("bias_pct"), errors="coerce").abs().fillna(0.0)
+    ranked["peak_penalty"] = 1.0 - pd.to_numeric(ranked.get("peak_event_score"), errors="coerce").fillna(0.0)
+    sort_cols = ["status_rank", "WAPE", "sMAPE", "bias_penalty", "peak_penalty", "eligibility_score"]
+    asc = [True, True, True, True, True, False]
+    if "ro_WAPE" in ranked.columns:
+        sort_cols = ["status_rank", "ro_WAPE", "WAPE", "sMAPE", "bias_penalty", "peak_penalty", "eligibility_score"]
+        asc = [True, True, True, True, True, True, False]
+    ranked = ranked.sort_values(sort_cols, ascending=asc, na_position="last").reset_index(drop=True)
+    production_model = ranked.iloc[0]["model"] if len(ranked) else outputs.get("best_model")
+    production_status = ranked.iloc[0]["status"] if len(ranked) else "eligible"
+    if production_status == "reject":
+        preferred = ["ARIMA", "SARIMA/SARIMAX", outputs.get("best_model")]
+        for cand in preferred:
+            if cand in set(outputs.get("predictions", {}).keys()):
+                production_model = cand
+                break
+        production_status = "guarded_fallback"
+    production_interval = quantile_tables.get(production_model, pd.DataFrame())
+    production_service = service_tables.get(production_model, pd.DataFrame())
+    pack = {"feature_availability_audit": feature_audit_df, "bias_dashboard": bias_df, "peak_event_dashboard": peak_df, "forecast_value_add": fva_df, "model_eligibility_gate": eligibility_df, "quantile_forecasts": quantile_tables, "service_level_simulation": service_tables, "production_model": production_model, "production_status": production_status, "production_interval_table": production_interval, "production_service_table": production_service, "rolling_origin_summary": robt_summary, "production_ranking": ranked}
+    pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, pack)
+    return pack
+
+def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics_df: pd.DataFrame, target_col: str, outputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     notes: List[str] = []
     status = "guarded_use_only"
     try:
         profile_df = export_payload.get("series_profile_report", pd.DataFrame())
         anomaly_df = export_payload.get("anomaly_governance", pd.DataFrame())
-        backtest_df = export_payload.get("proxy_backtest_raw_vs_clean", pd.DataFrame())
-
+        if outputs is not None:
+            prod_pack = outputs.get("production_governance", {}) or {}
+            gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
+            live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
+            alerts_df = live_pack.get("alerts", pd.DataFrame()) if isinstance(live_pack, dict) else pd.DataFrame()
+            if len(gate_df):
+                top = gate_df.sort_values(["status", "eligibility_score"], ascending=[True, False]).iloc[0]
+                notes.append(f"Production gate: {top['model']} -> {top['status']} (score={safe_float(top.get('eligibility_score')):.1f})")
+            if len(alerts_df):
+                notes.append(f"Canlı izleme için {len(alerts_df)} alarm üretildi; kör tam otomasyon öncesi shadow-mode zorunlu.")
         if not profile_df.empty and "series" in profile_df.columns:
             row = profile_df.loc[profile_df["series"] == target_col]
             if not row.empty:
                 n_obs = float(pd.to_numeric(pd.Series([row.iloc[0].get("n_obs", np.nan)]), errors="coerce").iloc[0])
                 if pd.notna(n_obs) and n_obs < 84:
-                    notes.append(f"Seri uzunluğu {int(n_obs)} gözlem; aylık ilaç talebinde üretim seviyesi planlama için kısa/sınırda kabul edilir.")
-
+                    notes.append(f"Seri uzunluğu {int(n_obs)} gözlem; aylık ilaç planlama için sınırlı ve overfit riski taşır.")
         if not anomaly_df.empty and "series" in anomaly_df.columns:
             a = anomaly_df.loc[anomaly_df["series"] == target_col].copy()
             if len(a) > 0 and "is_training_excluded" in a.columns:
                 excluded = int(a["is_training_excluded"].fillna(False).astype(bool).sum())
                 if excluded > 0:
                     notes.append(f"Bu seri için eğitim dışı bırakılan {excluded} kayıt var; yönetişim doğru fakat model belirsizliğini artırır.")
-
         if not metrics_df.empty and "WAPE" in metrics_df.columns:
             best_row = metrics_df.copy()
             best_row["WAPE_num"] = pd.to_numeric(best_row["WAPE"], errors="coerce")
@@ -7750,21 +8094,11 @@ def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics
                         notes.append("Holdout performansı güçlü; kontrollü karar desteği için uygundur.")
                     else:
                         notes.append("Holdout performansı kabul edilebilir olsa da tam otomatik üretim kullanımı için ek onay katmanı gerekir.")
-
-        if not backtest_df.empty and "series" in backtest_df.columns and "metric" in backtest_df.columns:
-            b = backtest_df[(backtest_df["series"] == target_col) & (backtest_df["metric"] == "__OVERALL__")]
-            if not b.empty:
-                decision = str(b.iloc[0].get("decision", ""))
-                reason = str(b.iloc[0].get("decision_reason", ""))
-                notes.append(f"Proxy backtest kararı: {decision}. {reason}".strip())
     except Exception:
         notes.append("Üretim uygunluğu değerlendirmesi hesaplanırken hata oluştu; temkinli kullanım önerilir.")
-
     if not notes:
         notes.append("Bu çıktı tez ve analitik inceleme için uygundur; tam otomatik gerçek hayat kullanımı için ek doğrulama gerekir.")
     return {"status": status, "notes": notes}
-
-
 
 def render_streamlit_app():
     st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
@@ -7917,7 +8251,7 @@ def render_streamlit_app():
             for note in outputs.get("metadata", {}).get("runtime_guardrails", []):
                 st.write(f"- {note}")
 
-    readiness = assess_production_readiness(export_payload, outputs["metrics_df"], target_col)
+    readiness = assess_production_readiness(export_payload, outputs["metrics_df"], target_col, outputs=outputs)
     prod_pack = outputs.get("production_governance", {}) or {}
     prod_model = outputs.get("production_model", outputs.get("best_model"))
     prod_status = outputs.get("production_status", "eligible")
@@ -8009,7 +8343,7 @@ def render_streamlit_app():
 
     with tab6:
         if "rolling_origin_backtest" in outputs and len(outputs["rolling_origin_backtest"]) > 0:
-            st.markdown("**Rolling-origin backtest (hafif katman)**")
+            st.markdown("**Rolling-origin backtest (tam katman)**")
             st.dataframe(style_metric_dataframe(outputs["rolling_origin_backtest"]), width="stretch")
         if "validation_metrics_df" in outputs and len(outputs["validation_metrics_df"]) > 0:
             st.markdown("**Validation-temelli model kalitesi**")
@@ -8037,6 +8371,12 @@ def render_streamlit_app():
         st.dataframe(style_metric_dataframe(prod_pack.get("production_interval_table", pd.DataFrame())), width="stretch")
         st.markdown("**Service-level / stok etkisi simülasyonu**")
         st.dataframe(style_metric_dataframe(prod_pack.get("production_service_table", pd.DataFrame())), width="stretch")
+        st.markdown("**Live monitoring pack**")
+        live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
+        st.dataframe(style_metric_dataframe(live_pack.get("summary", pd.DataFrame())), width="stretch")
+        if isinstance(live_pack.get("alerts"), pd.DataFrame) and len(live_pack.get("alerts")) > 0:
+            st.markdown("**Production alerts**")
+            st.dataframe(style_metric_dataframe(live_pack.get("alerts", pd.DataFrame())), width="stretch")
 
     with tab8:
         st.markdown("**Kalite raporu**")
