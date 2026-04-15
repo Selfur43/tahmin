@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 
 
 
@@ -5691,9 +5691,30 @@ TURKCE_DEGER_HARITASI = {
 
 
 def _turkcelestir_df_kolonlari(df: pd.DataFrame) -> pd.DataFrame:
+    """Kolon adlarını Türkçeleştirir ve çeviri sonrası oluşan tekrarları güvenli biçimde birleştirir."""
     out = df.copy()
-    out.columns = [TURKCE_KOLON_HARITASI.get(str(c), str(c)) for c in out.columns]
-    return out
+    translated_cols = [TURKCE_KOLON_HARITASI.get(str(c), str(c)) for c in out.columns]
+    out.columns = translated_cols
+
+    if len(set(translated_cols)) == len(translated_cols):
+        return out
+
+    birlesik_seriler = {}
+    kolon_sirasi = []
+    for idx, ad in enumerate(translated_cols):
+        col_data = out.iloc[:, idx]
+        if ad not in birlesik_seriler:
+            birlesik_seriler[ad] = col_data.copy()
+            kolon_sirasi.append(ad)
+        else:
+            mevcut = birlesik_seriler[ad]
+            try:
+                birlesik_seriler[ad] = pd.concat([mevcut, col_data], axis=1).bfill(axis=1).iloc[:, 0]
+            except Exception:
+                birlesik_seriler[ad] = mevcut.where(mevcut.notna(), col_data)
+
+    sonuc = pd.DataFrame({ad: birlesik_seriler[ad] for ad in kolon_sirasi})
+    return sonuc
 
 
 def style_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
