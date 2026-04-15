@@ -4616,11 +4616,18 @@ except Exception:
         XGBRegressor = None
 
 try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    shap = None
+    HAS_SHAP = False
+
+try:
     from sklearn.model_selection import ParameterGrid
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 
 def infer_season_length_from_freq(freq_alias: str) -> int:
@@ -5638,11 +5645,27 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         "search_table": pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True]).reset_index(drop=True),
         "feature_importance": importance_df,
         "shap_status": shap_status,
-        "used_feature_count": len(X_train_final.columns)
+        "used_feature_count": len(X_train_final.columns),
+        "fallback_used": False,
+        "fallback_method": None
     }
 
 
 def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M") -> Dict[str, Any]:
+    if XGBRegressor is None:
+        fallback = seasonal_naive_forecast(train_df["y"], len(test_df), infer_seasonal_period(freq_alias))
+        return {
+            "model": None,
+            "forecast": np.maximum(np.asarray(fallback, dtype=float), 0.0),
+            "strategy": "fallback",
+            "search_table": pd.DataFrame(),
+            "feature_importance": pd.DataFrame(columns=["feature", "importance"]),
+            "shap_status": "disabled",
+            "used_feature_count": 0,
+            "fallback_used": True,
+            "fallback_method": "seasonal_naive"
+        }
+
     exog_combined = None
     if feature_train is not None and feature_test is not None and len(feature_train.columns) > 0:
         exog_combined = pd.concat([feature_train.reset_index(drop=True), feature_test.reset_index(drop=True)], axis=0, ignore_index=True)
@@ -5863,6 +5886,56 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
     }
 
 
+def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics_df: pd.DataFrame, target_col: str) -> Dict[str, Any]:
+    notes: List[str] = []
+    status = "guarded_use_only"
+    try:
+        profile_df = export_payload.get("series_profile_report", pd.DataFrame())
+        anomaly_df = export_payload.get("anomaly_governance", pd.DataFrame())
+        backtest_df = export_payload.get("proxy_backtest_raw_vs_clean", pd.DataFrame())
+
+        if not profile_df.empty and "series" in profile_df.columns:
+            row = profile_df.loc[profile_df["series"] == target_col]
+            if not row.empty:
+                n_obs = float(pd.to_numeric(pd.Series([row.iloc[0].get("n_obs", np.nan)]), errors="coerce").iloc[0])
+                if pd.notna(n_obs) and n_obs < 84:
+                    notes.append(f"Seri uzunluğu {int(n_obs)} gözlem; aylık ilaç talebinde üretim seviyesi planlama için kısa/sınırda kabul edilir.")
+
+        if not anomaly_df.empty and "series" in anomaly_df.columns:
+            a = anomaly_df.loc[anomaly_df["series"] == target_col].copy()
+            if len(a) > 0 and "is_training_excluded" in a.columns:
+                excluded = int(a["is_training_excluded"].fillna(False).astype(bool).sum())
+                if excluded > 0:
+                    notes.append(f"Bu seri için eğitim dışı bırakılan {excluded} kayıt var; yönetişim doğru fakat model belirsizliğini artırır.")
+
+        if not metrics_df.empty and "WAPE" in metrics_df.columns:
+            best_row = metrics_df.copy()
+            best_row["WAPE_num"] = pd.to_numeric(best_row["WAPE"], errors="coerce")
+            best_row["sMAPE_num"] = pd.to_numeric(best_row.get("sMAPE"), errors="coerce") if "sMAPE" in best_row.columns else np.nan
+            best_row = best_row.sort_values(["WAPE_num", "sMAPE_num"], ascending=[True, True])
+            if len(best_row):
+                bw = best_row.iloc[0]["WAPE_num"]
+                bs = best_row.iloc[0]["sMAPE_num"]
+                if pd.notna(bw) and pd.notna(bs):
+                    if bw <= 7 and bs <= 6:
+                        notes.append("Holdout performansı güçlü; kontrollü karar desteği için uygundur.")
+                    else:
+                        notes.append("Holdout performansı kabul edilebilir olsa da tam otomatik üretim kullanımı için ek onay katmanı gerekir.")
+
+        if not backtest_df.empty and "series" in backtest_df.columns and "metric" in backtest_df.columns:
+            b = backtest_df[(backtest_df["series"] == target_col) & (backtest_df["metric"] == "__OVERALL__")]
+            if not b.empty:
+                decision = str(b.iloc[0].get("decision", ""))
+                reason = str(b.iloc[0].get("decision_reason", ""))
+                notes.append(f"Proxy backtest kararı: {decision}. {reason}".strip())
+    except Exception:
+        notes.append("Üretim uygunluğu değerlendirmesi hesaplanırken hata oluştu; temkinli kullanım önerilir.")
+
+    if not notes:
+        notes.append("Bu çıktı tez ve analitik inceleme için uygundur; tam otomatik gerçek hayat kullanımı için ek doğrulama gerekir.")
+    return {"status": status, "notes": notes}
+
+
 def render_streamlit_app():
     st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
     st.title("Talep Tahminleme Studio")
@@ -5969,6 +6042,12 @@ def render_streamlit_app():
     metrics_df = style_metric_dataframe(outputs["metrics_df"])
     st.dataframe(metrics_df, use_container_width=True)
     st.download_button("Karşılaştırma tablosunu indir (CSV)", data=dataframe_to_download_bytes(metrics_df), file_name=f"{selected_sheet}_{target_col}_model_karsilastirma.csv", mime="text/csv")
+
+    readiness = assess_production_readiness(export_payload, outputs["metrics_df"], target_col)
+    st.warning("Bu sürüm tez ve karar destek için güçlüdür; ancak kör şekilde tam otomatik üretim planı olarak kullanılmamalıdır.")
+    with st.expander("Üretim kullanımı değerlendirmesi", expanded=False):
+        for note in readiness["notes"]:
+            st.write(f"- {note}")
 
     cc = outputs.get("champion_challenger", {})
     if cc.get("champion"):
