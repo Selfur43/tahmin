@@ -65,6 +65,10 @@ import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.impute import KNNImputer
+try:
+    from sklearn.linear_model import Ridge
+except Exception:
+    Ridge = None
 
 # GUI (desktop optional; Streamlit Cloud/mobile does not use tkinter)
 try:
@@ -4680,7 +4684,8 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
+
 
 @dataclass
 class ForecastRuntimeConfig:
@@ -4696,32 +4701,38 @@ class ForecastRuntimeConfig:
     prophet_max_exog_cols: int = 4
     prophet_allow_logistic_growth: bool = False
     prophet_disable_holidays_for_short_series: bool = True
+    prophet_probe_backend: bool = True
+    prophet_backend_fail_to_surrogate: bool = True
     xgb_enable_shap: bool = False
     xgb_skip_direct_on_short_series: bool = True
+    xgb_max_feature_cols: int = 14
+    xgb_force_single_thread: bool = True
     xgb_param_grid: Tuple[Dict[str, Any], ...] = field(default_factory=lambda: (
         {
-            "max_depth": 3,
-            "learning_rate": 0.05,
-            "n_estimators": 180,
-            "subsample": 0.9,
-            "colsample_bytree": 0.9,
+            "max_depth": 2,
+            "learning_rate": 0.08,
+            "n_estimators": 72,
+            "subsample": 0.90,
+            "colsample_bytree": 0.85,
             "reg_alpha": 0.0,
-            "reg_lambda": 1.0,
+            "reg_lambda": 1.2,
             "min_child_weight": 1
         },
         {
-            "max_depth": 4,
-            "learning_rate": 0.04,
-            "n_estimators": 240,
+            "max_depth": 3,
+            "learning_rate": 0.06,
+            "n_estimators": 96,
             "subsample": 0.85,
-            "colsample_bytree": 0.85,
+            "colsample_bytree": 0.80,
             "reg_alpha": 0.0,
-            "reg_lambda": 1.1,
+            "reg_lambda": 1.4,
             "min_child_weight": 1
         }
     ))
 
 FORECAST_RUNTIME_CONFIG = ForecastRuntimeConfig()
+_PROPhet_BACKEND_PROBE_CACHE = {"done": False, "ok": None, "message": "not_checked"}
+
 
 
 def infer_season_length_from_freq(freq_alias: str) -> int:
@@ -5432,6 +5443,73 @@ def reduce_exog_feature_set(
     return xtr[selected].copy(), xte[selected].copy(), selected, dropped
 
 
+
+
+def reduce_ml_feature_set(
+    feature_train: Optional[pd.DataFrame],
+    feature_test: Optional[pd.DataFrame],
+    y_train: pd.Series,
+    max_cols: int = 14,
+    corr_threshold: float = 0.985
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], List[str], List[str]]:
+    dropped: List[str] = []
+    selected: List[str] = []
+    if feature_train is None or feature_test is None:
+        return feature_train, feature_test, selected, dropped
+    if len(feature_train.columns) == 0:
+        return feature_train, feature_test, selected, dropped
+    xtr = feature_train.copy().reset_index(drop=True)
+    xte = feature_test.copy().reset_index(drop=True)
+    keep_numeric = []
+    for c in xtr.columns:
+        s = pd.to_numeric(xtr[c], errors="coerce")
+        if s.notna().sum() < max(5, len(xtr) // 5):
+            dropped.append(c)
+            continue
+        if float(np.nanvar(s.values)) <= 1e-12:
+            dropped.append(c)
+            continue
+        keep_numeric.append(c)
+    if not keep_numeric:
+        return None, None, selected, dropped
+    xtr = xtr[keep_numeric].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    xte = xte[keep_numeric].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    y_ref = pd.to_numeric(y_train, errors="coerce").astype(float).reset_index(drop=True)
+    score_rows = []
+    for c in xtr.columns:
+        score_rows.append({
+            "col": c,
+            "abs_corr": _safe_abs_corr(xtr[c], y_ref),
+            "var": safe_float(np.nanvar(xtr[c].values))
+        })
+    score_df = pd.DataFrame(score_rows).sort_values(["abs_corr", "var", "col"], ascending=[False, False, True])
+    ranked = score_df["col"].tolist()
+    for c in ranked:
+        if len(selected) >= max_cols:
+            dropped.append(c)
+            continue
+        if any(_safe_abs_corr(xtr[c], xtr[k]) >= corr_threshold for k in selected):
+            dropped.append(c)
+            continue
+        selected.append(c)
+    if not selected:
+        return None, None, [], dropped
+    return xtr[selected].copy(), xte[selected].copy(), selected, dropped
+
+
+def build_fast_xgb_regressor(cfg: Dict[str, Any]):
+    params = dict(cfg)
+    if HAS_XGBOOST:
+        params.setdefault("objective", "reg:squarederror")
+        params.setdefault("random_state", 42)
+        params.setdefault("verbosity", 0)
+        params.setdefault("tree_method", "hist")
+        params.setdefault("max_bin", 64)
+        if FORECAST_RUNTIME_CONFIG.xgb_force_single_thread:
+            params.setdefault("n_jobs", 1)
+        return XGBRegressor(**params)
+    return XGBRegressor(random_state=42)
+
 def should_use_prophet_holidays(freq_alias: str, n_train: int) -> bool:
     if not FORECAST_RUNTIME_CONFIG.prophet_disable_holidays_for_short_series:
         return True
@@ -5440,6 +5518,156 @@ def should_use_prophet_holidays(freq_alias: str, n_train: int) -> bool:
     if str(freq_alias).upper() == "W" and n_train < 120:
         return False
     return True
+
+
+
+def probe_prophet_backend() -> Tuple[bool, str]:
+    if not HAS_PROPHET:
+        return False, "prophet_package_missing"
+    if not FORECAST_RUNTIME_CONFIG.prophet_probe_backend:
+        return True, "probe_disabled"
+    if _PROPhet_BACKEND_PROBE_CACHE["done"]:
+        return bool(_PROPhet_BACKEND_PROBE_CACHE["ok"]), str(_PROPhet_BACKEND_PROBE_CACHE["message"])
+    try:
+        m = Prophet()
+        ok = hasattr(m, "stan_backend") and getattr(m, "stan_backend", None) is not None
+        msg = "ok" if ok else "stan_backend_missing"
+    except Exception as e:
+        ok = False
+        msg = str(e)
+    _PROPhet_BACKEND_PROBE_CACHE["done"] = True
+    _PROPhet_BACKEND_PROBE_CACHE["ok"] = bool(ok)
+    _PROPhet_BACKEND_PROBE_CACHE["message"] = str(msg)
+    return bool(ok), str(msg)
+
+
+def _build_prophet_style_surrogate_design(
+    base_df: pd.DataFrame,
+    exog_df: Optional[pd.DataFrame],
+    freq_alias: str
+) -> Tuple[pd.DataFrame, List[str]]:
+    df = base_df[["ds", "y"]].copy().reset_index(drop=True)
+    ds = pd.to_datetime(df["ds"])
+    df["t"] = np.arange(len(df), dtype=float)
+    df["t2"] = df["t"] ** 2
+    month = ds.dt.month.fillna(1).astype(int)
+    df["month_sin"] = np.sin(2 * np.pi * month / 12.0)
+    df["month_cos"] = np.cos(2 * np.pi * month / 12.0)
+    quarter = ds.dt.quarter.fillna(1).astype(int)
+    df["quarter_sin"] = np.sin(2 * np.pi * quarter / 4.0)
+    df["quarter_cos"] = np.cos(2 * np.pi * quarter / 4.0)
+    if str(freq_alias).upper() in ["W", "D"]:
+        week = ds.dt.isocalendar().week.astype(int).clip(lower=1)
+        df["week_sin"] = np.sin(2 * np.pi * week / 52.0)
+        df["week_cos"] = np.cos(2 * np.pi * week / 52.0)
+    if str(freq_alias).upper() in ["D", "H"]:
+        dow = ds.dt.dayofweek.astype(int)
+        df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
+        df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
+    if exog_df is not None and len(exog_df.columns) > 0:
+        ex = exog_df.copy().reset_index(drop=True)
+        for c in ex.columns:
+            safe_name = f"reg__{re.sub(r'[^0-9A-Za-z_]+', '_', str(c))}"
+            df[safe_name] = pd.to_numeric(ex[c], errors="coerce")
+    feature_cols = [c for c in df.columns if c not in ["ds", "y"]]
+    return df, feature_cols
+
+
+def fit_prophet_surrogate(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    freq_alias: str,
+    exog_train: Optional[pd.DataFrame] = None,
+    exog_test: Optional[pd.DataFrame] = None,
+    reason: str = "prophet_backend_unavailable"
+) -> Dict[str, Any]:
+    y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
+    xtr, xte, used_cols, dropped_cols = reduce_exog_feature_set(
+        exog_train,
+        exog_test,
+        y_train,
+        max_cols=min(FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols, 3)
+    )
+    full_df = pd.concat([train_df[["ds", "y"]], test_df[["ds", "y"]]], axis=0, ignore_index=True)
+    full_exog = None
+    if xtr is not None and xte is not None:
+        full_exog = pd.concat([xtr.reset_index(drop=True), xte.reset_index(drop=True)], axis=0, ignore_index=True)
+    design, feature_cols = _build_prophet_style_surrogate_design(full_df, full_exog, freq_alias)
+    train_cut = len(train_df)
+    X_train = design.iloc[:train_cut][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    y_train_arr = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0).values
+    X_test = design.iloc[train_cut:train_cut + len(test_df)][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    tr_inner, val_inner = make_inner_train_val_split(train_df)
+    inner_cut = len(tr_inner)
+    inner_design = design.iloc[:len(train_df)].copy().reset_index(drop=True)
+    X_inner_tr = inner_design.iloc[:inner_cut][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    y_inner_tr = pd.to_numeric(tr_inner["y"], errors="coerce").astype(float).fillna(0.0).values
+    X_inner_val = inner_design.iloc[inner_cut:inner_cut + len(val_inner)][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    y_inner_val = pd.to_numeric(val_inner["y"], errors="coerce").astype(float).fillna(0.0).values
+
+    alpha_grid = [0.1, 1.0, 5.0, 10.0]
+    rows = []
+    best_alpha = 1.0
+    best_score = np.inf
+    for alpha in alpha_grid:
+        try:
+            if Ridge is not None:
+                mdl = Ridge(alpha=alpha, random_state=42)
+            else:
+                raise RuntimeError("ridge_unavailable")
+            mdl.fit(X_inner_tr.values, y_inner_tr)
+            pred_val = np.maximum(np.asarray(mdl.predict(X_inner_val.values), dtype=float), 0.0)
+            val_w = wape(y_inner_val, pred_val)
+            val_s = smape(y_inner_val, pred_val)
+            comp = float(val_w + 0.35 * val_s + 0.01 * alpha)
+            rows.append({"alpha": alpha, "val_wape": val_w, "val_smape": val_s, "composite_score": comp})
+            if comp < best_score:
+                best_score = comp
+                best_alpha = alpha
+        except Exception as e:
+            rows.append({"alpha": alpha, "val_wape": np.nan, "val_smape": np.nan, "composite_score": np.nan, "fit_error": str(e)[:200]})
+
+    if Ridge is not None:
+        final_model = Ridge(alpha=best_alpha, random_state=42)
+        final_model.fit(X_train.values, y_train_arr)
+        pred = np.maximum(np.asarray(final_model.predict(X_test.values), dtype=float), 0.0)
+    else:
+        pred, fb_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, infer_season_length_from_freq(freq_alias))
+        final_model = None
+        reason = f"{reason}|ridge_missing|{fb_name}"
+
+    fc = test_df[["ds", "y"]].copy().reset_index(drop=True)
+    fc["yhat"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    if len(fc):
+        fc["trend"] = np.linspace(float(y_train_arr[0]) if len(y_train_arr) else 0.0, float(y_train_arr[-1]) if len(y_train_arr) else 0.0, num=len(fc))
+        fc["yearly"] = fc["yhat"] - fc["trend"]
+    else:
+        fc["trend"] = []
+        fc["yearly"] = []
+    return {
+        "model": final_model,
+        "forecast_df": fc,
+        "forecast": np.maximum(np.asarray(fc["yhat"].values, dtype=float), 0.0),
+        "config": {"mode": "prophet_style_ridge", "alpha": best_alpha},
+        "selected_plan": {"plan_name": "prophet_surrogate", "reason": reason},
+        "component_validation": {
+            "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if len(fc) else np.nan,
+            "seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if len(fc) else np.nan,
+            "seasonality_present": True,
+            "used_exog_cols": list(xtr.columns) if xtr is not None else [],
+            "dropped_exog_cols": sorted(set(dropped_cols)),
+            "final_retry_used": True,
+            "rename_map": {},
+            "fit_error_samples": [str(reason)]
+        },
+        "used_exog_cols": list(xtr.columns) if xtr is not None else [],
+        "dropped_exog_cols": sorted(set(dropped_cols)),
+        "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
+        "fallback_used": True,
+        "fallback_method": "prophet_style_ridge",
+        "error": str(reason)
+    }
 
 
 def build_runtime_guardrail_notes(freq_alias: str, n_train: int, horizon: int, stat_exog_cols: List[str], prophet_exog_cols: List[str]) -> List[str]:
@@ -5452,6 +5680,7 @@ def build_runtime_guardrail_notes(freq_alias: str, n_train: int, horizon: int, s
         notes.append(f"Prophet regressors {FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols} ile sınırlandı.")
     if horizon <= 3:
         notes.append("Kısa test ufku: interaktif hız modu nedeniyle ağır walk-forward/refit kapalı tutuldu.")
+    notes.append(f"XGBoost ML feature seti en fazla {FORECAST_RUNTIME_CONFIG.xgb_max_feature_cols} kolon ile sınırlandı.")
     return notes
 
 
@@ -5810,7 +6039,10 @@ def _fit_predict_prophet_once(
 
 def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if not HAS_PROPHET:
-        raise ImportError("prophet paketi bulunamadı.")
+        return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason="prophet_package_missing")
+    backend_ok, backend_msg = probe_prophet_backend()
+    if not backend_ok and FORECAST_RUNTIME_CONFIG.prophet_backend_fail_to_surrogate:
+        return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=f"prophet_backend_probe_failed:{backend_msg}")
 
     y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
     prop_xtr, prop_xte, _used_exog_cols, dropped_exog = reduce_exog_feature_set(
@@ -5976,7 +6208,7 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
 
     if best is None:
         diag = "; ".join(fit_errors[:3]) if fit_errors else "bilinmeyen hata"
-        raise RuntimeError(f"Prophet modeli kurulamadı. İlk hatalar: {diag}")
+        return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=f"prophet_search_failed:{diag}")
 
     final_cols = exog_cols if best["use_exog"] else []
     final_tr = tr_full.copy()
@@ -5995,34 +6227,38 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
         final_retry_used = False
     except Exception as final_e:
         fit_errors.append(f"final_primary: {str(final_e)}")
-        m, fc, pred = _fit_predict_prophet_once(
-            final_tr,
-            final_te,
-            freq_alias,
-            {
-                "seasonality_mode": "additive",
-                "changepoint_prior_scale": 0.03,
-                "seasonality_prior_scale": 1.0,
-                "growth": "linear"
-            },
-            [],
-            use_holidays=False,
-            add_custom_seasonality=False
-        )
-        best = {
-            "cfg": {
-                "seasonality_mode": "additive",
-                "changepoint_prior_scale": 0.03,
-                "seasonality_prior_scale": 1.0,
-                "growth": "linear"
-            },
-            "use_exog": False,
-            "use_holidays": False,
-            "add_custom_seasonality": False,
-            "plan_name": "final_safe_retry"
-        }
-        final_cols = []
-        final_retry_used = True
+        try:
+            m, fc, pred = _fit_predict_prophet_once(
+                final_tr,
+                final_te,
+                freq_alias,
+                {
+                    "seasonality_mode": "additive",
+                    "changepoint_prior_scale": 0.03,
+                    "seasonality_prior_scale": 1.0,
+                    "growth": "linear"
+                },
+                [],
+                use_holidays=False,
+                add_custom_seasonality=False
+            )
+            best = {
+                "cfg": {
+                    "seasonality_mode": "additive",
+                    "changepoint_prior_scale": 0.03,
+                    "seasonality_prior_scale": 1.0,
+                    "growth": "linear"
+                },
+                "use_exog": False,
+                "use_holidays": False,
+                "add_custom_seasonality": False,
+                "plan_name": "final_safe_retry"
+            }
+            final_cols = []
+            final_retry_used = True
+        except Exception as final_retry_e:
+            fit_errors.append(f"final_retry: {str(final_retry_e)}")
+            return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=" | ".join(fit_errors[:5]))
 
     comp_summary = {
         "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,
@@ -6062,6 +6298,7 @@ def build_recursive_feature_row(history_values: List[float], target_date: pd.Tim
 
 
 
+
 def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_combined: Optional[pd.DataFrame], freq_alias: str, strategy: str = "recursive") -> Dict[str, Any]:
     if XGBRegressor is None:
         raise ImportError("XGBoost veya sklearn gradient boosting bulunamadı.")
@@ -6076,29 +6313,35 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     X_base = feat_inner.iloc[:len(tr_inner)][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     y_base = tr_inner["y"].values.astype(float)
 
-    grid = list(FORECAST_RUNTIME_CONFIG.xgb_param_grid) if HAS_XGBOOST else [{"max_depth": 6, "learning_rate": 0.05, "n_estimators": 200}]
+    grid = list(FORECAST_RUNTIME_CONFIG.xgb_param_grid) if HAS_XGBOOST else [{"max_depth": 3, "learning_rate": 0.08, "n_estimators": 72}]
+    if len(train_df) <= 72 and str(freq_alias).upper() == "M":
+        grid = grid[:1]
 
     best = None
     best_score = np.inf
     search_rows = []
+    X_base_np = X_base.values.astype(float)
+    y_base_np = np.asarray(y_base, dtype=float)
+
     for cfg in grid:
         try:
             if strategy == "recursive":
-                model = XGBRegressor(objective="reg:squarederror", random_state=42, **cfg) if HAS_XGBOOST else XGBRegressor(random_state=42)
-                model.fit(X_base, y_base)
+                model = build_fast_xgb_regressor(cfg)
+                model.fit(X_base_np, y_base_np)
                 history = list(tr_inner["y"].astype(float).values)
                 preds = []
                 for i in range(len(val_inner)):
                     target_date = pd.to_datetime(val_inner.iloc[i]["ds"])
                     exog_row = exog_inner.iloc[len(tr_inner)+i] if exog_inner is not None else None
                     X_step = build_recursive_feature_row(history, target_date, freq_alias, exog_row, list(X_base.columns))
-                    pred_i = float(model.predict(X_step)[0])
+                    pred_i = float(model.predict(X_step.values.astype(float))[0])
                     pred_i = max(pred_i, 0.0)
                     preds.append(pred_i)
                     history.append(pred_i)
                 pred_val = np.asarray(preds, dtype=float)
             else:
                 pred_direct = []
+                last_model = None
                 for h in range(1, len(val_inner)+1):
                     feat_shifted = feat_inner.copy()
                     feat_shifted["target_h"] = feat_shifted["y"].shift(-h)
@@ -6106,22 +6349,24 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
                     ds_train = feat_shifted.loc[train_mask, inner_cols + ["target_h"]].dropna().copy()
                     if len(ds_train) < 8:
                         raise ValueError("Direct strategy için yeterli gözlem yok.")
-                    X_h = ds_train[inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    X_h = ds_train[inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
                     y_h = ds_train["target_h"].astype(float).values
-                    model_h = XGBRegressor(objective="reg:squarederror", random_state=42, **cfg) if HAS_XGBOOST else XGBRegressor(random_state=42)
+                    model_h = build_fast_xgb_regressor(cfg)
                     model_h.fit(X_h, y_h)
                     origin_idx = len(tr_inner) - 1
-                    row = feat_inner.iloc[[origin_idx]][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    row = feat_inner.iloc[[origin_idx]][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
                     pred_direct.append(max(float(model_h.predict(row)[0]), 0.0))
+                    last_model = model_h
                 pred_val = np.asarray(pred_direct[:len(val_inner)], dtype=float)
-                model = model_h
+                model = last_model
             score = wape(val_inner["y"].values, pred_val)
             sm = smape(val_inner["y"].values, pred_val)
             search_rows.append({**cfg, "strategy": strategy, "val_wape": score, "val_smape": sm})
             if score < best_score:
                 best_score = score
                 best = {"cfg": cfg, "strategy": strategy}
-        except Exception:
+        except Exception as e:
+            search_rows.append({**cfg, "strategy": strategy, "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:180]})
             continue
 
     if best is None:
@@ -6132,19 +6377,15 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     y_train_final = train_df["y"].astype(float).values
 
     if best["strategy"] == "recursive":
-        model = XGBRegressor(objective="reg:squarederror", random_state=42, **best["cfg"]) if HAS_XGBOOST else XGBRegressor(random_state=42)
-        if HAS_XGBOOST and len(X_train_final) >= 12:
-            split = max(2, len(X_train_final)//5)
-            model.fit(X_train_final.iloc[:-split], y_train_final[:-split], eval_set=[(X_train_final.iloc[-split:], y_train_final[-split:])], verbose=False)
-        else:
-            model.fit(X_train_final, y_train_final)
+        model = build_fast_xgb_regressor(best["cfg"])
+        model.fit(X_train_final.values.astype(float), np.asarray(y_train_final, dtype=float))
         history = list(train_df["y"].astype(float).values)
         preds = []
         for i in range(len(future_df)):
             target_date = pd.to_datetime(future_df.iloc[i]["ds"])
             exog_row = exog_combined.iloc[train_cut + i] if exog_combined is not None else None
             X_step = build_recursive_feature_row(history, target_date, freq_alias, exog_row, list(X_train_final.columns))
-            pred_i = max(float(model.predict(X_step)[0]), 0.0)
+            pred_i = max(float(model.predict(X_step.values.astype(float))[0]), 0.0)
             preds.append(pred_i)
             history.append(pred_i)
         pred_test = np.asarray(preds, dtype=float)
@@ -6156,11 +6397,11 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
             feat_shifted = feat_train_test.copy()
             feat_shifted["target_h"] = feat_shifted["y"].shift(-h)
             ds_train = feat_shifted.iloc[:train_cut][feature_cols + ["target_h"]].dropna().copy()
-            X_h = ds_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            X_h = ds_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
             y_h = ds_train["target_h"].astype(float).values
-            model_h = XGBRegressor(objective="reg:squarederror", random_state=42, **best["cfg"]) if HAS_XGBOOST else XGBRegressor(random_state=42)
+            model_h = build_fast_xgb_regressor(best["cfg"])
             model_h.fit(X_h, y_h)
-            origin_row = feat_train_test.iloc[[train_cut-1]][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            origin_row = feat_train_test.iloc[[train_cut-1]][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
             pred_test.append(max(float(model_h.predict(origin_row)[0]), 0.0))
             trained_models.append(model_h)
         pred_test = np.asarray(pred_test, dtype=float)
@@ -6176,8 +6417,8 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     shap_status = "disabled_fast_mode"
     if HAS_SHAP and FORECAST_RUNTIME_CONFIG.xgb_enable_shap:
         try:
-            explainer = shap.Explainer(trained_models[0], X_train_final.head(min(100, len(X_train_final))))
-            sv = explainer(X_train_final.head(min(50, len(X_train_final))))
+            explainer = shap.Explainer(trained_models[0], X_train_final.head(min(100, len(X_train_final))).values.astype(float))
+            sv = explainer(X_train_final.head(min(50, len(X_train_final))).values.astype(float))
             shap_status = f"computed_on_{sv.values.shape[0]}_rows"
         except Exception:
             shap_status = "failed_optional"
@@ -6186,7 +6427,7 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         "model": trained_models[0],
         "forecast": pred_test,
         "strategy": best["strategy"],
-        "search_table": pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True]).reset_index(drop=True),
+        "search_table": pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True], na_position="last").reset_index(drop=True),
         "feature_importance": importance_df,
         "shap_status": shap_status,
         "used_feature_count": len(X_train_final.columns),
@@ -6211,10 +6452,22 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
         }
 
     exog_combined = None
+    selected_ml_cols: List[str] = []
+    dropped_ml_cols: List[str] = []
     if feature_train is not None and feature_test is not None and len(feature_train.columns) > 0:
-        exog_combined = pd.concat([feature_train.reset_index(drop=True), feature_test.reset_index(drop=True)], axis=0, ignore_index=True)
+        red_tr, red_te, selected_ml_cols, dropped_ml_cols = reduce_ml_feature_set(
+            feature_train,
+            feature_test,
+            pd.to_numeric(train_df["y"], errors="coerce").astype(float),
+            max_cols=FORECAST_RUNTIME_CONFIG.xgb_max_feature_cols
+        )
+        if red_tr is not None and red_te is not None:
+            exog_combined = pd.concat([red_tr.reset_index(drop=True), red_te.reset_index(drop=True)], axis=0, ignore_index=True)
 
     recursive_res = fit_xgboost_strategy(train_df, test_df, exog_combined, freq_alias, strategy="recursive")
+    recursive_res["selected_ml_feature_cols"] = selected_ml_cols
+    recursive_res["dropped_ml_feature_cols"] = dropped_ml_cols
+
     if FORECAST_RUNTIME_CONFIG.xgb_skip_direct_on_short_series and len(train_df) <= 72:
         recursive_res["strategy_comparison"] = pd.DataFrame([{
             "strategy": "recursive",
@@ -6225,6 +6478,8 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
         return recursive_res
 
     direct_res = fit_xgboost_strategy(train_df, test_df, exog_combined, freq_alias, strategy="direct")
+    direct_res["selected_ml_feature_cols"] = selected_ml_cols
+    direct_res["dropped_ml_feature_cols"] = dropped_ml_cols
     rec_wape = wape(test_df["y"].values, recursive_res["forecast"])
     dir_wape = wape(test_df["y"].values, direct_res["forecast"])
     best = recursive_res if rec_wape <= dir_wape else direct_res
@@ -6233,7 +6488,6 @@ def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_
         {"strategy": "direct", "WAPE": dir_wape, "sMAPE": smape(test_df["y"].values, direct_res["forecast"]), "used_feature_count": direct_res.get("used_feature_count", np.nan)},
     ]).sort_values(["WAPE", "sMAPE"], ascending=[True, True]).reset_index(drop=True)
     return best
-
 
 def build_model_metrics(model_name: str, y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
     return {
@@ -6258,13 +6512,21 @@ def build_weighted_ensemble(pred_map: Dict[str, np.ndarray], metrics_df: pd.Data
     use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
     if len(use_df) == 0:
         raise ValueError("Ensemble için model yok.")
-    use_df["raw_weight"] = 1.0 / np.maximum(use_df["WAPE"].astype(float), 1e-6)
-    use_df["weight"] = use_df["raw_weight"] / use_df["raw_weight"].sum()
+    use_df = use_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
+    best_wape = float(use_df.iloc[0]["WAPE"])
+    prune_threshold = min(best_wape * 1.25, best_wape + 1.0)
+    pruned = use_df.loc[(use_df["WAPE"].astype(float) <= prune_threshold)].copy()
+    if len(pruned) == 0:
+        pruned = use_df.head(1).copy()
+    elif len(pruned) > 2:
+        pruned = pruned.head(2).copy()
+    pruned["raw_weight"] = 1.0 / np.maximum(np.square(pruned["WAPE"].astype(float)), 1e-6)
+    pruned["weight"] = pruned["raw_weight"] / pruned["raw_weight"].sum()
     ensemble = None
-    for _, row in use_df.iterrows():
+    for _, row in pruned.iterrows():
         pred = np.asarray(pred_map[row["model"]], dtype=float)
         ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
-    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), use_df[["model", "WAPE", "sMAPE", "weight"]]
+    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[["model", "WAPE", "sMAPE", "weight"]]
 
 
 def build_model_level_fallback(model_name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, error_message: str) -> Dict[str, Any]:
