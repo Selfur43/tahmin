@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 
 
 
@@ -5772,13 +5772,50 @@ def build_acf_pacf_figure(train_df: pd.DataFrame, target_col: str):
     plt.tight_layout()
     return fig
 
-def plot_forecast_results(train_df: pd.DataFrame, test_df: pd.DataFrame, predictions: Dict[str, np.ndarray], title: str):
+def build_model_visual_style_map(outputs: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    outputs = outputs or {}
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs, dict) else {}
+    prod_model = prod_pack.get("production_model")
+    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    prophet_info = outputs.get("prophet", {}) if isinstance(outputs, dict) else {}
+    style_map: Dict[str, Dict[str, Any]] = {}
+    if isinstance(gate_df, pd.DataFrame) and len(gate_df):
+        for _, row in gate_df.iterrows():
+            model_name = str(row.get("model"))
+            status = str(row.get("status", "eligible"))
+            opacity = 1.0
+            width = 2.5
+            dash = "solid"
+            if status == "challenger_only":
+                opacity = 0.72
+                width = 2.0
+            elif status == "reject":
+                opacity = 0.35
+                width = 1.4
+                dash = "dot"
+            if model_name == prod_model:
+                opacity = 1.0
+                width = 4.0
+                dash = "solid"
+            style_map[model_name] = {"opacity": opacity, "width": width, "dash": dash}
+    if prophet_info and bool(prophet_info.get("fallback_used", False)):
+        style_map.setdefault("Prophet", {})
+        style_map["Prophet"].update({"opacity": 0.28, "width": 1.2, "dash": "dot"})
+    return style_map
+
+def plot_forecast_results(train_df: pd.DataFrame, test_df: pd.DataFrame, predictions: Dict[str, np.ndarray], title: str, model_style_map: Optional[Dict[str, Dict[str, Any]]] = None):
+    model_style_map = model_style_map or {}
     if HAS_PLOTLY:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=train_df["ds"], y=train_df["y"], mode="lines+markers", name="Eğitim"))
-        fig.add_trace(go.Scatter(x=test_df["ds"], y=test_df["y"], mode="lines+markers", name="Gerçek"))
+        fig.add_trace(go.Scatter(x=train_df["ds"], y=train_df["y"], mode="lines+markers", name="Eğitim", line=dict(width=2.4), opacity=0.95))
+        fig.add_trace(go.Scatter(x=test_df["ds"], y=test_df["y"], mode="lines+markers", name="Gerçek", line=dict(width=3.0), opacity=1.0))
         for name, pred in predictions.items():
-            fig.add_trace(go.Scatter(x=test_df["ds"], y=pred, mode="lines+markers", name=name))
+            style = model_style_map.get(name, {})
+            fig.add_trace(go.Scatter(
+                x=test_df["ds"], y=pred, mode="lines+markers", name=name,
+                line=dict(width=float(style.get("width", 2.2)), dash=str(style.get("dash", "solid"))),
+                opacity=float(style.get("opacity", 0.9))
+            ))
         fig.update_layout(title=title, xaxis_title="Tarih", yaxis_title="Talep", legend_title="Seriler", template="plotly_white")
         return fig
     return None
@@ -7389,9 +7426,9 @@ def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Op
     out = validation_df.copy()
     out["bağlamsal_ceza"] = 0.0
     if not regime.get("intermittent_like", False):
-        out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 1.75
+        out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 4.50
     if not regime.get("seasonal_like", False):
-        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 0.90
+        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.25
     if regime.get("volatile_like", False):
         out.loc[out["model"].eq("ARIMA"), "bağlamsal_ceza"] += 0.20
         out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] += 0.10
@@ -7399,7 +7436,7 @@ def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Op
         out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] -= 0.15
     if regime.get("trendy_like", False):
         out.loc[out["model"].eq("XGBoost"), "bağlamsal_ceza"] -= 0.10
-    out["bağlamsal_doğrulama_skoru"] = pd.to_numeric(out.get("val_WAPE"), errors="coerce").fillna(99.0) + pd.to_numeric(out.get("val_sMAPE"), errors="coerce").fillna(99.0) * 0.10 + out["bağlamsal_ceza"].fillna(0.0)
+    out["bağlamsal_doğrulama_skoru"] = pd.to_numeric(out.get("val_WAPE"), errors="coerce").fillna(99.0) + pd.to_numeric(out.get("val_sMAPE"), errors="coerce").fillna(99.0) * 0.12 + out["bağlamsal_ceza"].fillna(0.0)
     return out.sort_values(["bağlamsal_doğrulama_skoru", "val_WAPE", "val_sMAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
 
 
@@ -8010,7 +8047,9 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
     outputs["validation_metrics_df"] = validation_df
     metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
-    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values, rolling_summary=summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame())), profile=profile)
+    outputs["rolling_origin_backtest"] = run_rolling_origin_backtest_full(export_payload, target_col, outputs, freq_alias, horizon=min(max(2, int(horizon)), 3), use_exog_for_stat_models=use_exog_for_stat_models, use_exog_for_prophet=use_exog_for_prophet, max_folds=3)
+    rolling_summary_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values, rolling_summary=rolling_summary_df, profile=profile)
     outputs["predictions"]["Ensemble"] = ensemble_pred
     outputs["metrics"].append(build_model_metrics("Ensemble", train_df["y"].values, test_df["y"].values, ensemble_pred))
     outputs["tables"]["Ensemble"] = build_actual_vs_pred_df(test_df, ensemble_pred, "Ensemble")
@@ -8031,10 +8070,10 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         {"model": "ARIMA", "fallback_used": bool((outputs.get("arima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("arima") or {}).get("fallback_method")},
         {"model": "Intermittent", "fallback_used": bool((outputs.get("intermittent") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("intermittent") or {}).get("fallback_method")},
     ])
-    outputs["rolling_origin_backtest"] = run_rolling_origin_backtest_full(export_payload, target_col, outputs, freq_alias, horizon=min(max(2, int(horizon)), 3), use_exog_for_stat_models=use_exog_for_stat_models, use_exog_for_prophet=use_exog_for_prophet, max_folds=3)
     outputs["production_governance"] = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
     outputs["production_model"] = outputs["production_governance"].get("production_model", outputs.get("best_model"))
     outputs["production_status"] = outputs["production_governance"].get("production_status", "eligible")
+    outputs["model_gorsel_stil_haritasi"] = build_model_visual_style_map(outputs)
     outputs["karar_hiyerarsisi"] = build_karar_hiyerarsisi_ozeti(outputs)
     outputs["prophet_gorunurluk_ozeti"] = build_prophet_gorunurluk_ozeti(outputs.get("prophet", {}))
     outputs["benzersiz_rapor_katalogu"] = build_benzersiz_rapor_katalogu(outputs, outputs["production_governance"])
@@ -8375,6 +8414,27 @@ def enforce_hard_feature_contract_gate(eligibility_df: pd.DataFrame, feature_aud
     return out
 
 
+def build_production_decision_explanation(production_ranking: pd.DataFrame, production_model: Optional[str]) -> str:
+    if production_ranking is None or len(production_ranking) == 0 or not production_model:
+        return "Üretim modeli, uygunluk ve performans bilgileri sınırlı olduğu için temkinli seçildi."
+    row = production_ranking.loc[production_ranking["model"].astype(str) == str(production_model)].head(1)
+    if len(row) == 0:
+        return f"{production_model} seçildi; çünkü güvenli varsayılan aday olarak öne çıktı."
+    row = row.iloc[0]
+    nedenler = []
+    if pd.notna(row.get("ro_WAPE")):
+        nedenler.append(f"rolling-origin WAPE={safe_float(row.get('ro_WAPE')):.2f}")
+    if pd.notna(row.get("WAPE")):
+        nedenler.append(f"holdout WAPE={safe_float(row.get('WAPE')):.2f}")
+    if pd.notna(row.get("eligibility_score")):
+        nedenler.append(f"uygunluk skoru={safe_float(row.get('eligibility_score')):.1f}")
+    if pd.notna(row.get("service_gap")) and float(row.get("service_gap")) <= 1e-9:
+        nedenler.append("servis açığı yok")
+    if pd.notna(row.get("peak_event_score")):
+        nedenler.append(f"tepe skoru={safe_float(row.get('peak_event_score')):.3f}")
+    durum = TURKCE_DEGER_HARITASI.get(str(row.get("status", "eligible")), str(row.get("status", "eligible")))
+    return f"{production_model} seçildi; çünkü {', '.join(nedenler[:4])} ve üretim durumu '{durum}' olarak değerlendirildi."
+
 def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
     prod_model = production_pack.get("production_model", outputs.get("best_model"))
     bias_df = production_pack.get("bias_dashboard", pd.DataFrame())
@@ -8444,6 +8504,8 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
     summary["alarm_sayısı"] = len(alerts)
     summary["yüksek_alarm_sayısı"] = sum(1 for a in alerts if a["severity"] == "high")
     summary["canlı_kullanım_önerisi"] = recommendation
+    summary["karar_açıklaması"] = build_production_decision_explanation(production_pack.get("production_ranking", pd.DataFrame()), prod_model)
+    summary["karar_kartı"] = summary.apply(lambda r: f"Model: {r['üretim_modeli']} | Sapma: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f} | Fallback: {safe_float(r.get('fallback_oranı', np.nan)):.2f} | Drift: {safe_float(r.get('drift_oranı', np.nan)):.2f} | Servis: {safe_float(r.get('gerçekleşen_servis', np.nan)):.2f}/{safe_float(r.get('hedef_servis', np.nan)):.2f} | Alarm: {int(r.get('alarm_sayısı', 0)) if pd.notna(r.get('alarm_sayısı', np.nan)) else 0}", axis=1)
 
     metric_df = outputs.get("metrics_df", pd.DataFrame())
     prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
@@ -8527,13 +8589,13 @@ def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Di
         ranked.loc[ranked["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.1
     ranked["operasyonel_skor"] = (
         ranked["status_rank"].fillna(9.0) * 1000.0
-        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.68
-        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.14
-        + ranked["service_penalty"].fillna(0.0) * 20.0
-        + ranked["under_penalty"].fillna(0.0) * 13.5
-        + ranked["bias_penalty"].fillna(0.0) * 1.35
-        + ranked["peak_penalty"].fillna(0.0) * 11.0
-        + ranked["bağlamsal_ceza"].fillna(0.0) * 8.0
+        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.78
+        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.10
+        + ranked["service_penalty"].fillna(0.0) * 22.0
+        + ranked["under_penalty"].fillna(0.0) * 14.5
+        + ranked["bias_penalty"].fillna(0.0) * 1.45
+        + ranked["peak_penalty"].fillna(0.0) * 12.5
+        + ranked["bağlamsal_ceza"].fillna(0.0) * 9.5
         - pd.to_numeric(ranked.get("eligibility_score"), errors="coerce").fillna(0.0) * 0.03
     )
     sort_cols = ["operasyonel_skor", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
@@ -8550,7 +8612,7 @@ def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Di
         production_status = "guarded_fallback"
     production_interval = quantile_tables.get(production_model, pd.DataFrame())
     production_service = service_tables.get(production_model, pd.DataFrame())
-    pack = {"feature_availability_audit": feature_audit_df, "bias_dashboard": bias_df, "peak_event_dashboard": peak_df, "forecast_value_add": fva_df, "model_eligibility_gate": eligibility_df, "quantile_forecasts": quantile_tables, "service_level_simulation": service_tables, "production_model": production_model, "production_status": production_status, "production_interval_table": production_interval, "production_service_table": production_service, "rolling_origin_summary": robt_summary, "production_ranking": ranked}
+    pack = {"feature_availability_audit": feature_audit_df, "bias_dashboard": bias_df, "peak_event_dashboard": peak_df, "forecast_value_add": fva_df, "model_eligibility_gate": eligibility_df, "quantile_forecasts": quantile_tables, "service_level_simulation": service_tables, "production_model": production_model, "production_status": production_status, "production_interval_table": production_interval, "production_service_table": production_service, "rolling_origin_summary": robt_summary, "production_ranking": ranked, "production_decision_explanation": build_production_decision_explanation(ranked, production_model)}
     pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, pack)
     return pack
 
@@ -8641,6 +8703,10 @@ def build_karar_hiyerarsisi_ozeti(outputs: Dict[str, Any]) -> pd.DataFrame:
     out = lider.rename(columns={"karar_kademesi": "KararAşaması", "model": "KazananModel"}).copy()
     out["KararAmacı"] = out["KararAşaması"].map(karar_map)
     out["Anlamı"] = out["KararAşaması"].map(aciklama_map)
+    prod_expl = ((outputs.get("production_governance", {}) or {}).get("production_decision_explanation") if isinstance(outputs, dict) else None)
+    if prod_expl:
+        extra = pd.DataFrame([{"KararAşaması": "Üretim karar açıklaması", "KazananModel": str((outputs.get("production_governance", {}) or {}).get("production_model", "-")), "KararAmacı": "Neden seçildi?", "Anlamı": str(prod_expl)}])
+        out = pd.concat([out, extra], axis=0, ignore_index=True)
     return out
 
 
@@ -8657,7 +8723,7 @@ def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFra
         production_note = "Üretimde ancak doğrulama ve uygunluk kapısından geçerse kullanılmalı."
     elif fallback_used:
         rozet = "Fallback Prophet"
-        production_note = "Production’da kullanılmaz; yalnız meydan okuyucu veya tanısal amaçla gösterilir."
+        production_note = "Production’da kullanılmaz; görselde soluk gösterilir ve yalnız meydan okuyucu/tanısal amaçla kullanılır."
     else:
         rozet = "Prophet belirsiz"
         production_note = "Bu çalışma modu temkinli yorumlanmalı."
@@ -8884,7 +8950,7 @@ def render_streamlit_app():
             if len(err_df):
                 st.dataframe(err_df, width="stretch")
 
-    fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin")
+    fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
     if fig is not None:
         st.plotly_chart(fig, width="stretch")
 
@@ -8898,7 +8964,7 @@ def render_streamlit_app():
             st.json({"order": sarima.get("order"), "seasonal_order": sarima.get("seasonal_order"), "trend": sarima.get("trend"), "AIC": sarima.get("aic"), "BIC": sarima.get("bic"), "Ljung-Box p-değeri": sarima.get("ljung_box_pvalue"), "d": sarima.get("d"), "D": sarima.get("D"), "transform": sarima.get("transform"), "white_noise_ok": sarima.get("residual_white_noise_ok"), "fallback_used": sarima.get("fallback_used"), "fallback_method": sarima.get("fallback_method")})
             if "SARIMA/SARIMAX" in outputs["tables"]:
                 st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), width="stretch")
-                fig_sarima = plot_forecast_results(outputs["train"], outputs["test"], {"SARIMA/SARIMAX": outputs["predictions"]["SARIMA/SARIMAX"]}, f"{target_col} - SARIMA/SARIMAX")
+                fig_sarima = plot_forecast_results(outputs["train"], outputs["test"], {"SARIMA/SARIMAX": outputs["predictions"]["SARIMA/SARIMAX"]}, f"{target_col} - SARIMA/SARIMAX", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
                 if fig_sarima is not None:
                     st.plotly_chart(fig_sarima, width="stretch")
             if isinstance(sarima.get("search_table"), pd.DataFrame) and len(sarima.get("search_table")):
@@ -8913,7 +8979,7 @@ def render_streamlit_app():
             if isinstance(outputs["prophet"].get("component_validation"), dict):
                 st.json(outputs["prophet"].get("component_validation", {}))
             st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), width="stretch")
-            fig_prophet = plot_forecast_results(outputs["train"], outputs["test"], {"Prophet": outputs["predictions"]["Prophet"]}, f"{target_col} - Prophet")
+            fig_prophet = plot_forecast_results(outputs["train"], outputs["test"], {"Prophet": outputs["predictions"]["Prophet"]}, f"{target_col} - Prophet", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
             if fig_prophet is not None:
                 st.plotly_chart(fig_prophet, width="stretch")
             st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), width="stretch")
@@ -8927,7 +8993,7 @@ def render_streamlit_app():
             st.json({"selected_strategy": outputs["xgboost"].get("strategy"), "shap_status": outputs["xgboost"].get("shap_status"), "fallback_used": outputs["xgboost"].get("fallback_used"), "fallback_method": outputs["xgboost"].get("fallback_method")})
             if "XGBoost" in outputs["tables"]:
                 st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), width="stretch")
-                fig_xgb = plot_forecast_results(outputs["train"], outputs["test"], {"XGBoost": outputs["predictions"]["XGBoost"]}, f"{target_col} - XGBoost")
+                fig_xgb = plot_forecast_results(outputs["train"], outputs["test"], {"XGBoost": outputs["predictions"]["XGBoost"]}, f"{target_col} - XGBoost", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
                 if fig_xgb is not None:
                     st.plotly_chart(fig_xgb, width="stretch")
             st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), width="stretch")
@@ -8945,7 +9011,7 @@ def render_streamlit_app():
         st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), width="stretch")
         st.markdown("**Ansambl gerçek ve tahmin**")
         st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), width="stretch")
-        fig_ens = plot_forecast_results(outputs["train"], outputs["test"], {"Ensemble": outputs["predictions"]["Ensemble"]}, f"{target_col} - Ensemble")
+        fig_ens = plot_forecast_results(outputs["train"], outputs["test"], {"Ensemble": outputs["predictions"]["Ensemble"]}, f"{target_col} - Ensemble", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
         if fig_ens is not None:
             st.plotly_chart(fig_ens, width="stretch")
 
