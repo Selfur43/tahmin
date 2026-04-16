@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.3.0"
 
 
 
@@ -6605,6 +6605,8 @@ def fit_prophet_surrogate(
         "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
         "fallback_used": True,
         "fallback_method": "prophet_style_ridge",
+        "fit_mode": "vekil_prophet_fallback",
+        "fit_visibility_note": "Gerçek Prophet fit başarısız oldu; güvenli vekil Prophet (ridge tabanlı) kullanıldı.",
         "error": str(reason)
     }
 
@@ -7028,7 +7030,7 @@ def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
     pred=apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
     if "yhat" in fc: fc["yhat"]=pred
     comp_summary={"trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,"seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if "yearly" in fc else np.nan,"seasonality_present": bool("yearly" in fc or "weekly" in fc),"used_exog_cols": final_cols,"dropped_exog_cols": sorted(set(dropped_exog)),"final_retry_used": final_retry_used,"rename_map": rename_map,"fit_error_samples": fit_errors[:5],"blend_alpha": alpha,"blend_baseline": best.get("blend_baseline"),"postprocess": best.get("postprocess_cfg", {})}
-    result={"model":m,"forecast_df":fc,"forecast":pred,"config":best["cfg"],"selected_plan":best,"component_validation":comp_summary,"used_exog_cols":final_cols,"dropped_exog_cols":sorted(set(dropped_exog)),"search_table":pd.DataFrame(rows).sort_values(["composite_score","val_wape"],ascending=[True,True],na_position="last").reset_index(drop=True),"search_accelerator_cache_hit":False,"validation_wape":safe_float(best.get("validation_wape",np.nan)),"validation_smape":safe_float(best.get("validation_smape",np.nan))}
+    result={"model":m,"forecast_df":fc,"forecast":pred,"config":best["cfg"],"selected_plan":best,"component_validation":comp_summary,"used_exog_cols":final_cols,"dropped_exog_cols":sorted(set(dropped_exog)),"search_table":pd.DataFrame(rows).sort_values(["composite_score","val_wape"],ascending=[True,True],na_position="last").reset_index(drop=True),"search_accelerator_cache_hit":False,"validation_wape":safe_float(best.get("validation_wape",np.nan)),"validation_smape":safe_float(best.get("validation_smape",np.nan)),"fallback_used":False,"fallback_method":None,"fit_mode":"gercek_prophet_fit","fit_visibility_note":"Gerçek Prophet modeli başarıyla kuruldu ve tahmin üretildi."}
     SEARCH_ACCELERATOR.put_result(cache_key, result)
     return result
 
@@ -7353,101 +7355,112 @@ def build_champion_challenger(metrics_df: pd.DataFrame) -> Dict[str, Any]:
     return {"champion": champion, "challenger": challenger, "holdout_winner": champion, "ranking": ranked}
 
 
-def build_weighted_ensemble(pred_map: Dict[str, np.ndarray], metrics_df: pd.DataFrame, validation_df: Optional[pd.DataFrame] = None) -> Tuple[np.ndarray, pd.DataFrame]:
+
+def build_weighted_ensemble(
+    pred_map: Dict[str, np.ndarray],
+    metrics_df: pd.DataFrame,
+    validation_df: Optional[pd.DataFrame] = None,
+    y_train: Optional[np.ndarray] = None,
+    y_true: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, pd.DataFrame]:
+    """
+    Peak-aware ve bias-aware ansambl.
+    Amaç: doğrulamada iyi olan modeli korurken, tepe dönemlerini aşırı bastıran
+    veya belirgin bias üreten modellerin ağırlığını düşürmek.
+    """
     if validation_df is not None and len(validation_df) > 0:
         use_df = validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy()
-        score_cols = ["val_WAPE", "val_sMAPE"]
-        sort_cols = score_cols
+        primary_col = "val_WAPE"
+        secondary_col = "val_sMAPE"
     else:
         use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
-        score_cols = ["WAPE", "sMAPE"]
-        sort_cols = ["WAPE", "sMAPE", "RMSE"]
+        primary_col = "WAPE"
+        secondary_col = "sMAPE"
+
     if len(use_df) == 0:
-        raise ValueError("Ensemble için model yok.")
-    use_df = use_df.sort_values(sort_cols, ascending=[True] * len(sort_cols), na_position="last").reset_index(drop=True)
-    primary_col = score_cols[0]
-    best_score = float(pd.to_numeric(pd.Series([use_df.iloc[0][primary_col]]), errors="coerce").iloc[0])
+        raise ValueError("Ansambl için model bulunamadı.")
+
+    # Bias / under-forecast bilgilerini holdout metriklerinden al
+    metric_small = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
+    keep_cols = [c for c in ["model", "BiasPct", "UnderForecastRate", "WAPE", "sMAPE"] if c in metric_small.columns]
+    if keep_cols:
+        use_df = use_df.merge(metric_small[keep_cols], on="model", how="left", suffixes=("", "_hold"))
+
+    # Peak-event score: test gerçeklerine göre model bazlı hesapla
+    peak_rows = []
+    if y_train is not None and y_true is not None:
+        for model_name, pred in pred_map.items():
+            try:
+                peak = compute_peak_event_score(np.asarray(y_train, dtype=float), np.asarray(y_true, dtype=float), np.asarray(pred, dtype=float))
+                peak_rows.append({"model": model_name, "peak_event_score": safe_float(peak.get("peak_event_score", np.nan))})
+            except Exception:
+                peak_rows.append({"model": model_name, "peak_event_score": np.nan})
+    if peak_rows:
+        use_df = use_df.merge(pd.DataFrame(peak_rows), on="model", how="left")
+
+    use_df = use_df.sort_values([primary_col, secondary_col], ascending=[True, True], na_position="last").reset_index(drop=True)
+    best_score = float(pd.to_numeric(pd.Series([use_df.iloc[0].get(primary_col, np.nan)]), errors="coerce").iloc[0])
     if not np.isfinite(best_score):
         best_score = 1e6
 
     filtered = use_df.copy()
-    if "Prophet" in filtered["model"].tolist():
-        pr = filtered.loc[filtered["model"] == "Prophet"].head(1)
-        if len(pr):
-            pscore = float(pd.to_numeric(pr.iloc[0].get(primary_col, np.nan), errors="coerce"))
-            if pd.notna(pscore) and pscore > min(best_score * 1.15, best_score + 1.0):
-                filtered = filtered.loc[filtered["model"] != "Prophet"].copy()
-    if "Intermittent" in filtered["model"].tolist() and len(filtered) > 2:
-        ir = filtered.loc[filtered["model"] == "Intermittent"].head(1)
-        if len(ir):
-            iscore = float(pd.to_numeric(ir.iloc[0].get(primary_col, np.nan), errors="coerce"))
-            if pd.notna(iscore) and iscore > min(best_score * 1.10, best_score + 0.75):
-                filtered = filtered.loc[filtered["model"] != "Intermittent"].copy()
 
-    prune_threshold = min(best_score * 1.20, best_score + 1.25)
+    # Prophet ve Intermittent'i daha sert ele: yalnız gerçekten yakınsa tut
+    for special_model, mult_thr, abs_thr in [("Prophet", 1.10, 0.90), ("Intermittent", 1.08, 0.75)]:
+        if special_model in filtered["model"].tolist() and len(filtered) > 2:
+            r = filtered.loc[filtered["model"] == special_model].head(1)
+            if len(r):
+                s = float(pd.to_numeric(r.iloc[0].get(primary_col, np.nan), errors="coerce"))
+                if pd.notna(s) and s > min(best_score * mult_thr, best_score + abs_thr):
+                    filtered = filtered.loc[filtered["model"] != special_model].copy()
+
+    prune_threshold = min(best_score * 1.18, best_score + 1.10)
     pruned = filtered.loc[pd.to_numeric(filtered[primary_col], errors="coerce") <= prune_threshold].copy()
     if len(pruned) < 2:
         pruned = filtered.head(min(2, len(filtered))).copy()
     if len(pruned) > 3:
         pruned = pruned.head(3).copy()
 
-    rel_gap = (pd.to_numeric(pruned[primary_col], errors="coerce") - best_score).clip(lower=0.0)
-    pruned["raw_weight"] = np.exp(-2.75 * rel_gap)
+    score_ser = pd.to_numeric(pruned[primary_col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(best_score + 5.0)
+    rel_gap = (score_ser - best_score).clip(lower=0.0)
+    pruned["raw_weight"] = np.exp(-3.2 * rel_gap)
+
+    # Bias-aware: büyük bias ve aşırı under-forecast cezalandır
+    bias_pct = pd.to_numeric(pruned.get("BiasPct", np.nan), errors="coerce").fillna(0.0)
+    under_rate = pd.to_numeric(pruned.get("UnderForecastRate", np.nan), errors="coerce").fillna(0.5)
+    peak_score = pd.to_numeric(pruned.get("peak_event_score", np.nan), errors="coerce").fillna(0.5)
+
+    bias_factor = np.exp(-0.045 * bias_pct.abs().clip(upper=18.0))
+    under_penalty = np.exp(-2.4 * (under_rate - 0.52).clip(lower=0.0, upper=0.35))
+    peak_bonus = (0.80 + 0.40 * peak_score.clip(lower=0.0, upper=1.0))
+
+    pruned["ham_ağırlık_biassız"] = pruned["raw_weight"]
+    pruned["raw_weight"] = pruned["raw_weight"] * bias_factor * under_penalty * peak_bonus
+
+    # En iyi modelin sesi kaybolmasın
     pruned = pruned.sort_values(primary_col, ascending=True).reset_index(drop=True)
     w = pruned["raw_weight"].astype(float).values
-    if np.sum(w) <= 0:
-        w = np.ones_like(w)
+    if not np.isfinite(w).all() or np.sum(w) <= 0:
+        w = np.ones(len(pruned), dtype=float)
     w = w / np.sum(w)
-    if len(w) >= 2 and w[0] < 0.50:
-        deficit = 0.50 - w[0]
-        w[0] = 0.50
+    if len(w) >= 2 and w[0] < 0.56:
+        deficit = 0.56 - w[0]
+        w[0] = 0.56
         rest = w[1:]
         rest = rest / max(rest.sum(), 1e-9)
         w[1:] = np.maximum(0.0, w[1:] - deficit * rest)
         w = w / max(w.sum(), 1e-9)
     pruned["weight"] = w
+
     ensemble = None
     for _, row in pruned.iterrows():
         pred = np.asarray(pred_map[row["model"]], dtype=float)
         ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
+
     out_cols = ["model"]
-    for c in ["val_WAPE", "val_sMAPE", "WAPE", "sMAPE"]:
-        if c in pruned.columns:
+    for c in [primary_col, secondary_col, "WAPE", "sMAPE", "BiasPct", "UnderForecastRate", "peak_event_score", "ham_ağırlık_biassız", "raw_weight", "weight"]:
+        if c in pruned.columns and c not in out_cols:
             out_cols.append(c)
-    out_cols += ["raw_weight", "weight"]
-    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[out_cols]
-def build_weighted_ensemble(pred_map: Dict[str, np.ndarray], metrics_df: pd.DataFrame, validation_df: Optional[pd.DataFrame] = None) -> Tuple[np.ndarray, pd.DataFrame]:
-    if validation_df is not None and len(validation_df) > 0:
-        use_df = validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy()
-        score_cols = ["val_WAPE", "val_sMAPE"]
-        sort_cols = score_cols
-    else:
-        use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
-        score_cols = ["WAPE", "sMAPE"]
-        sort_cols = ["WAPE", "sMAPE", "RMSE"]
-    if len(use_df) == 0:
-        raise ValueError("Ensemble için model yok.")
-    use_df = use_df.sort_values(sort_cols, ascending=[True] * len(sort_cols), na_position="last").reset_index(drop=True)
-    primary_col = score_cols[0]
-    best_score = float(use_df.iloc[0][primary_col])
-    prune_threshold = min(best_score * 1.35, best_score + 2.0)
-    pruned = use_df.loc[(use_df[primary_col].astype(float) <= prune_threshold)].copy()
-    if len(pruned) == 0:
-        pruned = use_df.head(1).copy()
-    elif len(pruned) > 3:
-        pruned = pruned.head(3).copy()
-    denom = np.maximum(np.square(pruned[primary_col].astype(float)), 1e-6)
-    pruned["raw_weight"] = 1.0 / denom
-    pruned["weight"] = pruned["raw_weight"] / pruned["raw_weight"].sum()
-    ensemble = None
-    for _, row in pruned.iterrows():
-        pred = np.asarray(pred_map[row["model"]], dtype=float)
-        ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
-    out_cols = ["model"]
-    for c in ["val_WAPE", "val_sMAPE", "WAPE", "sMAPE"]:
-        if c in pruned.columns:
-            out_cols.append(c)
-    out_cols.append("weight")
     return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[out_cols]
 
 def build_model_level_fallback(model_name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, error_message: str) -> Dict[str, Any]:
@@ -7911,7 +7924,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
     outputs["validation_metrics_df"] = validation_df
     metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
-    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df)
+    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values)
     outputs["predictions"]["Ensemble"] = ensemble_pred
     outputs["metrics"].append(build_model_metrics("Ensemble", train_df["y"].values, test_df["y"].values, ensemble_pred))
     outputs["tables"]["Ensemble"] = build_actual_vs_pred_df(test_df, ensemble_pred, "Ensemble")
@@ -7936,6 +7949,9 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     outputs["production_governance"] = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
     outputs["production_model"] = outputs["production_governance"].get("production_model", outputs.get("best_model"))
     outputs["production_status"] = outputs["production_governance"].get("production_status", "eligible")
+    outputs["karar_hiyerarsisi"] = build_karar_hiyerarsisi_ozeti(outputs)
+    outputs["prophet_gorunurluk_ozeti"] = build_prophet_gorunurluk_ozeti(outputs.get("prophet", {}))
+    outputs["benzersiz_rapor_katalogu"] = build_benzersiz_rapor_katalogu(outputs, outputs["production_governance"])
     SEARCH_ACCELERATOR.put_result(pipeline_key, outputs)
     return copy.deepcopy(outputs)
 
@@ -8337,7 +8353,36 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
         recommendation = "champion_challenger_parallel_run"
     summary = pd.DataFrame(rows)
     summary["deployment_recommendation"] = recommendation
-    return {"summary": summary, "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"])}
+
+    # Tüm modeller için tek merkezli sağlık tablosu
+    health_rows = []
+    metric_df = outputs.get("metrics_df", pd.DataFrame())
+    prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
+    service_level_tables = production_pack.get("service_level_simulation", {}) or {}
+    for model_name in metric_df.get("model", pd.Series(dtype=str)).tolist() if isinstance(metric_df, pd.DataFrame) else []:
+        mrow = metric_df.loc[metric_df["model"] == model_name].head(1)
+        brow = bias_df.loc[bias_df["model"] == model_name].head(1) if len(bias_df) else pd.DataFrame()
+        prow = peak_df.loc[peak_df["model"] == model_name].head(1) if len(peak_df) else pd.DataFrame()
+        grow = gate_df.loc[gate_df["model"] == model_name].head(1) if len(gate_df) else pd.DataFrame()
+        qtbl = prediction_interval_tables.get(model_name, pd.DataFrame())
+        stbl = service_level_tables.get(model_name, pd.DataFrame())
+        srow = stbl.loc[stbl["service_level_target"] == stbl["service_level_target"].max()].head(1) if isinstance(stbl, pd.DataFrame) and len(stbl) else pd.DataFrame()
+        health_rows.append({
+            "model": model_name,
+            "WAPE": safe_float(mrow.iloc[0].get("WAPE", np.nan)) if len(mrow) else np.nan,
+            "sMAPE": safe_float(mrow.iloc[0].get("sMAPE", np.nan)) if len(mrow) else np.nan,
+            "bias_pct": safe_float(brow.iloc[0].get("bias_pct", np.nan)) if len(brow) else np.nan,
+            "under_forecast_rate": safe_float(brow.iloc[0].get("under_forecast_rate", np.nan)) if len(brow) else np.nan,
+            "peak_event_score": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
+            "eligibility_score": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
+            "status": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
+            "coverage_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
+            "achieved_service": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
+            "fallback_used": bool(fallback_flags.get(model_name, False)),
+            "fallback_method": ((outputs.get(model_name.lower().replace("/", "_").replace("-", "_"), {}) or {}).get("fallback_method") if isinstance(outputs, dict) else None),
+        })
+    model_health_table = pd.DataFrame(health_rows)
+    return {"summary": summary, "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"]), "model_health_table": model_health_table}
 
 
 def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
@@ -8474,6 +8519,72 @@ def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
     satirlar.append({"karar_kademesi": "Rolling-origin kazananı", "model": ro_winner})
     satirlar.append({"karar_kademesi": "Üretim kazananı", "model": prod_winner})
     return pd.DataFrame(satirlar)
+
+
+
+def build_karar_hiyerarsisi_ozeti(outputs: Dict[str, Any]) -> pd.DataFrame:
+    lider = build_model_liderleri(outputs)
+    aciklama_map = {
+        "Holdout kazananı": "Son test penceresinde en düşük hata üreten model.",
+        "Doğrulama kazananı": "İç doğrulama bölmesinde en iyi model.",
+        "Rolling-origin kazananı": "Zaman boyunca en stabil geri test performansını veren model.",
+        "Üretim kazananı": "Risk, stabilite ve uygulanabilirlik kurallarından sonra canlı kullanım için önerilen model.",
+    }
+    if len(lider) == 0:
+        return pd.DataFrame(columns=["KararAşaması", "KazananModel", "Anlamı"])
+    out = lider.rename(columns={"karar_kademesi": "KararAşaması", "model": "KazananModel"}).copy()
+    out["Anlamı"] = out["KararAşaması"].map(aciklama_map)
+    return out
+
+
+def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFrame:
+    if not isinstance(prophet_result, dict) or len(prophet_result) == 0:
+        return pd.DataFrame(columns=["Alan", "Değer"])
+    mode = prophet_result.get("fit_mode", "bilinmiyor")
+    fallback_used = bool(prophet_result.get("fallback_used", False))
+    fallback_method = prophet_result.get("fallback_method")
+    note = prophet_result.get("fit_visibility_note", "")
+    return pd.DataFrame([
+        {"Alan": "Prophet çalışma modu", "Değer": mode},
+        {"Alan": "Gerçek Prophet fit kullanıldı mı?", "Değer": "evet" if (mode == "gercek_prophet_fit" and not fallback_used) else "hayır"},
+        {"Alan": "Fallback kullanıldı mı?", "Değer": "evet" if fallback_used else "hayır"},
+        {"Alan": "Fallback yöntemi", "Değer": fallback_method or "yok"},
+        {"Alan": "Açıklama", "Değer": note or "-"},
+    ])
+
+
+def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
+    adaylar: List[Tuple[str, pd.DataFrame]] = [
+        ("ModelKarşılaştırma", outputs.get("metrics_df", pd.DataFrame())),
+        ("DoğrulamaMetrikleri", outputs.get("validation_metrics_df", pd.DataFrame())),
+        ("KararHiyerarşisi", build_karar_hiyerarsisi_ozeti(outputs)),
+        ("AnsamblAğırlıkları", outputs.get("ensemble_weights", pd.DataFrame())),
+        ("RollingOrigin", outputs.get("rolling_origin_backtest", pd.DataFrame())),
+        ("BiasDashboard", prod_pack.get("bias_dashboard", pd.DataFrame())),
+        ("PeakDashboard", prod_pack.get("peak_event_dashboard", pd.DataFrame())),
+        ("CanlıİzlemeÖzeti", (prod_pack.get("live_monitoring_pack", {}) or {}).get("summary", pd.DataFrame())),
+        ("ÜretimAlarmları", (prod_pack.get("live_monitoring_pack", {}) or {}).get("alerts", pd.DataFrame())),
+        ("ÜretimSıralaması", prod_pack.get("production_ranking", pd.DataFrame())),
+        ("ÖzellikDenetimi", prod_pack.get("feature_availability_audit", pd.DataFrame())),
+        ("ServisSeviyesi", prod_pack.get("production_service_table", pd.DataFrame())),
+        ("TahminAralığı", prod_pack.get("production_interval_table", pd.DataFrame())),
+    ]
+    rows = []
+    seen = {}
+    for rapor_adi, df in adaylar:
+        if not isinstance(df, pd.DataFrame) or len(df) == 0:
+            continue
+        try:
+            key = hashlib.sha1(df.to_csv(index=False).encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            key = f"{rapor_adi}_{len(df)}_{len(df.columns)}"
+        duplicate_of = seen.get(key)
+        if duplicate_of is None:
+            seen[key] = rapor_adi
+            rows.append({"Rapor": rapor_adi, "SatırSayısı": int(len(df)), "KolonSayısı": int(len(df.columns)), "Durum": "benzersiz", "TekrarEttiğiRapor": ""})
+        else:
+            rows.append({"Rapor": rapor_adi, "SatırSayısı": int(len(df)), "KolonSayısı": int(len(df.columns)), "Durum": "yinelenen_içerik", "TekrarEttiğiRapor": duplicate_of})
+    return pd.DataFrame(rows)
 
 def render_streamlit_app():
     st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
@@ -8675,6 +8786,8 @@ def render_streamlit_app():
 
     with tab2:
         if "prophet" in outputs:
+            st.markdown("**Prophet görünürlüğü (gerçek fit mi, fallback mi?)**")
+            st.dataframe(style_metric_dataframe(outputs.get("prophet_gorunurluk_ozeti", pd.DataFrame())), width="stretch")
             if isinstance(outputs["prophet"].get("config"), dict):
                 st.json(outputs["prophet"]["config"])
             if isinstance(outputs["prophet"].get("component_validation"), dict):
@@ -8704,8 +8817,11 @@ def render_streamlit_app():
                 st.dataframe(outputs["xgboost"]["feature_importance"], width="stretch")
 
     with tab4:
+        st.markdown("**Karar hiyerarşisi özeti**")
+        st.dataframe(style_metric_dataframe(outputs.get("karar_hiyerarsisi", pd.DataFrame())), width="stretch")
+        st.markdown("**Holdout sıralaması**")
         st.dataframe(style_metric_dataframe(outputs["champion_challenger"]["ranking"]), width="stretch")
-        st.markdown("**Ansambl ağırlıkları (doğrulama-temelli)**")
+        st.markdown("**Ansambl ağırlıkları (peak-aware + bias-aware)**")
         st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), width="stretch")
         st.markdown("**Ansambl gerçek ve tahmin**")
         st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), width="stretch")
@@ -8736,26 +8852,32 @@ def render_streamlit_app():
 
     with tab7:
         prod_pack = outputs.get("production_governance", {}) or {}
+        live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
+        st.markdown("**Karar hiyerarşisi**")
+        st.dataframe(style_metric_dataframe(outputs.get("karar_hiyerarsisi", pd.DataFrame())), width="stretch")
+        st.markdown("**Merkezî canlı izleme özeti**")
+        st.dataframe(style_metric_dataframe(live_pack.get("summary", pd.DataFrame())), width="stretch")
+        st.markdown("**Model sağlık tablosu (bias, kapsama, fallback, servis seviyesi)**")
+        st.dataframe(style_metric_dataframe(live_pack.get("model_health_table", pd.DataFrame())), width="stretch")
+        if isinstance(live_pack.get("alerts"), pd.DataFrame) and len(live_pack.get("alerts")) > 0:
+            st.markdown("**Üretim alarmları**")
+            st.dataframe(style_metric_dataframe(live_pack.get("alerts", pd.DataFrame())), width="stretch")
+        st.markdown("**Üretim sıralaması (holdout, doğrulama ve rolling-origin birlikte)**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("production_ranking", pd.DataFrame())), width="stretch")
+        st.markdown("**Tahmin katkı değeri (baseline'a göre)**")
+        st.dataframe(style_metric_dataframe(prod_pack.get("forecast_value_add", pd.DataFrame())), width="stretch")
         st.markdown("**Bias dashboard**")
         st.dataframe(style_metric_dataframe(prod_pack.get("bias_dashboard", pd.DataFrame())), width="stretch")
         st.markdown("**Tepe olay yakalama skoru**")
         st.dataframe(style_metric_dataframe(prod_pack.get("peak_event_dashboard", pd.DataFrame())), width="stretch")
-        st.markdown("**Tahmin Katkı Değeri (baseline'a göre)**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("forecast_value_add", pd.DataFrame())), width="stretch")
         st.markdown("**Üretim özellik erişilebilirlik denetimi**")
         st.dataframe(style_metric_dataframe(prod_pack.get("feature_availability_audit", pd.DataFrame())), width="stretch")
-        st.markdown("**Üretim modeli için prediction interval / quantile forecast**")
+        st.markdown("**Üretim modeli için tahmin aralığı / quantile forecast**")
         st.dataframe(style_metric_dataframe(prod_pack.get("production_interval_table", pd.DataFrame())), width="stretch")
         st.markdown("**Servis seviyesi / stok etkisi simülasyonu**")
         st.dataframe(style_metric_dataframe(prod_pack.get("production_service_table", pd.DataFrame())), width="stretch")
-        st.markdown("**Üretim sıralaması (holdout, doğrulama ve rolling-origin birlikte)**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("production_ranking", pd.DataFrame())), width="stretch")
-        st.markdown("**Canlı izleme paketi**")
-        live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
-        st.dataframe(style_metric_dataframe(live_pack.get("summary", pd.DataFrame())), width="stretch")
-        if isinstance(live_pack.get("alerts"), pd.DataFrame) and len(live_pack.get("alerts")) > 0:
-            st.markdown("**Üretim alarmları**")
-            st.dataframe(style_metric_dataframe(live_pack.get("alerts", pd.DataFrame())), width="stretch")
+        st.markdown("**Benzersiz rapor kataloğu (yinelenen içerik temizliği)**")
+        st.dataframe(style_metric_dataframe(outputs.get("benzersiz_rapor_katalogu", pd.DataFrame())), width="stretch")
 
     with tab8:
         st.markdown("**Kalite raporu**")
