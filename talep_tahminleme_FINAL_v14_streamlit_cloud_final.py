@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 
 
@@ -7355,6 +7355,53 @@ def build_champion_challenger(metrics_df: pd.DataFrame) -> Dict[str, Any]:
     return {"champion": champion, "challenger": challenger, "holdout_winner": champion, "ranking": ranked}
 
 
+def infer_runtime_regime_from_profile(profile: Optional[Dict[str, Any]] = None, y_train: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    profile = profile or {}
+    intermittency = safe_float(profile.get("intermittency_ratio", np.nan))
+    cv = safe_float(profile.get("cv", np.nan))
+    seasonality = safe_float(profile.get("seasonality_strength", np.nan))
+    trend = safe_float(profile.get("trend_strength", np.nan))
+    if y_train is not None and (pd.isna(intermittency) or pd.isna(cv)):
+        ys = pd.Series(np.asarray(y_train, dtype=float))
+        if pd.isna(intermittency):
+            intermittency = safe_float((ys.fillna(0) == 0).mean())
+        if pd.isna(cv):
+            mu = safe_float(ys.mean())
+            sigma = safe_float(ys.std())
+            cv = safe_float(sigma / mu) if pd.notna(mu) and mu not in [0, 0.0] else np.nan
+    return {
+        "intermittent_like": bool(pd.notna(intermittency) and intermittency >= 0.20),
+        "seasonal_like": bool(pd.notna(seasonality) and seasonality >= 0.18),
+        "trendy_like": bool(pd.notna(trend) and trend >= 0.10),
+        "volatile_like": bool(pd.notna(cv) and cv >= 0.35),
+        "intermittency": intermittency,
+        "cv": cv,
+        "seasonality": seasonality,
+        "trend": trend,
+    }
+
+
+def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    if not isinstance(validation_df, pd.DataFrame) or len(validation_df) == 0:
+        return pd.DataFrame(columns=["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"])
+    profile = profile or {}
+    regime = infer_runtime_regime_from_profile(profile=profile)
+    out = validation_df.copy()
+    out["bağlamsal_ceza"] = 0.0
+    if not regime.get("intermittent_like", False):
+        out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 1.75
+    if not regime.get("seasonal_like", False):
+        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 0.90
+    if regime.get("volatile_like", False):
+        out.loc[out["model"].eq("ARIMA"), "bağlamsal_ceza"] += 0.20
+        out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] += 0.10
+    if regime.get("seasonal_like", False):
+        out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] -= 0.15
+    if regime.get("trendy_like", False):
+        out.loc[out["model"].eq("XGBoost"), "bağlamsal_ceza"] -= 0.10
+    out["bağlamsal_doğrulama_skoru"] = pd.to_numeric(out.get("val_WAPE"), errors="coerce").fillna(99.0) + pd.to_numeric(out.get("val_sMAPE"), errors="coerce").fillna(99.0) * 0.10 + out["bağlamsal_ceza"].fillna(0.0)
+    return out.sort_values(["bağlamsal_doğrulama_skoru", "val_WAPE", "val_sMAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
+
 
 def build_weighted_ensemble(
     pred_map: Dict[str, np.ndarray],
@@ -7362,31 +7409,46 @@ def build_weighted_ensemble(
     validation_df: Optional[pd.DataFrame] = None,
     y_train: Optional[np.ndarray] = None,
     y_true: Optional[np.ndarray] = None,
+    rolling_summary: Optional[pd.DataFrame] = None,
+    profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     """
-    Peak-aware ve bias-aware ansambl.
-    Amaç: doğrulamada iyi olan modeli korurken, tepe dönemlerini aşırı bastıran
-    veya belirgin bias üreten modellerin ağırlığını düşürmek.
+    Peak-aware + bias-aware + regime-aware ansambl.
+    Validation, holdout ve rolling-origin birlikte kullanılır.
+    İntermittent model, seri gerçekten intermittent değilse baskın gelemez.
     """
-    if validation_df is not None and len(validation_df) > 0:
-        use_df = validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy()
-        primary_col = "val_WAPE"
-        secondary_col = "val_sMAPE"
-    else:
-        use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
-        primary_col = "WAPE"
-        secondary_col = "sMAPE"
-
-    if len(use_df) == 0:
+    if not pred_map:
         raise ValueError("Ansambl için model bulunamadı.")
 
-    # Bias / under-forecast bilgilerini holdout metriklerinden al
-    metric_small = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
-    keep_cols = [c for c in ["model", "BiasPct", "UnderForecastRate", "WAPE", "sMAPE"] if c in metric_small.columns]
-    if keep_cols:
-        use_df = use_df.merge(metric_small[keep_cols], on="model", how="left", suffixes=("", "_hold"))
+    profile = profile or {}
+    regime = infer_runtime_regime_from_profile(profile=profile, y_train=y_train)
 
-    # Peak-event score: test gerçeklerine göre model bazlı hesapla
+    use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
+    if len(use_df) == 0:
+        raise ValueError("Ansambl için metrik bulunamadı.")
+
+    if validation_df is not None and len(validation_df) > 0:
+        val_ctx = build_contextual_validation_ranking(validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy(), profile=profile)
+        keep = [c for c in ["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"] if c in val_ctx.columns]
+        if keep:
+            use_df = use_df.merge(val_ctx[keep], on="model", how="left")
+    else:
+        use_df["val_WAPE"] = np.nan
+        use_df["val_sMAPE"] = np.nan
+        use_df["bağlamsal_ceza"] = 0.0
+        use_df["bağlamsal_doğrulama_skoru"] = np.nan
+
+    if rolling_summary is not None and len(rolling_summary) > 0:
+        rs = rolling_summary.loc[rolling_summary["model"].isin(pred_map.keys())].copy()
+        if len(rs):
+            rs = rs.rename(columns={"WAPE": "ro_WAPE", "MAE": "ro_MAE"})
+            keep = [c for c in ["model", "ro_WAPE", "ro_MAE"] if c in rs.columns]
+            use_df = use_df.merge(rs[keep], on="model", how="left")
+    if "ro_WAPE" not in use_df.columns:
+        use_df["ro_WAPE"] = np.nan
+    if "ro_MAE" not in use_df.columns:
+        use_df["ro_MAE"] = np.nan
+
     peak_rows = []
     if y_train is not None and y_true is not None:
         for model_name, pred in pred_map.items():
@@ -7398,69 +7460,90 @@ def build_weighted_ensemble(
     if peak_rows:
         use_df = use_df.merge(pd.DataFrame(peak_rows), on="model", how="left")
 
-    use_df = use_df.sort_values([primary_col, secondary_col], ascending=[True, True], na_position="last").reset_index(drop=True)
-    best_score = float(pd.to_numeric(pd.Series([use_df.iloc[0].get(primary_col, np.nan)]), errors="coerce").iloc[0])
+    for c in ["BiasPct", "UnderForecastRate", "peak_event_score", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE"]:
+        if c in use_df.columns:
+            use_df[c] = pd.to_numeric(use_df[c], errors="coerce")
+        else:
+            use_df[c] = np.nan
+
+    def _min_norm(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if s.notna().sum() == 0:
+            return pd.Series(1.0, index=series.index, dtype=float)
+        mn, mx = float(s.min()), float(s.max())
+        if not np.isfinite(mn) or not np.isfinite(mx) or abs(mx - mn) < 1e-9:
+            return pd.Series(0.0, index=series.index, dtype=float)
+        return (s - mn) / (mx - mn)
+
+    use_df["hold_norm"] = _min_norm(use_df["WAPE"])
+    use_df["val_norm"] = _min_norm(use_df["val_WAPE"].fillna(use_df["WAPE"]))
+    use_df["ro_norm"] = _min_norm(use_df["ro_WAPE"].fillna(use_df["WAPE"]))
+    use_df["bias_pen"] = use_df["BiasPct"].abs().fillna(0.0).clip(upper=18.0) / 18.0
+    use_df["under_pen"] = (use_df["UnderForecastRate"].fillna(0.5) - 0.52).clip(lower=0.0, upper=0.40) / 0.40
+    use_df["peak_pen"] = (0.72 - use_df["peak_event_score"].fillna(0.0)).clip(lower=0.0, upper=0.72) / 0.72
+    use_df["regime_pen"] = 0.0
+    if not regime.get("intermittent_like", False):
+        use_df.loc[use_df["model"].eq("Intermittent"), "regime_pen"] += 0.35
+    if not regime.get("seasonal_like", False):
+        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.18
+    if regime.get("seasonal_like", False):
+        use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_pen"] -= 0.05
+    if regime.get("volatile_like", False):
+        use_df.loc[use_df["model"].eq("XGBoost"), "regime_pen"] -= 0.04
+
+    use_df["birleşik_skor"] = (
+        use_df["hold_norm"].fillna(1.0) * 0.28
+        + use_df["val_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * 0.26
+        + use_df["ro_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * 0.30
+        + use_df["peak_pen"].fillna(0.0) * 0.09
+        + use_df["bias_pen"].fillna(0.0) * 0.04
+        + use_df["under_pen"].fillna(0.0) * 0.02
+        + use_df["regime_pen"].fillna(0.0) * 0.08
+    )
+    use_df = use_df.sort_values(["birleşik_skor", "ro_WAPE", "WAPE", "val_WAPE"], ascending=[True, True, True, True], na_position="last").reset_index(drop=True)
+    best_score = float(pd.to_numeric(use_df.iloc[0].get("birleşik_skor", np.nan), errors="coerce")) if len(use_df) else 1.0
     if not np.isfinite(best_score):
-        best_score = 1e6
+        best_score = 1.0
 
-    filtered = use_df.copy()
+    pruned = use_df.copy()
+    if len(pruned) > 4:
+        pruned = pruned.head(4).copy()
+    if "Prophet" in pruned["model"].tolist():
+        prow = pruned.loc[pruned["model"].eq("Prophet")].head(1)
+        if len(prow):
+            ps = float(pd.to_numeric(prow.iloc[0].get("birleşik_skor", np.nan), errors="coerce"))
+            if pd.notna(ps) and ps > best_score + 0.12 and len(pruned) > 2:
+                pruned = pruned.loc[~pruned["model"].eq("Prophet")].copy()
 
-    # Prophet ve Intermittent'i daha sert ele: yalnız gerçekten yakınsa tut
-    for special_model, mult_thr, abs_thr in [("Prophet", 1.10, 0.90), ("Intermittent", 1.08, 0.75)]:
-        if special_model in filtered["model"].tolist() and len(filtered) > 2:
-            r = filtered.loc[filtered["model"] == special_model].head(1)
-            if len(r):
-                s = float(pd.to_numeric(r.iloc[0].get(primary_col, np.nan), errors="coerce"))
-                if pd.notna(s) and s > min(best_score * mult_thr, best_score + abs_thr):
-                    filtered = filtered.loc[filtered["model"] != special_model].copy()
-
-    prune_threshold = min(best_score * 1.18, best_score + 1.10)
-    pruned = filtered.loc[pd.to_numeric(filtered[primary_col], errors="coerce") <= prune_threshold].copy()
-    if len(pruned) < 2:
-        pruned = filtered.head(min(2, len(filtered))).copy()
-    if len(pruned) > 3:
-        pruned = pruned.head(3).copy()
-
-    score_ser = pd.to_numeric(pruned[primary_col], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(best_score + 5.0)
-    rel_gap = (score_ser - best_score).clip(lower=0.0)
-    pruned["raw_weight"] = np.exp(-3.2 * rel_gap)
-
-    # Bias-aware: büyük bias ve aşırı under-forecast cezalandır
-    bias_pct = pd.to_numeric(pruned.get("BiasPct", np.nan), errors="coerce").fillna(0.0)
-    under_rate = pd.to_numeric(pruned.get("UnderForecastRate", np.nan), errors="coerce").fillna(0.5)
-    peak_score = pd.to_numeric(pruned.get("peak_event_score", np.nan), errors="coerce").fillna(0.5)
-
-    bias_factor = np.exp(-0.045 * bias_pct.abs().clip(upper=18.0))
-    under_penalty = np.exp(-2.4 * (under_rate - 0.52).clip(lower=0.0, upper=0.35))
-    peak_bonus = (0.80 + 0.40 * peak_score.clip(lower=0.0, upper=1.0))
-
-    pruned["ham_ağırlık_biassız"] = pruned["raw_weight"]
-    pruned["raw_weight"] = pruned["raw_weight"] * bias_factor * under_penalty * peak_bonus
-
-    # En iyi modelin sesi kaybolmasın
-    pruned = pruned.sort_values(primary_col, ascending=True).reset_index(drop=True)
+    raw = np.exp(-4.5 * (pruned["birleşik_skor"].fillna(1.0) - best_score).clip(lower=0.0))
+    peak_bonus = 0.75 + 0.50 * pruned["peak_event_score"].fillna(0.5).clip(lower=0.0, upper=1.0)
+    bias_factor = np.exp(-0.035 * pruned["BiasPct"].abs().fillna(0.0).clip(upper=18.0))
+    under_factor = np.exp(-2.0 * (pruned["UnderForecastRate"].fillna(0.5) - 0.52).clip(lower=0.0, upper=0.40))
+    regime_factor = np.exp(-1.8 * pruned["regime_pen"].fillna(0.0).clip(lower=0.0, upper=0.60))
+    pruned["ham_ağırlık"] = raw
+    pruned["raw_weight"] = raw * peak_bonus * bias_factor * under_factor * regime_factor
+    if not regime.get("intermittent_like", False) and "Intermittent" in pruned["model"].tolist():
+        idx = pruned.index[pruned["model"].eq("Intermittent")]
+        pruned.loc[idx, "raw_weight"] = np.minimum(pruned.loc[idx, "raw_weight"].astype(float), 0.18)
+    pruned = pruned.sort_values(["birleşik_skor", "ro_WAPE", "WAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
     w = pruned["raw_weight"].astype(float).values
     if not np.isfinite(w).all() or np.sum(w) <= 0:
         w = np.ones(len(pruned), dtype=float)
     w = w / np.sum(w)
-    if len(w) >= 2 and w[0] < 0.56:
-        deficit = 0.56 - w[0]
-        w[0] = 0.56
+    if len(w) >= 2 and w[0] < 0.52:
+        deficit = 0.52 - w[0]
+        w[0] = 0.52
         rest = w[1:]
-        rest = rest / max(rest.sum(), 1e-9)
-        w[1:] = np.maximum(0.0, w[1:] - deficit * rest)
-        w = w / max(w.sum(), 1e-9)
+        if rest.sum() > 0:
+            rest = rest / rest.sum()
+            w[1:] = np.maximum(0.0, w[1:] - deficit * rest)
+            w = w / max(w.sum(), 1e-9)
     pruned["weight"] = w
-
     ensemble = None
     for _, row in pruned.iterrows():
         pred = np.asarray(pred_map[row["model"]], dtype=float)
         ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
-
-    out_cols = ["model"]
-    for c in [primary_col, secondary_col, "WAPE", "sMAPE", "BiasPct", "UnderForecastRate", "peak_event_score", "ham_ağırlık_biassız", "raw_weight", "weight"]:
-        if c in pruned.columns and c not in out_cols:
-            out_cols.append(c)
+    out_cols = [c for c in ["model", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "BiasPct", "UnderForecastRate", "peak_event_score", "regime_pen", "birleşik_skor", "ham_ağırlık", "raw_weight", "weight"] if c in pruned.columns]
     return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[out_cols]
 
 def build_model_level_fallback(model_name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, error_message: str) -> Dict[str, Any]:
@@ -7711,8 +7794,11 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
                 score -= 12.0
                 reasons.append("Holdout performansı lider modele göre zayıf.")
         if model_name == "Intermittent" and intermittency < 0.20:
-            score -= 25.0
+            score -= 38.0
             reasons.append("Intermittent model, düzenli seri için birincil aday değil.")
+        elif model_name == "Intermittent" and intermittency < 0.30:
+            score -= 14.0
+            reasons.append("Seri tam intermittent değil; intermittent modelin etkisi sınırlandı.")
         if model_name == "XGBoost" and n_obs < 30:
             score -= 15.0
             reasons.append("Makine öğrenmesi için gözlem sayısı sınırlı.")
@@ -7726,11 +7812,11 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
                     score -= 24.0
                     reasons.append("Ansambl, lider modelin üzerine çıkamıyor.")
         status = "eligible"
-        if model_name == "Prophet" and score < 82.0:
+        if model_name == "Prophet" and score < 85.0:
             status = "challenger_only"
         elif score < 75.0:
             status = "challenger_only"
-        if model_name == "Prophet" and score < 68.0:
+        if model_name == "Prophet" and score < 72.0:
             status = "reject"
         elif score < 58.0:
             status = "reject"
@@ -7924,7 +8010,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
     outputs["validation_metrics_df"] = validation_df
     metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
-    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values)
+    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values, rolling_summary=summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame())), profile=profile)
     outputs["predictions"]["Ensemble"] = ensemble_pred
     outputs["metrics"].append(build_model_metrics("Ensemble", train_df["y"].values, test_df["y"].values, ensemble_pred))
     outputs["tables"]["Ensemble"] = build_actual_vs_pred_df(test_df, ensemble_pred, "Ensemble")
@@ -8214,7 +8300,7 @@ def run_rolling_origin_backtest_full(export_payload: Dict[str, pd.DataFrame], ta
             pred_map = {k: operational_bias_peak_postprocess(tr["y"], np.asarray(v["forecast"], dtype=float), freq_alias=freq_alias, model_name=k, profile=profile) for k, v in model_results.items()}
             metrics_rows = [build_model_metrics(k, tr["y"].values, te["y"].values, v) for k, v in pred_map.items()]
             val_rows = [extract_validation_metrics_from_result(k, model_results[k]) for k in model_results.keys()]
-            ens_pred, _ = build_weighted_ensemble(pred_map, pd.DataFrame(metrics_rows), validation_df=pd.DataFrame(val_rows))
+            ens_pred, _ = build_weighted_ensemble(pred_map, pd.DataFrame(metrics_rows), validation_df=pd.DataFrame(val_rows), y_train=tr["y"].values, y_true=te["y"].values, profile=profile)
             _record("Ensemble", ens_pred)
         except Exception:
             pass
@@ -8297,6 +8383,8 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
     interval_df = production_pack.get("production_interval_table", pd.DataFrame())
     feature_df = production_pack.get("feature_availability_audit", pd.DataFrame())
     service_df = production_pack.get("production_service_table", pd.DataFrame())
+    full_ro = outputs.get("rolling_origin_backtest", pd.DataFrame())
+    robt = summarize_full_backtest(full_ro)
     fallback_flags = {
         "XGBoost": bool((outputs.get("xgboost") or {}).get("fallback_used", False)),
         "Prophet": bool((outputs.get("prophet") or {}).get("fallback_used", False)),
@@ -8305,81 +8393,84 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
         "Intermittent": bool((outputs.get("intermittent") or {}).get("fallback_used", False)),
     }
     fallback_rate = float(np.mean(list(fallback_flags.values()))) if fallback_flags else 0.0
-    rows = []
     alerts = []
     train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
     prod_pred = np.asarray((outputs.get("predictions") or {}).get(prod_model, np.array([])), dtype=float)
-    drift_ratio = float(np.mean(prod_pred) / max(float(train_y.tail(min(6, len(train_y))).mean()) if len(train_y) else 1.0, 1e-6)) if len(prod_pred) else np.nan
+    recent_mean = float(train_y.tail(min(6, len(train_y))).mean()) if len(train_y) else np.nan
+    drift_ratio = float(np.mean(prod_pred) / max(recent_mean, 1e-6)) if len(prod_pred) and pd.notna(recent_mean) else np.nan
     bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
     peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
     gate_row = gate_df.loc[gate_df["model"] == prod_model].head(1) if len(gate_df) else pd.DataFrame()
+    ro_row = robt.loc[robt["model"] == prod_model].head(1) if len(robt) else pd.DataFrame()
     service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) else pd.DataFrame()
     achieved_service = float(pd.to_numeric(service_row.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce")) if len(service_row) else np.nan
     target_service = float(pd.to_numeric(service_row.iloc[0].get("service_level_target", np.nan), errors="coerce")) if len(service_row) else np.nan
-    rows.append({
-        "production_model": prod_model,
-        "production_status": production_pack.get("production_status", "eligible"),
-        "bias_pct": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "under_forecast_rate": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "peak_event_score": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan,
-        "eligibility_score": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan,
-        "drift_ratio_vs_recent": drift_ratio,
-        "coverage_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
-        "coverage_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
-        "max_feature_risk": float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max()) if len(feature_df) else np.nan,
-        "fallback_rate": fallback_rate,
-        "achieved_service": achieved_service,
-        "target_service": target_service,
-    })
-    r = rows[0]
-    if pd.notna(r["bias_pct"]) and abs(r["bias_pct"]) > 8.0:
-        alerts.append({"severity": "high", "alert": "bias_alert", "detail": f"Bias yüksek: {r['bias_pct']:.2f}%"})
-    if pd.notna(r["under_forecast_rate"]) and r["under_forecast_rate"] > 0.60:
-        alerts.append({"severity": "high", "alert": "under_forecast_alert", "detail": f"Under-forecast oranı yüksek: {r['under_forecast_rate']:.2f}"})
-    if pd.notna(r["peak_event_score"]) and r["peak_event_score"] < 0.35:
-        alerts.append({"severity": "high", "alert": "peak_capture_alert", "detail": f"Peak-event yakalama zayıf: {r['peak_event_score']:.2f}"})
-    if pd.notna(r["drift_ratio_vs_recent"]) and not (0.82 <= r["drift_ratio_vs_recent"] <= 1.22):
-        alerts.append({"severity": "medium", "alert": "forecast_drift_alert", "detail": f"Forecast/recent seviye oranı: {r['drift_ratio_vs_recent']:.2f}"})
-    if pd.notna(r["max_feature_risk"]) and r["max_feature_risk"] > 0.25:
-        alerts.append({"severity": "high", "alert": "feature_contract_alert", "detail": "Production feature contract tamamen güvenli değil."})
-    if pd.notna(r["achieved_service"]) and pd.notna(r["target_service"]) and r["achieved_service"] + 1e-9 < r["target_service"]:
-        alerts.append({"severity": "high", "alert": "service_level_alert", "detail": f"Servis seviyesi hedef altında: {r['achieved_service']:.2f} < {r['target_service']:.2f}"})
+    summary_row = {
+        "üretim_modeli": prod_model,
+        "üretim_durumu": production_pack.get("production_status", "eligible"),
+        "sapma_yüzde": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
+        "eksik_tahmin_oranı": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan,
+        "tepe_olay_skoru": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan,
+        "uygunluk_skoru": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan,
+        "rolling_wape": float(pd.to_numeric(ro_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(ro_row) else np.nan,
+        "drift_oranı": drift_ratio,
+        "kapsama_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
+        "kapsama_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
+        "maksimum_özellik_riski": float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max()) if len(feature_df) else np.nan,
+        "fallback_oranı": fallback_rate,
+        "gerçekleşen_servis": achieved_service,
+        "hedef_servis": target_service,
+    }
+    if pd.notna(summary_row["sapma_yüzde"]) and abs(summary_row["sapma_yüzde"]) > 8.0:
+        alerts.append({"severity": "high", "alert": "sapma_alarmı", "detail": f"Sapma yüksek: {summary_row['sapma_yüzde']:.2f}%"})
+    if pd.notna(summary_row["eksik_tahmin_oranı"]) and summary_row["eksik_tahmin_oranı"] > 0.60:
+        alerts.append({"severity": "high", "alert": "eksik_tahmin_alarmı", "detail": f"Eksik tahmin oranı yüksek: {summary_row['eksik_tahmin_oranı']:.2f}"})
+    if pd.notna(summary_row["tepe_olay_skoru"]) and summary_row["tepe_olay_skoru"] < 0.35:
+        alerts.append({"severity": "high", "alert": "tepe_yakalama_alarmı", "detail": f"Tepe olay yakalama zayıf: {summary_row['tepe_olay_skoru']:.2f}"})
+    if pd.notna(summary_row["drift_oranı"]) and not (0.82 <= summary_row["drift_oranı"] <= 1.22):
+        alerts.append({"severity": "medium", "alert": "drift_alarmı", "detail": f"Tahmin/son dönem seviye oranı: {summary_row['drift_oranı']:.2f}"})
+    if pd.notna(summary_row["maksimum_özellik_riski"]) and summary_row["maksimum_özellik_riski"] > 0.25:
+        alerts.append({"severity": "high", "alert": "özellik_kontratı_alarmı", "detail": "Production feature contract tamamen güvenli değil."})
+    if pd.notna(summary_row["gerçekleşen_servis"]) and pd.notna(summary_row["hedef_servis"]) and summary_row["gerçekleşen_servis"] + 1e-9 < summary_row["hedef_servis"]:
+        alerts.append({"severity": "high", "alert": "servis_seviyesi_alarmı", "detail": f"Servis seviyesi hedef altında: {summary_row['gerçekleşen_servis']:.2f} < {summary_row['hedef_servis']:.2f}"})
     if fallback_rate > 0.20:
-        alerts.append({"severity": "medium", "alert": "fallback_rate_alert", "detail": f"Model ailelerinde fallback oranı yüksek: {fallback_rate:.2f}"})
-    recommendation = "eligible_for_guarded_production"
+        alerts.append({"severity": "medium", "alert": "fallback_oranı_alarmı", "detail": f"Model ailelerinde fallback oranı yüksek: {fallback_rate:.2f}"})
+    recommendation = "guardrailli_üretime_uygun"
     if any(a["severity"] == "high" for a in alerts):
-        recommendation = "shadow_mode_required"
+        recommendation = "shadow_mode_zorunlu"
     elif alerts:
-        recommendation = "champion_challenger_parallel_run"
-    summary = pd.DataFrame(rows)
-    summary["deployment_recommendation"] = recommendation
+        recommendation = "şampiyon_meydan_okuyan_paralel"
+    summary = pd.DataFrame([summary_row])
+    summary["alarm_sayısı"] = len(alerts)
+    summary["yüksek_alarm_sayısı"] = sum(1 for a in alerts if a["severity"] == "high")
+    summary["canlı_kullanım_önerisi"] = recommendation
 
-    # Tüm modeller için tek merkezli sağlık tablosu
-    health_rows = []
     metric_df = outputs.get("metrics_df", pd.DataFrame())
     prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
     service_level_tables = production_pack.get("service_level_simulation", {}) or {}
+    health_rows = []
     for model_name in metric_df.get("model", pd.Series(dtype=str)).tolist() if isinstance(metric_df, pd.DataFrame) else []:
         mrow = metric_df.loc[metric_df["model"] == model_name].head(1)
         brow = bias_df.loc[bias_df["model"] == model_name].head(1) if len(bias_df) else pd.DataFrame()
         prow = peak_df.loc[peak_df["model"] == model_name].head(1) if len(peak_df) else pd.DataFrame()
         grow = gate_df.loc[gate_df["model"] == model_name].head(1) if len(gate_df) else pd.DataFrame()
+        rrow = robt.loc[robt["model"] == model_name].head(1) if len(robt) else pd.DataFrame()
         qtbl = prediction_interval_tables.get(model_name, pd.DataFrame())
         stbl = service_level_tables.get(model_name, pd.DataFrame())
         srow = stbl.loc[stbl["service_level_target"] == stbl["service_level_target"].max()].head(1) if isinstance(stbl, pd.DataFrame) and len(stbl) else pd.DataFrame()
         health_rows.append({
             "model": model_name,
             "WAPE": safe_float(mrow.iloc[0].get("WAPE", np.nan)) if len(mrow) else np.nan,
-            "sMAPE": safe_float(mrow.iloc[0].get("sMAPE", np.nan)) if len(mrow) else np.nan,
-            "bias_pct": safe_float(brow.iloc[0].get("bias_pct", np.nan)) if len(brow) else np.nan,
-            "under_forecast_rate": safe_float(brow.iloc[0].get("under_forecast_rate", np.nan)) if len(brow) else np.nan,
-            "peak_event_score": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
-            "eligibility_score": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
-            "status": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
-            "coverage_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
-            "achieved_service": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
-            "fallback_used": bool(fallback_flags.get(model_name, False)),
-            "fallback_method": ((outputs.get(model_name.lower().replace("/", "_").replace("-", "_"), {}) or {}).get("fallback_method") if isinstance(outputs, dict) else None),
+            "rolling_WAPE": safe_float(rrow.iloc[0].get("WAPE", np.nan)) if len(rrow) else np.nan,
+            "sapma_yüzde": safe_float(brow.iloc[0].get("bias_pct", np.nan)) if len(brow) else np.nan,
+            "eksik_tahmin_oranı": safe_float(brow.iloc[0].get("under_forecast_rate", np.nan)) if len(brow) else np.nan,
+            "tepe_olay_skoru": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
+            "uygunluk_skoru": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
+            "durum": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
+            "kapsama_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
+            "gerçekleşen_servis": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
+            "fallback_kullanıldı": bool(fallback_flags.get(model_name, False)),
+            "fallback_yöntemi": ((outputs.get(model_name.lower().replace("/", "_").replace("-", "_"), {}) or {}).get("fallback_method") if isinstance(outputs, dict) else None),
         })
     model_health_table = pd.DataFrame(health_rows)
     return {"summary": summary, "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"]), "model_health_table": model_health_table}
@@ -8428,14 +8519,21 @@ def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Di
     ranked["service_penalty"] = pd.to_numeric(ranked.get("service_gap"), errors="coerce").fillna(0.0)
     ranked["ro_WAPE_norm"] = pd.to_numeric(ranked.get("ro_WAPE"), errors="coerce")
     ranked["hold_WAPE_norm"] = pd.to_numeric(ranked.get("WAPE"), errors="coerce")
+    regime = infer_runtime_regime_from_profile(profile=outputs.get("metadata", {}).get("profile", {}) or {}, y_train=np.asarray(outputs.get("train", pd.DataFrame()).get("y", pd.Series(dtype=float)), dtype=float) if isinstance(outputs.get("train"), pd.DataFrame) and "y" in outputs.get("train", pd.DataFrame()).columns else None)
+    ranked["bağlamsal_ceza"] = 0.0
+    if not regime.get("intermittent_like", False):
+        ranked.loc[ranked["model"].eq("Intermittent"), "bağlamsal_ceza"] += 2.5
+    if not regime.get("seasonal_like", False):
+        ranked.loc[ranked["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.1
     ranked["operasyonel_skor"] = (
         ranked["status_rank"].fillna(9.0) * 1000.0
-        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.55
-        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.20
-        + ranked["service_penalty"].fillna(0.0) * 18.0
-        + ranked["under_penalty"].fillna(0.0) * 12.0
-        + ranked["bias_penalty"].fillna(0.0) * 1.2
-        + ranked["peak_penalty"].fillna(0.0) * 10.0
+        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.68
+        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.14
+        + ranked["service_penalty"].fillna(0.0) * 20.0
+        + ranked["under_penalty"].fillna(0.0) * 13.5
+        + ranked["bias_penalty"].fillna(0.0) * 1.35
+        + ranked["peak_penalty"].fillna(0.0) * 11.0
+        + ranked["bağlamsal_ceza"].fillna(0.0) * 8.0
         - pd.to_numeric(ranked.get("eligibility_score"), errors="coerce").fillna(0.0) * 0.03
     )
     sort_cols = ["operasyonel_skor", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
@@ -8507,11 +8605,13 @@ def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
     satirlar = []
     hold_df = outputs.get("metrics_df", pd.DataFrame())
     val_df = outputs.get("validation_metrics_df", pd.DataFrame())
+    profile = outputs.get("metadata", {}).get("profile", {}) or {}
+    val_rank = build_contextual_validation_ranking(val_df, profile=profile)
     ro_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
     prod_pack = outputs.get("production_governance", {}) or {}
     prod_rank = prod_pack.get("production_ranking", pd.DataFrame())
     hold_winner = hold_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).iloc[0]["model"] if len(hold_df) else None
-    val_winner = val_df.sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True]).iloc[0]["model"] if len(val_df) else None
+    val_winner = val_rank.iloc[0]["model"] if len(val_rank) else None
     ro_winner = ro_df.sort_values(["WAPE", "MAE"], ascending=[True, True]).iloc[0]["model"] if len(ro_df) else None
     prod_winner = prod_rank.iloc[0]["model"] if len(prod_rank) else outputs.get("production_model")
     satirlar.append({"karar_kademesi": "Holdout kazananı", "model": hold_winner})
@@ -8526,15 +8626,23 @@ def build_karar_hiyerarsisi_ozeti(outputs: Dict[str, Any]) -> pd.DataFrame:
     lider = build_model_liderleri(outputs)
     aciklama_map = {
         "Holdout kazananı": "Son test penceresinde en düşük hata üreten model.",
-        "Doğrulama kazananı": "İç doğrulama bölmesinde en iyi model.",
+        "Doğrulama kazananı": "İç doğrulama bölmesinde en iyi model; bağlamsal ceza uygulanmıştır.",
         "Rolling-origin kazananı": "Zaman boyunca en stabil geri test performansını veren model.",
-        "Üretim kazananı": "Risk, stabilite ve uygulanabilirlik kurallarından sonra canlı kullanım için önerilen model.",
+        "Üretim kazananı": "Risk, stabilite, uygulanabilirlik ve canlı yönetişim kurallarından sonra önerilen model.",
+    }
+    karar_map = {
+        "Holdout kazananı": "Kısa dönem doğruluk",
+        "Doğrulama kazananı": "Aşırı öğrenme kontrolü",
+        "Rolling-origin kazananı": "Zamana karşı dayanıklılık",
+        "Üretim kazananı": "Canlı kullanım kararı",
     }
     if len(lider) == 0:
-        return pd.DataFrame(columns=["KararAşaması", "KazananModel", "Anlamı"])
+        return pd.DataFrame(columns=["KararAşaması", "KazananModel", "KararAmacı", "Anlamı"])
     out = lider.rename(columns={"karar_kademesi": "KararAşaması", "model": "KazananModel"}).copy()
+    out["KararAmacı"] = out["KararAşaması"].map(karar_map)
     out["Anlamı"] = out["KararAşaması"].map(aciklama_map)
     return out
+
 
 
 def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFrame:
@@ -8544,13 +8652,25 @@ def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFra
     fallback_used = bool(prophet_result.get("fallback_used", False))
     fallback_method = prophet_result.get("fallback_method")
     note = prophet_result.get("fit_visibility_note", "")
+    if mode == "gercek_prophet_fit" and not fallback_used:
+        rozet = "Gerçek Prophet"
+        production_note = "Üretimde ancak doğrulama ve uygunluk kapısından geçerse kullanılmalı."
+    elif fallback_used:
+        rozet = "Fallback Prophet"
+        production_note = "Production’da kullanılmaz; yalnız meydan okuyucu veya tanısal amaçla gösterilir."
+    else:
+        rozet = "Prophet belirsiz"
+        production_note = "Bu çalışma modu temkinli yorumlanmalı."
     return pd.DataFrame([
+        {"Alan": "Prophet rozeti", "Değer": rozet},
         {"Alan": "Prophet çalışma modu", "Değer": mode},
         {"Alan": "Gerçek Prophet fit kullanıldı mı?", "Değer": "evet" if (mode == "gercek_prophet_fit" and not fallback_used) else "hayır"},
         {"Alan": "Fallback kullanıldı mı?", "Değer": "evet" if fallback_used else "hayır"},
         {"Alan": "Fallback yöntemi", "Değer": fallback_method or "yok"},
+        {"Alan": "Üretim notu", "Değer": production_note},
         {"Alan": "Açıklama", "Değer": note or "-"},
     ])
+
 
 
 def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
