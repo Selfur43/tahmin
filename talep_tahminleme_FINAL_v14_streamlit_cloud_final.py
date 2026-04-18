@@ -8083,12 +8083,20 @@ def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Di
 
 
 
+def _safe_df_copy(obj: Any) -> pd.DataFrame:
+    return obj.copy() if isinstance(obj, pd.DataFrame) else pd.DataFrame()
+
+
+def _safe_copy(obj: Any) -> Any:
+    return copy.deepcopy(obj) if obj is not None else None
+
+
 def _build_compact_output_payload(outputs: Dict[str, Any]) -> Dict[str, Any]:
-    metrics_df = (outputs.get("metrics_df") or pd.DataFrame()).copy()
-    stage_timing_table = (outputs.get("stage_timing_table") or pd.DataFrame()).copy()
-    validation_metrics_df = (outputs.get("validation_metrics_df") or pd.DataFrame()).copy()
-    rolling_origin_backtest = (outputs.get("rolling_origin_backtest") or pd.DataFrame()).copy()
-    fallback_summary = (outputs.get("fallback_summary") or pd.DataFrame()).copy()
+    metrics_df = _safe_df_copy(outputs.get("metrics_df"))
+    stage_timing_table = _safe_df_copy(outputs.get("stage_timing_table"))
+    validation_metrics_df = _safe_df_copy(outputs.get("validation_metrics_df"))
+    rolling_origin_backtest = _safe_df_copy(outputs.get("rolling_origin_backtest"))
+    fallback_summary = _safe_df_copy(outputs.get("fallback_summary"))
     compact = {
         "metadata": copy.deepcopy(outputs.get("metadata", {})),
         "metrics_df": metrics_df,
@@ -8103,16 +8111,16 @@ def _build_compact_output_payload(outputs: Dict[str, Any]) -> Dict[str, Any]:
         "ensemble_weights": copy.deepcopy(outputs.get("ensemble_weights", {})),
         "model_errors": copy.deepcopy(outputs.get("model_errors", {})),
         "stage_timings": copy.deepcopy(outputs.get("stage_timings", {})),
-        "karar_hiyerarsisi": (outputs.get("karar_hiyerarsisi") or pd.DataFrame()).copy() if isinstance(outputs.get("karar_hiyerarsisi"), pd.DataFrame) else copy.deepcopy(outputs.get("karar_hiyerarsisi")),
-        "prophet_gorunurluk_ozeti": (outputs.get("prophet_gorunurluk_ozeti") or pd.DataFrame()).copy() if isinstance(outputs.get("prophet_gorunurluk_ozeti"), pd.DataFrame) else copy.deepcopy(outputs.get("prophet_gorunurluk_ozeti")),
+        "karar_hiyerarsisi": _safe_df_copy(outputs.get("karar_hiyerarsisi")) if isinstance(outputs.get("karar_hiyerarsisi"), pd.DataFrame) else copy.deepcopy(outputs.get("karar_hiyerarsisi")),
+        "prophet_gorunurluk_ozeti": _safe_df_copy(outputs.get("prophet_gorunurluk_ozeti")) if isinstance(outputs.get("prophet_gorunurluk_ozeti"), pd.DataFrame) else copy.deepcopy(outputs.get("prophet_gorunurluk_ozeti")),
     }
     prod = outputs.get("production_governance", {}) or {}
     compact["production_governance"] = {
         "production_model": prod.get("production_model"),
         "production_status": prod.get("production_status"),
-        "production_interval_table": (prod.get("production_interval_table") or pd.DataFrame()).copy() if isinstance(prod.get("production_interval_table"), pd.DataFrame) else copy.deepcopy(prod.get("production_interval_table")),
-        "production_service_table": (prod.get("production_service_table") or pd.DataFrame()).copy() if isinstance(prod.get("production_service_table"), pd.DataFrame) else copy.deepcopy(prod.get("production_service_table")),
-        "model_eligibility_gate": (prod.get("model_eligibility_gate") or pd.DataFrame()).copy() if isinstance(prod.get("model_eligibility_gate"), pd.DataFrame) else copy.deepcopy(prod.get("model_eligibility_gate")),
+        "production_interval_table": _safe_df_copy(prod.get("production_interval_table")) if isinstance(prod.get("production_interval_table"), pd.DataFrame) else copy.deepcopy(prod.get("production_interval_table")),
+        "production_service_table": _safe_df_copy(prod.get("production_service_table")) if isinstance(prod.get("production_service_table"), pd.DataFrame) else copy.deepcopy(prod.get("production_service_table")),
+        "model_eligibility_gate": _safe_df_copy(prod.get("model_eligibility_gate")) if isinstance(prod.get("model_eligibility_gate"), pd.DataFrame) else copy.deepcopy(prod.get("model_eligibility_gate")),
     }
     return compact
 
@@ -8233,6 +8241,18 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         SEARCH_ACCELERATOR.put_result(pipeline_key, outputs)
     return copy.deepcopy(outputs)
 
+def _batch_release_memory(clear_failures: bool = False) -> None:
+    try:
+        plt.close("all")
+    except Exception:
+        pass
+    try:
+        SEARCH_ACCELERATOR.clear_caches(artifacts=True, results=True, failures=clear_failures)
+    except Exception:
+        pass
+    gc.collect()
+
+
 def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True, progress_callback=None) -> Dict[str, Any]:
     targets = list(export_payload["series_profile_report"]["series"].dropna().astype(str).tolist())
     if not targets:
@@ -8251,7 +8271,7 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
         except Exception:
             pass
 
-    def _build_rows_from_output(target_name: str, out: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def _build_rows_from_output(target_name: str, out: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         mdf = out.get("metrics_df")
         if not isinstance(mdf, pd.DataFrame):
             mdf = pd.DataFrame()
@@ -8267,6 +8287,7 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
         best_row["best_model"] = out.get("best_model")
         best_row["production_model"] = out.get("production_model")
         best_row["production_status"] = out.get("production_status")
+
         champion_row = {
             "target_col": target_name,
             "champion": (out.get("champion_challenger", {}) or {}).get("champion"),
@@ -8276,38 +8297,40 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
             "segment": meta.get("segment"),
             "abc_xyz": meta.get("abc_xyz")
         }
-        return best_row, champion_row
 
-    def _slim_batch_output(out: Dict[str, Any]) -> Dict[str, Any]:
-        meta = copy.deepcopy(out.get("metadata", {}) or {})
-        return {
-            "metadata": meta,
-            "metrics_df": (out.get("metrics_df") if isinstance(out.get("metrics_df"), pd.DataFrame) else pd.DataFrame()).copy(),
-            "champion_challenger": copy.deepcopy(out.get("champion_challenger", {}) or {}),
+        # Batch UI only needs summary artifacts; keeping full per-series payloads in memory
+        # increases memory pressure and causes Streamlit worker restarts on longer runs.
+        tiny_output = {
+            "target_col": target_name,
             "best_model": out.get("best_model"),
             "production_model": out.get("production_model"),
             "production_status": out.get("production_status"),
-            "stage_timing_table": (out.get("stage_timing_table") if isinstance(out.get("stage_timing_table"), pd.DataFrame) else pd.DataFrame()).copy(),
-            "validation_metrics_df": (out.get("validation_metrics_df") if isinstance(out.get("validation_metrics_df"), pd.DataFrame) else pd.DataFrame()).copy(),
-            "rolling_origin_backtest": (out.get("rolling_origin_backtest") if isinstance(out.get("rolling_origin_backtest"), pd.DataFrame) else pd.DataFrame()).copy(),
-            "fallback_summary": (out.get("fallback_summary") if isinstance(out.get("fallback_summary"), pd.DataFrame) else pd.DataFrame()).copy(),
+            "champion_challenger": copy.deepcopy(out.get("champion_challenger", {})),
+            "metrics_df": _safe_df_copy(out.get("metrics_df")),
+            "stage_timing_table": _safe_df_copy(out.get("stage_timing_table")),
+            "validation_metrics_df": _safe_df_copy(out.get("validation_metrics_df")),
+            "fallback_summary": _safe_df_copy(out.get("fallback_summary")),
         }
+        return best_row, champion_row, tiny_output
 
     rows: List[Dict[str, Any]] = []
     champion_rows: List[Dict[str, Any]] = []
     batch_outputs: Dict[str, Any] = {}
     runtime_rows: List[Dict[str, Any]] = []
-    completed: Dict[str, Any] = {}
 
     cpu_count = max(1, int(os.cpu_count() or 1))
     target_count = len(targets)
-    configured_outer = int(getattr(FORECAST_RUNTIME_CONFIG, "batch_max_workers", 2) or 2)
-    if cpu_count <= 2:
-        outer_workers = 1
-    elif target_count >= 6:
-        outer_workers = min(2, configured_outer, target_count)
-    else:
-        outer_workers = max(1, min(configured_outer, target_count))
+
+    # v35 strategy:
+    # 1) Disable outer target parallelism to stop nested-thread / memory blowups.
+    # 2) Keep the single-series fastlane inside each target by allowing strong inner parallelism.
+    # 3) Keep XGBoost multi-threaded in batch, matching single-series speed path.
+    # 4) Clear all search-accelerator caches and matplotlib artifacts after every series.
+    outer_workers = 1
+    configured_model_workers = int(getattr(FORECAST_RUNTIME_CONFIG, "search_accelerator_max_workers", 4) or 4)
+    configured_candidate_workers = int(getattr(FORECAST_RUNTIME_CONFIG, "search_accelerator_candidate_workers", 4) or 4)
+    inner_model_workers = max(1, min(cpu_count, max(configured_model_workers, 4)))
+    inner_candidate_workers = max(1, min(cpu_count, max(configured_candidate_workers, 4)))
 
     runtime_backup = {
         "search_accelerator_max_workers": FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers,
@@ -8319,70 +8342,67 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
         "sa_result_cache_enabled": SEARCH_ACCELERATOR.config.result_cache_enabled,
     }
 
-    if outer_workers >= 2:
-        inner_model_workers = max(1, min(2, cpu_count // outer_workers))
-        inner_candidate_workers = max(1, min(2, cpu_count // outer_workers))
-    else:
-        inner_model_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "search_accelerator_max_workers", 4) or 4), cpu_count))
-        inner_candidate_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "search_accelerator_candidate_workers", 4) or 4), cpu_count))
-
     batch_started = time.perf_counter()
     _emit_progress(0, target_count, f"Batch forecasting başlatıldı • 0/{target_count} seri tamamlandı")
 
-    # Batch modunda aynı tek-seri tahminleme mantığı korunur; yalnızca büyük bellek kopyaları ve gereksiz cache yükü azaltılır.
     FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = inner_model_workers
     FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = inner_candidate_workers
-    FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = bool(getattr(FORECAST_RUNTIME_CONFIG, "batch_force_xgb_single_thread", True))
+    FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = False
     SEARCH_ACCELERATOR.config.max_workers = inner_model_workers
     SEARCH_ACCELERATOR.config.candidate_workers = inner_candidate_workers
+    SEARCH_ACCELERATOR.config.cache_enabled = False
     SEARCH_ACCELERATOR.config.result_cache_enabled = False
+    _batch_release_memory(clear_failures=True)
 
     try:
-        def _run_one(target_name: str) -> Dict[str, Any]:
+        for idx, target in enumerate(targets, start=1):
             started = time.perf_counter()
-            out = run_full_forecasting_pipeline(
-                export_payload,
-                target_name,
-                horizon,
-                use_exog_for_stat_models,
-                use_exog_for_prophet,
-                compact_mode=True,
-                cache_pipeline_result=False
-            )
-            elapsed = time.perf_counter() - started
+            error_message = None
+            out = None
             try:
-                plt.close("all")
+                out = run_full_forecasting_pipeline(
+                    export_payload,
+                    target,
+                    horizon,
+                    use_exog_for_stat_models,
+                    use_exog_for_prophet,
+                    compact_mode=True,
+                    cache_pipeline_result=False
+                )
+                best_row, champion_row, tiny_output = _build_rows_from_output(target, out)
+                rows.append(best_row)
+                champion_rows.append(champion_row)
+                batch_outputs[target] = tiny_output
+            except Exception as e:
+                error_message = f"{type(e).__name__}: {e}"
+                rows.append({
+                    "target_col": target,
+                    "model": "ERROR",
+                    "MAE": np.nan,
+                    "RMSE": np.nan,
+                    "MAPE": np.nan,
+                    "sMAPE": np.nan,
+                    "WAPE": np.nan,
+                    "MASE": np.nan,
+                    "error": error_message
+                })
+
+            elapsed = time.perf_counter() - started
+            runtime_rows.append({
+                "target_col": target,
+                "elapsed_seconds": safe_float(elapsed),
+                "status": "ok" if error_message is None else "error",
+                "error": error_message
+            })
+
+            # Hard cleanup after every target; Streamlit Cloud is sensitive to memory growth.
+            _batch_release_memory(clear_failures=True)
+            try:
+                del out
             except Exception:
                 pass
             gc.collect()
-            return {"target": target_name, "output": out, "elapsed_seconds": elapsed, "error": None}
-
-        if outer_workers <= 1 or target_count == 1:
-            for idx, target in enumerate(targets, start=1):
-                try:
-                    result_block = _run_one(target)
-                except Exception as e:
-                    result_block = {"target": target, "output": None, "elapsed_seconds": np.nan, "error": f"{type(e).__name__}: {e}"}
-                completed[target] = result_block
-                _emit_progress(idx, target_count, f"{idx}/{target_count} seri tamamlandı • {target}")
-        else:
-            with ThreadPoolExecutor(max_workers=outer_workers, thread_name_prefix="batch-forecast") as ex:
-                future_map = {ex.submit(_run_one, target): target for target in targets}
-                done_count = 0
-                for fut in as_completed(future_map):
-                    target = future_map[fut]
-                    try:
-                        result_block = fut.result()
-                    except Exception as e:
-                        result_block = {"target": target, "output": None, "elapsed_seconds": np.nan, "error": f"{type(e).__name__}: {e}"}
-                    completed[target] = result_block
-                    done_count += 1
-                    try:
-                        plt.close("all")
-                    except Exception:
-                        pass
-                    gc.collect()
-                    _emit_progress(done_count, target_count, f"{done_count}/{target_count} seri tamamlandı • {target}")
+            _emit_progress(idx, target_count, f"{idx}/{target_count} seri tamamlandı • {target}")
     finally:
         FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = runtime_backup["search_accelerator_max_workers"]
         FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = runtime_backup["search_accelerator_candidate_workers"]
@@ -8391,39 +8411,7 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
         SEARCH_ACCELERATOR.config.candidate_workers = runtime_backup["sa_candidate_workers"]
         SEARCH_ACCELERATOR.config.cache_enabled = runtime_backup["sa_cache_enabled"]
         SEARCH_ACCELERATOR.config.result_cache_enabled = runtime_backup["sa_result_cache_enabled"]
-        try:
-            plt.close("all")
-        except Exception:
-            pass
-        gc.collect()
-
-    for target in targets:
-        block = completed.get(target, {"target": target, "output": None, "elapsed_seconds": np.nan, "error": "Bilinmeyen batch hatası"})
-        runtime_rows.append({
-            "target_col": target,
-            "elapsed_seconds": safe_float(block.get("elapsed_seconds", np.nan)),
-            "status": "ok" if not block.get("error") else "error",
-            "error": block.get("error")
-        })
-        if block.get("error") or block.get("output") is None:
-            rows.append({
-                "target_col": target,
-                "model": "ERROR",
-                "MAE": np.nan,
-                "RMSE": np.nan,
-                "MAPE": np.nan,
-                "sMAPE": np.nan,
-                "WAPE": np.nan,
-                "MASE": np.nan,
-                "error": str(block.get("error"))
-            })
-            continue
-
-        out = block["output"]
-        batch_outputs[target] = _slim_batch_output(out)
-        best_row, champion_row = _build_rows_from_output(target, out)
-        rows.append(best_row)
-        champion_rows.append(champion_row)
+        _batch_release_memory(clear_failures=True)
 
     total_elapsed = time.perf_counter() - batch_started
     runtime_rows.append({
@@ -8441,9 +8429,6 @@ def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int,
         "batch_outputs": batch_outputs,
         "batch_runtime": pd.DataFrame(runtime_rows)
     }
-
-
-
 
 def _seasonal_naive_array(y_train: pd.Series, horizon: int, season_length: int) -> np.ndarray:
     y_train = pd.to_numeric(y_train, errors="coerce").astype(float).dropna().reset_index(drop=True)
