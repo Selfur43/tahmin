@@ -4798,7 +4798,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "v34_batch_fastlane_stable"
+APP_VERSION = "v36_batch_incremental_resumable"
 
 
 
@@ -8253,6 +8253,206 @@ def _batch_release_memory(clear_failures: bool = False) -> None:
     gc.collect()
 
 
+
+
+def _build_batch_summary_rows_from_output(target_name: str, out: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    mdf = out.get("metrics_df")
+    if not isinstance(mdf, pd.DataFrame):
+        mdf = pd.DataFrame()
+    mdf = mdf.copy()
+    if len(mdf) == 0:
+        best_row = {"model": "NO_RESULT", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan}
+    else:
+        best_row = mdf.iloc[0].to_dict()
+    meta = out.get("metadata", {}) or {}
+    best_row["target_col"] = target_name
+    best_row["segment"] = meta.get("segment")
+    best_row["abc_xyz"] = meta.get("abc_xyz")
+    best_row["best_model"] = out.get("best_model")
+    best_row["production_model"] = out.get("production_model")
+    best_row["production_status"] = out.get("production_status")
+
+    champion_row = {
+        "target_col": target_name,
+        "champion": (out.get("champion_challenger", {}) or {}).get("champion"),
+        "challenger": (out.get("champion_challenger", {}) or {}).get("challenger"),
+        "production_model": out.get("production_model"),
+        "production_status": out.get("production_status"),
+        "segment": meta.get("segment"),
+        "abc_xyz": meta.get("abc_xyz")
+    }
+
+    tiny_output = {
+        "target_col": target_name,
+        "best_model": out.get("best_model"),
+        "production_model": out.get("production_model"),
+        "production_status": out.get("production_status"),
+        "champion_challenger": copy.deepcopy(out.get("champion_challenger", {})),
+        "metrics_df": _safe_df_copy(out.get("metrics_df")),
+        "stage_timing_table": _safe_df_copy(out.get("stage_timing_table")),
+        "validation_metrics_df": _safe_df_copy(out.get("validation_metrics_df")),
+        "fallback_summary": _safe_df_copy(out.get("fallback_summary")),
+    }
+    return best_row, champion_row, tiny_output
+
+
+def _batch_fastlane_single_target(export_payload: Dict[str, pd.DataFrame], target: str, horizon: int, use_exog_for_stat_models: bool, use_exog_for_prophet: bool) -> Dict[str, Any]:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    configured_model_workers = int(getattr(FORECAST_RUNTIME_CONFIG, "search_accelerator_max_workers", 4) or 4)
+    configured_candidate_workers = int(getattr(FORECAST_RUNTIME_CONFIG, "search_accelerator_candidate_workers", 4) or 4)
+    inner_model_workers = max(1, min(cpu_count, max(configured_model_workers, 4)))
+    inner_candidate_workers = max(1, min(cpu_count, max(configured_candidate_workers, 4)))
+
+    runtime_backup = {
+        "search_accelerator_max_workers": FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers,
+        "search_accelerator_candidate_workers": FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers,
+        "xgb_force_single_thread": FORECAST_RUNTIME_CONFIG.xgb_force_single_thread,
+        "sa_max_workers": SEARCH_ACCELERATOR.config.max_workers,
+        "sa_candidate_workers": SEARCH_ACCELERATOR.config.candidate_workers,
+        "sa_cache_enabled": SEARCH_ACCELERATOR.config.cache_enabled,
+        "sa_result_cache_enabled": SEARCH_ACCELERATOR.config.result_cache_enabled,
+    }
+
+    FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = inner_model_workers
+    FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = inner_candidate_workers
+    FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = False
+    SEARCH_ACCELERATOR.config.max_workers = inner_model_workers
+    SEARCH_ACCELERATOR.config.candidate_workers = inner_candidate_workers
+    SEARCH_ACCELERATOR.config.cache_enabled = False
+    SEARCH_ACCELERATOR.config.result_cache_enabled = False
+    _batch_release_memory(clear_failures=True)
+    try:
+        return run_full_forecasting_pipeline(
+            export_payload,
+            target,
+            horizon,
+            use_exog_for_stat_models,
+            use_exog_for_prophet,
+            compact_mode=True,
+            cache_pipeline_result=False
+        )
+    finally:
+        FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = runtime_backup["search_accelerator_max_workers"]
+        FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = runtime_backup["search_accelerator_candidate_workers"]
+        FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = runtime_backup["xgb_force_single_thread"]
+        SEARCH_ACCELERATOR.config.max_workers = runtime_backup["sa_max_workers"]
+        SEARCH_ACCELERATOR.config.candidate_workers = runtime_backup["sa_candidate_workers"]
+        SEARCH_ACCELERATOR.config.cache_enabled = runtime_backup["sa_cache_enabled"]
+        SEARCH_ACCELERATOR.config.result_cache_enabled = runtime_backup["sa_result_cache_enabled"]
+        _batch_release_memory(clear_failures=True)
+
+
+def _batch_job_state_key(forecast_cache_key: str) -> str:
+    return f"active_batch_job::{forecast_cache_key}"
+
+
+def initialize_incremental_batch_job(export_payload: Dict[str, pd.DataFrame], forecast_cache_key: str, horizon: int, use_exog_for_stat_models: bool, use_exog_for_prophet: bool) -> Dict[str, Any]:
+    targets = list(export_payload["series_profile_report"]["series"].dropna().astype(str).tolist())
+    job = {
+        "forecast_cache_key": forecast_cache_key,
+        "targets": targets,
+        "horizon": int(horizon),
+        "use_exog_for_stat_models": bool(use_exog_for_stat_models),
+        "use_exog_for_prophet": bool(use_exog_for_prophet),
+        "next_index": 0,
+        "rows": [],
+        "champion_rows": [],
+        "runtime_rows": [],
+        "batch_outputs": {},
+        "started_ts": time.time(),
+        "status": "running",
+        "last_target": None,
+        "last_message": f"Batch forecasting başlatıldı • 0/{len(targets)} seri tamamlandı"
+    }
+    st.session_state[_batch_job_state_key(forecast_cache_key)] = job
+    return job
+
+
+def get_incremental_batch_job(forecast_cache_key: str) -> Optional[Dict[str, Any]]:
+    return st.session_state.get(_batch_job_state_key(forecast_cache_key))
+
+
+def clear_incremental_batch_job(forecast_cache_key: str) -> None:
+    st.session_state.pop(_batch_job_state_key(forecast_cache_key), None)
+
+
+def finalize_incremental_batch_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    total_elapsed = max(0.0, time.time() - float(job.get("started_ts", time.time())))
+    runtime_rows = list(job.get("runtime_rows", []))
+    runtime_rows.append({
+        "target_col": "__BATCH_TOTAL__",
+        "elapsed_seconds": safe_float(total_elapsed),
+        "status": "ok",
+        "error": None
+    })
+    return {
+        "best_summary": pd.DataFrame(job.get("rows", [])),
+        "champion_table": pd.DataFrame(job.get("champion_rows", [])),
+        "batch_outputs": dict(job.get("batch_outputs", {})),
+        "batch_runtime": pd.DataFrame(runtime_rows)
+    }
+
+
+def process_one_incremental_batch_target(export_payload: Dict[str, pd.DataFrame], job: Dict[str, Any]) -> Dict[str, Any]:
+    targets = list(job.get("targets", []))
+    idx0 = int(job.get("next_index", 0))
+    total_count = len(targets)
+    if idx0 >= total_count:
+        job["status"] = "completed"
+        return job
+
+    target = targets[idx0]
+    started = time.perf_counter()
+    error_message = None
+    out = None
+    try:
+        out = _batch_fastlane_single_target(
+            export_payload,
+            target,
+            int(job.get("horizon", 1)),
+            bool(job.get("use_exog_for_stat_models", True)),
+            bool(job.get("use_exog_for_prophet", True))
+        )
+        best_row, champion_row, tiny_output = _build_batch_summary_rows_from_output(target, out)
+        job.setdefault("rows", []).append(best_row)
+        job.setdefault("champion_rows", []).append(champion_row)
+        job.setdefault("batch_outputs", {})[target] = tiny_output
+    except Exception as e:
+        error_message = f"{type(e).__name__}: {e}"
+        job.setdefault("rows", []).append({
+            "target_col": target,
+            "model": "ERROR",
+            "MAE": np.nan,
+            "RMSE": np.nan,
+            "MAPE": np.nan,
+            "sMAPE": np.nan,
+            "WAPE": np.nan,
+            "MASE": np.nan,
+            "error": error_message
+        })
+    finally:
+        elapsed = time.perf_counter() - started
+        job.setdefault("runtime_rows", []).append({
+            "target_col": target,
+            "elapsed_seconds": safe_float(elapsed),
+            "status": "ok" if error_message is None else "error",
+            "error": error_message
+        })
+        try:
+            del out
+        except Exception:
+            pass
+        _batch_release_memory(clear_failures=True)
+        gc.collect()
+
+    done = idx0 + 1
+    job["next_index"] = done
+    job["last_target"] = target
+    job["last_message"] = f"{done}/{max(total_count, 1)} seri tamamlandı • {target}"
+    job["status"] = "completed" if done >= total_count else "running"
+    return job
+
+
 def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True, progress_callback=None) -> Dict[str, Any]:
     targets = list(export_payload["series_profile_report"]["series"].dropna().astype(str).tolist())
     if not targets:
@@ -10052,38 +10252,62 @@ def render_streamlit_app():
 
     run_label = "Batch forecasting çalıştır" if mode == "Çok serili batch forecasting" else "Modelleri çalıştır ve karşılaştır"
     if st.button(run_label, type="primary"):
-        with st.spinner("Gelişmiş tahminleme katmanı çalışıyor..."):
-            try:
-                if forecast_cache_key in st.session_state["forecast_run_cache"]:
-                    cached_obj = st.session_state["forecast_run_cache"][forecast_cache_key]
-                else:
-                    if mode == "Tek seri":
-                        cached_obj = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
+        try:
+            if mode == "Tek seri":
+                with st.spinner("Gelişmiş tahminleme katmanı çalışıyor..."):
+                    if forecast_cache_key in st.session_state["forecast_run_cache"]:
+                        cached_obj = st.session_state["forecast_run_cache"][forecast_cache_key]
                     else:
-                        batch_progress_bar = st.progress(0)
-                        batch_progress_text = st.empty()
-                        def _batch_progress_callback(progress_fraction: float, message: str) -> None:
-                            pct = int(max(0, min(100, round(float(progress_fraction) * 100))))
-                            batch_progress_bar.progress(pct)
-                            batch_progress_text.caption(message)
-                        cached_obj = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet, progress_callback=_batch_progress_callback)
-                        batch_progress_bar.progress(100)
-                        batch_progress_text.success("Batch forecasting tamamlandı.")
-                    st.session_state["forecast_run_cache"][forecast_cache_key] = cached_obj
-
-                if mode == "Tek seri":
+                        cached_obj = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
+                        st.session_state["forecast_run_cache"][forecast_cache_key] = cached_obj
                     st.session_state["forecast_outputs"] = cached_obj
                     st.session_state["forecast_target"] = target_col
                     st.session_state["batch_mode"] = False
-                else:
-                    st.session_state["batch_outputs_full"] = cached_obj
+            else:
+                if forecast_cache_key in st.session_state["forecast_run_cache"]:
+                    st.session_state["batch_outputs_full"] = st.session_state["forecast_run_cache"][forecast_cache_key]
                     st.session_state["batch_mode"] = True
-            except Exception as e:
-                st.error(f"Tahminleme sırasında hata oluştu: {e}")
-                st.exception(e)
-                return
+                else:
+                    initialize_incremental_batch_job(export_payload, forecast_cache_key, horizon, use_exog_stat, use_exog_prophet)
+                    st.session_state["batch_mode"] = True
+                st.rerun()
+        except Exception as e:
+            st.error(f"Tahminleme sırasında hata oluştu: {e}")
+            st.exception(e)
+            return
 
     if mode == "Çok serili batch forecasting":
+        active_job = get_incremental_batch_job(forecast_cache_key)
+        if active_job is not None and active_job.get("status") == "running":
+            total_targets = max(1, len(active_job.get("targets", [])))
+            done_before = int(active_job.get("next_index", 0))
+            st.subheader("Batch forecasting ilerleme durumu")
+            progress_bar = st.progress(int(round((done_before / total_targets) * 100)))
+            progress_text = st.empty()
+            progress_text.caption(active_job.get("last_message", f"{done_before}/{total_targets} seri tamamlandı"))
+            with st.spinner(f"Gelişmiş tahminleme katmanı çalışıyor... ({done_before + 1}/{total_targets})"):
+                try:
+                    active_job = process_one_incremental_batch_target(export_payload, active_job)
+                    st.session_state[_batch_job_state_key(forecast_cache_key)] = active_job
+                except Exception as e:
+                    st.error(f"Batch forecasting sırasında hata oluştu: {e}")
+                    st.exception(e)
+                    clear_incremental_batch_job(forecast_cache_key)
+                    return
+            done_after = int(active_job.get("next_index", 0))
+            progress_bar.progress(int(round((done_after / total_targets) * 100)))
+            progress_text.success(active_job.get("last_message", f"{done_after}/{total_targets} seri tamamlandı"))
+            if active_job.get("status") == "completed":
+                final_batch = finalize_incremental_batch_job(active_job)
+                st.session_state["forecast_run_cache"][forecast_cache_key] = final_batch
+                st.session_state["batch_outputs_full"] = final_batch
+                st.session_state["batch_mode"] = True
+                clear_incremental_batch_job(forecast_cache_key)
+                st.rerun()
+            else:
+                st.caption("Bir sonraki seri otomatik olarak başlatılıyor...")
+                st.rerun()
+
         batch = st.session_state.get("batch_outputs_full")
         if batch is None:
             st.info("Batch sonucu görmek için butona bas.")
@@ -10092,6 +10316,9 @@ def render_streamlit_app():
         st.dataframe(style_metric_dataframe(batch["best_summary"]), width="stretch")
         st.subheader("Champion - Challenger tablosu")
         st.dataframe(batch["champion_table"], width="stretch")
+        if isinstance(batch.get("batch_runtime"), pd.DataFrame) and len(batch.get("batch_runtime")) > 0:
+            with st.expander("Batch çalışma süresi özeti", expanded=False):
+                st.dataframe(batch["batch_runtime"], width="stretch")
         st.download_button("Batch özetini indir (CSV)", data=dataframe_to_download_bytes(batch["best_summary"]), file_name=f"{selected_sheet}_batch_forecasting_summary.csv", mime="text/csv")
         return
 
