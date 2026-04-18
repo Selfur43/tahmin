@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 
 
 
@@ -4832,6 +4832,11 @@ class ForecastRuntimeConfig:
     search_accelerator_result_cache_enabled: bool = True
     search_accelerator_max_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
     search_accelerator_candidate_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
+    batch_max_workers: int = field(default_factory=lambda: max(1, min(2, os.cpu_count() or 2)))
+    batch_wall_seconds: float = 1740.0
+    batch_inner_model_workers: int = 2
+    batch_inner_candidate_workers: int = 2
+    batch_force_xgb_single_thread: bool = True
     xgb_param_grid: Tuple[Dict[str, Any], ...] = field(default_factory=lambda: (
         {
             "max_depth": 2,
@@ -8174,34 +8179,162 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     SEARCH_ACCELERATOR.put_result(pipeline_key, outputs)
     return copy.deepcopy(outputs)
 
-def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
-    targets = export_payload["series_profile_report"]["series"].tolist()
-    rows = []
-    champion_rows = []
-    batch_outputs = {}
-    for target in targets:
+def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True, progress_callback=None) -> Dict[str, Any]:
+    targets = list(export_payload["series_profile_report"]["series"].dropna().astype(str).tolist())
+    if not targets:
+        return {
+            "best_summary": pd.DataFrame(),
+            "champion_table": pd.DataFrame(),
+            "batch_outputs": {},
+            "batch_runtime": pd.DataFrame()
+        }
+
+    def _emit_progress(done_count: int, total_count: int, message: str) -> None:
+        if progress_callback is None:
+            return
         try:
-            out = run_full_forecasting_pipeline(export_payload, target, horizon, use_exog_for_stat_models, use_exog_for_prophet)
-            batch_outputs[target] = out
-            mdf = out["metrics_df"].copy()
+            progress_callback(done_count / max(total_count, 1), message)
+        except Exception:
+            pass
+
+    def _build_rows_from_output(target_name: str, out: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        mdf = (out.get("metrics_df") or pd.DataFrame()).copy()
+        if len(mdf) == 0:
+            best_row = {"model": "NO_RESULT", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan}
+        else:
             best_row = mdf.iloc[0].to_dict()
-            best_row["target_col"] = target
-            best_row["segment"] = out["metadata"]["segment"]
-            best_row["abc_xyz"] = out["metadata"]["abc_xyz"]
-            rows.append(best_row)
-            champion_rows.append({
+        best_row["target_col"] = target_name
+        best_row["segment"] = out.get("metadata", {}).get("segment")
+        best_row["abc_xyz"] = out.get("metadata", {}).get("abc_xyz")
+        best_row["best_model"] = out.get("best_model")
+        best_row["production_model"] = out.get("production_model")
+        best_row["production_status"] = out.get("production_status")
+        champion_row = {
+            "target_col": target_name,
+            "champion": out.get("champion_challenger", {}).get("champion"),
+            "challenger": out.get("champion_challenger", {}).get("challenger"),
+            "production_model": out.get("production_model"),
+            "production_status": out.get("production_status"),
+            "segment": out.get("metadata", {}).get("segment"),
+            "abc_xyz": out.get("metadata", {}).get("abc_xyz")
+        }
+        return best_row, champion_row
+
+    rows: List[Dict[str, Any]] = []
+    champion_rows: List[Dict[str, Any]] = []
+    batch_outputs: Dict[str, Any] = {}
+    runtime_rows: List[Dict[str, Any]] = []
+    completed: Dict[str, Any] = {}
+
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    outer_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "batch_max_workers", 2)), len(targets)))
+    if cpu_count <= 2:
+        outer_workers = 1
+    elif len(targets) >= 4:
+        outer_workers = min(outer_workers, 2)
+
+    batch_started = time.perf_counter()
+    runtime_backup = {
+        "search_accelerator_max_workers": FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers,
+        "search_accelerator_candidate_workers": FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers,
+        "xgb_force_single_thread": FORECAST_RUNTIME_CONFIG.xgb_force_single_thread,
+        "sa_max_workers": SEARCH_ACCELERATOR.config.max_workers,
+        "sa_candidate_workers": SEARCH_ACCELERATOR.config.candidate_workers,
+    }
+
+    inner_model_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "batch_inner_model_workers", 2)), cpu_count))
+    inner_candidate_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "batch_inner_candidate_workers", 2)), cpu_count))
+
+    # Batch modunda seri düzeyinde paralellik kullanılır; her seri içindeki paralellik kontrollü tutulur.
+    FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = inner_model_workers
+    FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = inner_candidate_workers
+    FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = bool(getattr(FORECAST_RUNTIME_CONFIG, "batch_force_xgb_single_thread", True))
+    SEARCH_ACCELERATOR.config.max_workers = inner_model_workers
+    SEARCH_ACCELERATOR.config.candidate_workers = inner_candidate_workers
+
+    _emit_progress(0, len(targets), f"Batch forecasting başlatıldı • 0/{len(targets)} seri tamamlandı")
+
+    try:
+        def _run_one(target_name: str) -> Dict[str, Any]:
+            started = time.perf_counter()
+            out = run_full_forecasting_pipeline(export_payload, target_name, horizon, use_exog_for_stat_models, use_exog_for_prophet)
+            elapsed = time.perf_counter() - started
+            return {"target": target_name, "output": out, "elapsed_seconds": elapsed, "error": None}
+
+        if outer_workers <= 1 or len(targets) == 1:
+            for idx, target in enumerate(targets, start=1):
+                try:
+                    result_block = _run_one(target)
+                except Exception as e:
+                    result_block = {"target": target, "output": None, "elapsed_seconds": np.nan, "error": str(e)}
+                completed[target] = result_block
+                _emit_progress(idx, len(targets), f"{idx}/{len(targets)} seri tamamlandı • {target}")
+        else:
+            with ThreadPoolExecutor(max_workers=outer_workers, thread_name_prefix="batch-forecast") as ex:
+                future_map = {
+                    ex.submit(_run_one, target): target
+                    for target in targets
+                }
+                done_count = 0
+                for fut in as_completed(future_map):
+                    target = future_map[fut]
+                    try:
+                        result_block = fut.result()
+                    except Exception as e:
+                        result_block = {"target": target, "output": None, "elapsed_seconds": np.nan, "error": str(e)}
+                    completed[target] = result_block
+                    done_count += 1
+                    _emit_progress(done_count, len(targets), f"{done_count}/{len(targets)} seri tamamlandı • {target}")
+    finally:
+        FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = runtime_backup["search_accelerator_max_workers"]
+        FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = runtime_backup["search_accelerator_candidate_workers"]
+        FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = runtime_backup["xgb_force_single_thread"]
+        SEARCH_ACCELERATOR.config.max_workers = runtime_backup["sa_max_workers"]
+        SEARCH_ACCELERATOR.config.candidate_workers = runtime_backup["sa_candidate_workers"]
+
+    for target in targets:
+        block = completed.get(target, {"target": target, "output": None, "elapsed_seconds": np.nan, "error": "Bilinmeyen batch hatası"})
+        runtime_rows.append({
+            "target_col": target,
+            "elapsed_seconds": safe_float(block.get("elapsed_seconds", np.nan)),
+            "status": "ok" if not block.get("error") else "error",
+            "error": block.get("error")
+        })
+        if block.get("error") or block.get("output") is None:
+            rows.append({
                 "target_col": target,
-                "champion": out["champion_challenger"]["champion"],
-                "challenger": out["champion_challenger"]["challenger"],
-                "segment": out["metadata"]["segment"],
-                "abc_xyz": out["metadata"]["abc_xyz"]
+                "model": "ERROR",
+                "MAE": np.nan,
+                "RMSE": np.nan,
+                "MAPE": np.nan,
+                "sMAPE": np.nan,
+                "WAPE": np.nan,
+                "MASE": np.nan,
+                "error": str(block.get("error"))
             })
-        except Exception as e:
-            rows.append({"target_col": target, "model": "ERROR", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan, "error": str(e)})
+            continue
+
+        out = block["output"]
+        batch_outputs[target] = out
+        best_row, champion_row = _build_rows_from_output(target, out)
+        rows.append(best_row)
+        champion_rows.append(champion_row)
+
+    total_elapsed = time.perf_counter() - batch_started
+    runtime_rows.append({
+        "target_col": "__BATCH_TOTAL__",
+        "elapsed_seconds": total_elapsed,
+        "status": "ok",
+        "error": None
+    })
+
+    _emit_progress(len(targets), len(targets), f"Batch forecasting tamamlandı • {len(targets)}/{len(targets)} seri işlendi • {total_elapsed:.1f} sn")
+
     return {
         "best_summary": pd.DataFrame(rows),
         "champion_table": pd.DataFrame(champion_rows),
-        "batch_outputs": batch_outputs
+        "batch_outputs": batch_outputs,
+        "batch_runtime": pd.DataFrame(runtime_rows)
     }
 
 
@@ -9837,7 +9970,15 @@ def render_streamlit_app():
                     if mode == "Tek seri":
                         cached_obj = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
                     else:
-                        cached_obj = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet)
+                        batch_progress_bar = st.progress(0)
+                        batch_progress_text = st.empty()
+                        def _batch_progress_callback(progress_fraction: float, message: str) -> None:
+                            pct = int(max(0, min(100, round(float(progress_fraction) * 100))))
+                            batch_progress_bar.progress(pct)
+                            batch_progress_text.caption(message)
+                        cached_obj = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet, progress_callback=_batch_progress_callback)
+                        batch_progress_bar.progress(100)
+                        batch_progress_text.success("Batch forecasting tamamlandı.")
                     st.session_state["forecast_run_cache"][forecast_cache_key] = cached_obj
 
                 if mode == "Tek seri":
