@@ -8019,53 +8019,191 @@ def build_service_level_simulation(test_df: pd.DataFrame, pred: np.ndarray, inte
     return pd.DataFrame(rows)
 
 
+def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+    prod_model = production_pack.get("production_model", outputs.get("best_model"))
+    bias_df = production_pack.get("bias_dashboard", pd.DataFrame())
+    peak_df = production_pack.get("peak_event_dashboard", pd.DataFrame())
+    gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame())
+    interval_df = production_pack.get("production_interval_table", pd.DataFrame())
+    feature_df = production_pack.get("feature_availability_audit", pd.DataFrame())
+    service_df = production_pack.get("production_service_table", pd.DataFrame())
+    full_ro = outputs.get("rolling_origin_backtest", pd.DataFrame())
+    robt = summarize_full_backtest(full_ro)
+    fallback_flags = {
+        "XGBoost": bool((outputs.get("xgboost") or {}).get("fallback_used", False)),
+        "Prophet": bool((outputs.get("prophet") or {}).get("fallback_used", False)),
+        "SARIMA/SARIMAX": bool((outputs.get("sarima") or {}).get("fallback_used", False)),
+        "ARIMA": bool((outputs.get("arima") or {}).get("fallback_used", False)),
+        "Intermittent": bool((outputs.get("intermittent") or {}).get("fallback_used", False)),
+        "Ensemble": False,
+    }
+    fallback_rate = float(np.mean(list(fallback_flags.values()))) if fallback_flags else 0.0
+    alerts = []
+    train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
+    prod_pred = np.asarray((outputs.get("predictions") or {}).get(prod_model, np.array([])), dtype=float)
+    recent_mean = float(train_y.tail(min(6, len(train_y))).mean()) if len(train_y) else np.nan
+    drift_ratio = float(np.mean(prod_pred) / max(recent_mean, 1e-6)) if len(prod_pred) and pd.notna(recent_mean) else np.nan
+    bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
+    peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
+    gate_row = gate_df.loc[gate_df["model"] == prod_model].head(1) if len(gate_df) else pd.DataFrame()
+    ro_row = robt.loc[robt["model"] == prod_model].head(1) if len(robt) else pd.DataFrame()
+    service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) else pd.DataFrame()
+    achieved_service = float(pd.to_numeric(service_row.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce")) if len(service_row) else np.nan
+    target_service = float(pd.to_numeric(service_row.iloc[0].get("service_level_target", np.nan), errors="coerce")) if len(service_row) else np.nan
+    freq_desc = outputs.get("metadata", {}).get("freq_alias", outputs.get("metadata", {}).get("frequency", "?"))
+    summary_row = {
+        "üretim_modeli": prod_model,
+        "üretim_durumu": production_pack.get("production_status", "eligible"),
+        "frekans": freq_desc,
+        "sapma_yüzde": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
+        "eksik_tahmin_oranı": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan,
+        "tepe_olay_skoru": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan,
+        "uygunluk_skoru": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan,
+        "rolling_wape": float(pd.to_numeric(ro_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(ro_row) else np.nan,
+        "drift_oranı": drift_ratio,
+        "kapsama_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
+        "kapsama_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
+        "maksimum_özellik_riski": float(pd.to_numeric(feature_df.get("availability_risk_score"), errors="coerce").max()) if isinstance(feature_df, pd.DataFrame) and len(feature_df) and "availability_risk_score" in feature_df.columns else np.nan,
+        "fallback_oranı": fallback_rate,
+        "gerçekleşen_servis": achieved_service,
+        "hedef_servis": target_service,
+    }
+    if pd.notna(summary_row["sapma_yüzde"]) and abs(summary_row["sapma_yüzde"]) > 8.0:
+        alerts.append({"severity": "high", "alert": "sapma_alarmı", "detail": f"Sapma yüksek: {summary_row['sapma_yüzde']:.2f}%"})
+    if pd.notna(summary_row["eksik_tahmin_oranı"]) and summary_row["eksik_tahmin_oranı"] > 0.60:
+        alerts.append({"severity": "high", "alert": "eksik_tahmin_alarmı", "detail": f"Eksik tahmin oranı yüksek: {summary_row['eksik_tahmin_oranı']:.2f}"})
+    if pd.notna(summary_row["tepe_olay_skoru"]) and summary_row["tepe_olay_skoru"] < 0.35:
+        alerts.append({"severity": "high", "alert": "tepe_yakalama_alarmı", "detail": f"Tepe olay yakalama zayıf: {summary_row['tepe_olay_skoru']:.2f}"})
+    if pd.notna(summary_row["drift_oranı"]) and not (0.82 <= summary_row["drift_oranı"] <= 1.22):
+        alerts.append({"severity": "medium", "alert": "drift_alarmı", "detail": f"Tahmin/son dönem seviye oranı: {summary_row['drift_oranı']:.2f}"})
+    if pd.notna(summary_row["maksimum_özellik_riski"]) and summary_row["maksimum_özellik_riski"] > 0.25:
+        alerts.append({"severity": "high", "alert": "özellik_kontratı_alarmı", "detail": "Production feature contract tamamen güvenli değil."})
+    if pd.notna(summary_row["gerçekleşen_servis"]) and pd.notna(summary_row["hedef_servis"]) and summary_row["gerçekleşen_servis"] + 1e-9 < summary_row["hedef_servis"]:
+        alerts.append({"severity": "high", "alert": "servis_seviyesi_alarmı", "detail": f"Servis seviyesi hedef altında: {summary_row['gerçekleşen_servis']:.2f} < {summary_row['hedef_servis']:.2f}"})
+    if fallback_rate > 0.20:
+        alerts.append({"severity": "medium", "alert": "fallback_oranı_alarmı", "detail": f"Model ailelerinde fallback oranı yüksek: {fallback_rate:.2f}"})
+    recommendation = "guardrailli_üretime_uygun"
+    if any(a["severity"] == "high" for a in alerts):
+        recommendation = "shadow_mode_zorunlu"
+    elif alerts:
+        recommendation = "şampiyon_meydan_okuyan_paralel"
+    summary = pd.DataFrame([summary_row])
+    summary["alarm_sayısı"] = len(alerts)
+    summary["yüksek_alarm_sayısı"] = sum(1 for a in alerts if a["severity"] == "high")
+    summary["canlı_kullanım_önerisi"] = recommendation
+    summary["karar_açıklaması"] = build_production_decision_explanation(production_pack.get("production_ranking", pd.DataFrame()), prod_model)
+    summary["karar_kartı"] = summary.apply(lambda r: f"Model: {r['üretim_modeli']} | Sapma: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f} | Fallback: {safe_float(r.get('fallback_oranı', np.nan)):.2f} | Drift: {safe_float(r.get('drift_oranı', np.nan)):.2f} | Servis: {safe_float(r.get('gerçekleşen_servis', np.nan)):.2f}/{safe_float(r.get('hedef_servis', np.nan)):.2f} | Alarm: {int(r.get('alarm_sayısı', 0)) if pd.notna(r.get('alarm_sayısı', np.nan)) else 0}", axis=1)
+
+    metric_df = outputs.get("metrics_df", pd.DataFrame())
+    prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
+    service_level_tables = production_pack.get("service_level_simulation", {}) or {}
+    health_rows = []
+    for model_name in metric_df.get("model", pd.Series(dtype=str)).tolist() if isinstance(metric_df, pd.DataFrame) else []:
+        mrow = metric_df.loc[metric_df["model"] == model_name].head(1)
+        brow = bias_df.loc[bias_df["model"] == model_name].head(1) if len(bias_df) else pd.DataFrame()
+        prow = peak_df.loc[peak_df["model"] == model_name].head(1) if len(peak_df) else pd.DataFrame()
+        grow = gate_df.loc[gate_df["model"] == model_name].head(1) if len(gate_df) else pd.DataFrame()
+        rrow = robt.loc[robt["model"] == model_name].head(1) if len(robt) else pd.DataFrame()
+        qtbl = prediction_interval_tables.get(model_name, pd.DataFrame())
+        stbl = service_level_tables.get(model_name, pd.DataFrame())
+        srow = stbl.loc[stbl["service_level_target"] == stbl["service_level_target"].max()].head(1) if isinstance(stbl, pd.DataFrame) and len(stbl) else pd.DataFrame()
+        health_rows.append({
+            "model": model_name,
+            "WAPE": safe_float(mrow.iloc[0].get("WAPE", np.nan)) if len(mrow) else np.nan,
+            "rolling_WAPE": safe_float(rrow.iloc[0].get("WAPE", np.nan)) if len(rrow) else np.nan,
+            "sapma_yüzde": safe_float(brow.iloc[0].get("bias_pct", np.nan)) if len(brow) else np.nan,
+            "eksik_tahmin_oranı": safe_float(brow.iloc[0].get("under_forecast_rate", np.nan)) if len(brow) else np.nan,
+            "tepe_olay_skoru": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
+            "uygunluk_skoru": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
+            "durum": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
+            "kapsama_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
+            "gerçekleşen_servis": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
+            "fallback_kullanıldı": bool(fallback_flags.get(model_name, False)),
+            "fallback_yöntemi": ((outputs.get(model_name.lower().replace("/", "_").replace("-", "_"), {}) or {}).get("fallback_method") if isinstance(outputs, dict) else None),
+        })
+    model_health_table = pd.DataFrame(health_rows)
+    if not len(model_health_table):
+        model_health_table = pd.DataFrame(columns=["model", "WAPE", "rolling_WAPE", "sapma_yüzde", "eksik_tahmin_oranı", "tepe_olay_skoru", "uygunluk_skoru", "durum", "kapsama_80", "gerçekleşen_servis", "fallback_kullanıldı", "fallback_yöntemi"])
+    return {"summary": summary, "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"]), "model_health_table": model_health_table}
+
+
 def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
-    feature_audit_df = build_feature_availability_audit(
-        export_payload.get("features", pd.DataFrame()),
-        export_payload.get("metadata", {}).get("date_col", "ds"),
-        target_col,
-        outputs.get("metadata", {}).get("stat_exog_cols", []) or [],
-        outputs.get("metadata", {}).get("prophet_exog_cols", []) or [],
-        outputs.get("metadata", {}).get("ml_feature_cols", []) or [],
-    )
+    feature_audit_df = build_feature_availability_audit(export_payload.get("features", pd.DataFrame()), export_payload.get("metadata", {}).get("date_col", "ds"), target_col, outputs.get("metadata", {}).get("stat_exog_cols", []) or [], outputs.get("metadata", {}).get("prophet_exog_cols", []) or [], outputs.get("metadata", {}).get("ml_feature_cols", []) or [])
     bias_df = build_bias_dashboard(outputs)
     peak_df = build_peak_event_dashboard(outputs)
     eligibility_df = build_model_eligibility_gate(outputs, feature_audit_df)
+    eligibility_df = enforce_hard_feature_contract_gate(eligibility_df, feature_audit_df)
     fva_df = build_forecast_value_add(outputs, freq_alias)
     quantile_tables: Dict[str, pd.DataFrame] = {}
     service_tables: Dict[str, pd.DataFrame] = {}
+    full_robt = outputs.get("rolling_origin_backtest", pd.DataFrame())
     for model_name, pred in (outputs.get("predictions") or {}).items():
         scale = estimate_model_interval_scale(outputs, model_name)
-        qdf = build_prediction_interval_table(outputs["test"], pred, scale)
+        qdf = build_calibrated_prediction_interval_table(outputs["test"], pred, model_name, full_robt, fallback_scale=scale)
         quantile_tables[model_name] = qdf
         service_tables[model_name] = build_service_level_simulation(outputs["test"], pred, qdf)
     metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
+    robt_summary = summarize_full_backtest(full_robt)
     ranked = metrics_df.copy()
+    if len(robt_summary):
+        ranked = ranked.merge(robt_summary[["model", "WAPE", "MAE"]].rename(columns={"WAPE": "ro_WAPE", "MAE": "ro_MAE"}), on="model", how="left")
     ranked = ranked.merge(eligibility_df[["model", "status", "eligibility_score"]], on="model", how="left")
+    bias_small = bias_df[["model", "bias_pct", "under_forecast_rate"]] if len(bias_df) else pd.DataFrame(columns=["model", "bias_pct", "under_forecast_rate"])
+    peak_small = peak_df[["model", "peak_event_score"]] if len(peak_df) else pd.DataFrame(columns=["model", "peak_event_score"])
+    ranked = ranked.merge(bias_small, on="model", how="left").merge(peak_small, on="model", how="left")
+    service_rows = []
+    for model_name, sdf in service_tables.items():
+        if isinstance(sdf, pd.DataFrame) and len(sdf):
+            top = sdf.loc[sdf["service_level_target"] == sdf["service_level_target"].max()].head(1)
+            if len(top):
+                tgt = float(pd.to_numeric(top.iloc[0].get("service_level_target", np.nan), errors="coerce"))
+                ach = float(pd.to_numeric(top.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce"))
+                service_rows.append({"model": model_name, "service_level_target": tgt, "achieved_cycle_service": ach, "service_gap": max(tgt - ach, 0.0) if pd.notna(tgt) and pd.notna(ach) else np.nan})
+    service_df = pd.DataFrame(service_rows)
+    if len(service_df):
+        ranked = ranked.merge(service_df[["model", "service_gap", "achieved_cycle_service"]], on="model", how="left")
     status_rank = {"eligible": 0, "challenger_only": 1, "reject": 2}
     ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
-    ranked = ranked.sort_values(["status_rank", "WAPE", "sMAPE", "eligibility_score"], ascending=[True, True, True, False], na_position="last").reset_index(drop=True)
+    ranked["bias_penalty"] = pd.to_numeric(ranked.get("bias_pct"), errors="coerce").fillna(0.0).abs()
+    ranked["under_penalty"] = (pd.to_numeric(ranked.get("under_forecast_rate"), errors="coerce").fillna(0.0) - 0.50).clip(lower=0.0)
+    ranked["peak_penalty"] = (0.45 - pd.to_numeric(ranked.get("peak_event_score"), errors="coerce").fillna(0.0)).clip(lower=0.0)
+    ranked["service_penalty"] = pd.to_numeric(ranked.get("service_gap"), errors="coerce").fillna(0.0)
+    ranked["ro_WAPE_norm"] = pd.to_numeric(ranked.get("ro_WAPE"), errors="coerce")
+    ranked["hold_WAPE_norm"] = pd.to_numeric(ranked.get("WAPE"), errors="coerce")
+    regime = infer_runtime_regime_from_profile(profile=outputs.get("metadata", {}).get("profile", {}) or {}, y_train=np.asarray(outputs.get("train", pd.DataFrame()).get("y", pd.Series(dtype=float)), dtype=float) if isinstance(outputs.get("train"), pd.DataFrame) and "y" in outputs.get("train", pd.DataFrame()).columns else None)
+    ranked["bağlamsal_ceza"] = 0.0
+    if not regime.get("intermittent_like", False):
+        ranked.loc[ranked["model"].eq("Intermittent"), "bağlamsal_ceza"] += 2.5
+    if not regime.get("seasonal_like", False):
+        ranked.loc[ranked["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.1
+    ranked["operasyonel_skor"] = (
+        ranked["status_rank"].fillna(9.0) * 1000.0
+        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.78
+        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.10
+        + ranked["service_penalty"].fillna(0.0) * 22.0
+        + ranked["under_penalty"].fillna(0.0) * 14.5
+        + ranked["bias_penalty"].fillna(0.0) * 1.45
+        + ranked["peak_penalty"].fillna(0.0) * 12.5
+        + ranked["bağlamsal_ceza"].fillna(0.0) * 9.5
+        - pd.to_numeric(ranked.get("eligibility_score"), errors="coerce").fillna(0.0) * 0.03
+    )
+    sort_cols = ["operasyonel_skor", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
+    asc = [True, True, True, True, True, True, True, False]
+    ranked = ranked.sort_values(sort_cols, ascending=asc, na_position="last").reset_index(drop=True)
     production_model = ranked.iloc[0]["model"] if len(ranked) else outputs.get("best_model")
     production_status = ranked.iloc[0]["status"] if len(ranked) else "eligible"
     if production_status == "reject":
-        production_model = "SARIMA/SARIMAX" if "SARIMA/SARIMAX" in outputs.get("predictions", {}) else outputs.get("best_model")
+        preferred = ["ARIMA", "SARIMA/SARIMAX", outputs.get("best_model")]
+        for cand in preferred:
+            if cand in set(outputs.get("predictions", {}).keys()):
+                production_model = cand
+                break
         production_status = "guarded_fallback"
     production_interval = quantile_tables.get(production_model, pd.DataFrame())
     production_service = service_tables.get(production_model, pd.DataFrame())
-    return {
-        "feature_availability_audit": feature_audit_df,
-        "bias_dashboard": bias_df,
-        "peak_event_dashboard": peak_df,
-        "forecast_value_add": fva_df,
-        "model_eligibility_gate": eligibility_df,
-        "quantile_forecasts": quantile_tables,
-        "service_level_simulation": service_tables,
-        "production_model": production_model,
-        "production_status": production_status,
-        "production_interval_table": production_interval,
-        "production_service_table": production_service,
-    }
-
+    pack = {"feature_availability_audit": feature_audit_df, "bias_dashboard": bias_df, "peak_event_dashboard": peak_df, "forecast_value_add": fva_df, "model_eligibility_gate": eligibility_df, "quantile_forecasts": quantile_tables, "service_level_simulation": service_tables, "production_model": production_model, "production_status": production_status, "production_interval_table": production_interval, "production_service_table": production_service, "rolling_origin_summary": robt_summary, "production_ranking": ranked, "production_decision_explanation": build_production_decision_explanation(ranked, production_model)}
+    pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, pack)
+    return pack
 
 
 
