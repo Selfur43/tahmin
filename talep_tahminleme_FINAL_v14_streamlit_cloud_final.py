@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "2.5.0"
 
 
 
@@ -4832,11 +4832,6 @@ class ForecastRuntimeConfig:
     search_accelerator_result_cache_enabled: bool = True
     search_accelerator_max_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
     search_accelerator_candidate_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
-    batch_max_workers: int = field(default_factory=lambda: max(1, min(2, os.cpu_count() or 2)))
-    batch_wall_seconds: float = 1740.0
-    batch_inner_model_workers: int = 2
-    batch_inner_candidate_workers: int = 2
-    batch_force_xgb_single_thread: bool = True
     xgb_param_grid: Tuple[Dict[str, Any], ...] = field(default_factory=lambda: (
         {
             "max_depth": 2,
@@ -5538,13 +5533,13 @@ def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[p
     season_len = infer_season_length_from_freq(freq_alias)
     lag_set = [1, 2, 3, 6, 12]
     if freq_alias == "W":
-        lag_set = [1, 2, 4, 8, 13, 26, 39, 52]
+        lag_set = [1, 2, 4, 8, 13, 26, 52]
     elif freq_alias == "D":
-        lag_set = [1, 2, 3, 7, 14, 21, 28, 56]
+        lag_set = [1, 2, 3, 7, 14, 21, 28]
     elif freq_alias == "M":
         lag_set = [1, 2, 3, 6, 12, 18, 24]
     elif freq_alias == "H":
-        lag_set = [1, 2, 3, 6, 12, 24, 48, 72]
+        lag_set = [1, 2, 3, 6, 12, 24, 48]
 
     for lag in sorted(set(lag_set)):
         df[f"lag_{lag}"] = df["y"].shift(lag)
@@ -5554,20 +5549,14 @@ def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[p
 
     df["diff_1"] = df["y"].diff(1)
 
-    shifted = df["y"].shift(1)
     for w in sorted(set([3, 6, 12, max(2, season_len)])):
+        shifted = df["y"].shift(1)
         df[f"roll_mean_{w}"] = shifted.rolling(w, min_periods=1).mean()
         df[f"roll_std_{w}"] = shifted.rolling(w, min_periods=1).std()
         df[f"roll_min_{w}"] = shifted.rolling(w, min_periods=1).min()
         df[f"roll_max_{w}"] = shifted.rolling(w, min_periods=1).max()
         df[f"roll_median_{w}"] = shifted.rolling(w, min_periods=1).median()
         df[f"ewm_mean_{w}"] = shifted.ewm(span=max(2, w), adjust=False).mean()
-    if freq_alias == "W":
-        for w in [4, 8, 13, 26, 52]:
-            s = shifted.rolling(w, min_periods=max(2, min(4, w))).mean()
-            df[f"recent_mean_gap_{w}"] = shifted - s
-            df[f"recent_z_{w}"] = (shifted - s) / (shifted.rolling(w, min_periods=max(2, min(4, w))).std().replace(0, np.nan))
-            df[f"trend_slope_{w}"] = shifted.diff().rolling(w, min_periods=max(2, min(4, w))).mean()
 
     ds = pd.to_datetime(df["ds"])
     df["year"] = ds.dt.year
@@ -5591,51 +5580,6 @@ def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[p
         dow = ds.dt.dayofweek.astype(int)
         df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
         df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
-
-    # Türkiye tatil ve özel dönem yakınlığı özellikleri
-    try:
-        years = sorted(set(ds.dt.year.dropna().astype(int).tolist()))
-        holiday_dates = []
-        if years:
-            import holidays as _holidays
-            tr_holidays = _holidays.country_holidays("TR", years=years)
-            holiday_dates = sorted(pd.to_datetime(list(tr_holidays.keys())))
-        if holiday_dates:
-            holiday_arr = np.array([pd.Timestamp(x).to_datetime64() for x in holiday_dates], dtype='datetime64[ns]')
-            current_arr = ds.values.astype('datetime64[ns]')
-            prev_gap = []
-            next_gap = []
-            for cur in current_arr:
-                diffs = (holiday_arr - cur).astype('timedelta64[D]').astype(int)
-                pos = diffs[diffs >= 0]
-                neg = (-diffs[diffs <= 0])
-                next_gap.append(int(pos.min()) if len(pos) else 999)
-                prev_gap.append(int(neg.min()) if len(neg) else 999)
-            df["tatil_yakınlık_sonraki"] = pd.Series(next_gap).clip(upper=60)
-            df["tatil_yakınlık_onceki"] = pd.Series(prev_gap).clip(upper=60)
-            df["tatil_yakınlık_min"] = np.minimum(df["tatil_yakınlık_sonraki"], df["tatil_yakınlık_onceki"])
-            df["tatil_yakın_flag_7"] = (df["tatil_yakınlık_min"] <= 7).astype(int)
-            df["tatil_yakın_flag_14"] = (df["tatil_yakınlık_min"] <= 14).astype(int)
-        else:
-            for c in ["tatil_yakınlık_sonraki", "tatil_yakınlık_onceki", "tatil_yakınlık_min", "tatil_yakın_flag_7", "tatil_yakın_flag_14"]:
-                df[c] = 0
-    except Exception:
-        for c in ["tatil_yakınlık_sonraki", "tatil_yakınlık_onceki", "tatil_yakınlık_min", "tatil_yakın_flag_7", "tatil_yakın_flag_14"]:
-            df[c] = 0
-
-    # Takvimsel özel olay yakınlığı (yılbaşı / ramazan-kurban etkisine yaklaşık vekil pencereler)
-    try:
-        month_day = ds.dt.strftime('%m-%d')
-        yilbasi = (month_day >= '12-20') | (month_day <= '01-10')
-        okul_acilis = (ds.dt.month == 9).astype(int)
-        yilsonu = (ds.dt.month == 12).astype(int)
-        df["ozel_olay_yılbaşı_penceresi"] = yilbasi.astype(int)
-        df["ozel_olay_okul_açılışı"] = okul_acilis
-        df["ozel_olay_yılsonu"] = yilsonu
-        df["ozel_olay_toplam_flag"] = (df[["ozel_olay_yılbaşı_penceresi", "ozel_olay_okul_açılışı", "ozel_olay_yılsonu"]].sum(axis=1) > 0).astype(int)
-    except Exception:
-        for c in ["ozel_olay_yılbaşı_penceresi", "ozel_olay_okul_açılışı", "ozel_olay_yılsonu", "ozel_olay_toplam_flag"]:
-            df[c] = 0
 
     if existing_exog is not None and len(existing_exog.columns) > 0:
         exog = existing_exog.copy().reset_index(drop=True)
@@ -7035,14 +6979,6 @@ def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: 
 def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if not HAS_PROPHET:
         return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason="prophet_package_missing")
-    if str(freq_alias).upper() == "W":
-        seasonality_strength = safe_float((profile or {}).get("seasonality_strength", np.nan))
-        trend_strength = safe_float((profile or {}).get("trend_strength", np.nan))
-        if len(train_df) < 104 or (pd.notna(seasonality_strength) and seasonality_strength < 0.12 and pd.notna(trend_strength) and trend_strength < 0.08):
-            result = fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason="weekly_prophet_hard_disable")
-            result["fit_mode"] = "haftalıkta_prophet_kapatıldı"
-            result["fit_visibility_note"] = "Haftalık frekansta kısa/zayıf sinyalli seri için Prophet otomatik kapatıldı; güvenli vekil model kullanıldı."
-            return result
     cache_key = build_search_signature("prophet_exact_search", freq_alias, train_df, test_df, profile=profile, exog_train=exog_train, exog_test=exog_test, extra={"max_configs": FORECAST_RUNTIME_CONFIG.prophet_max_configs})
     cached = SEARCH_ACCELERATOR.get_result(cache_key)
     if cached is not None:
@@ -7489,15 +7425,10 @@ def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Op
     regime = infer_runtime_regime_from_profile(profile=profile)
     out = validation_df.copy()
     out["bağlamsal_ceza"] = 0.0
-    freq_alias = str(profile.get("freq_alias", "")).upper() if isinstance(profile, dict) else ""
     if not regime.get("intermittent_like", False):
-        out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 7.50
-        if freq_alias in ["W", "D", "H"]:
-            out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 1.25
+        out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 4.50
     if not regime.get("seasonal_like", False):
-        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.75
-    if freq_alias == "W":
-        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 0.85
+        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.25
     if regime.get("volatile_like", False):
         out.loc[out["model"].eq("ARIMA"), "bağlamsal_ceza"] += 0.20
         out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] += 0.10
@@ -7519,15 +7450,15 @@ def build_weighted_ensemble(
     profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     """
-    Gerçek rolling-aware + bias-aware + peak-aware + regime-aware ansambl.
-    Haftalık veri için recent-local ve horizon-specific kaliteyi daha güçlü kullanır.
+    Peak-aware + bias-aware + regime-aware ansambl.
+    Validation, holdout ve rolling-origin birlikte kullanılır.
+    İntermittent model, seri gerçekten intermittent değilse baskın gelemez.
     """
     if not pred_map:
         raise ValueError("Ansambl için model bulunamadı.")
 
     profile = profile or {}
     regime = infer_runtime_regime_from_profile(profile=profile, y_train=y_train)
-    freq_alias = str(profile.get("freq_alias", "")).upper() if isinstance(profile, dict) else ""
 
     use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
     if len(use_df) == 0:
@@ -7555,32 +7486,18 @@ def build_weighted_ensemble(
     if "ro_MAE" not in use_df.columns:
         use_df["ro_MAE"] = np.nan
 
-    recent_rows = []
     peak_rows = []
     if y_train is not None and y_true is not None:
-        y_true_arr = np.asarray(y_true, dtype=float)
         for model_name, pred in pred_map.items():
-            pred_arr = np.asarray(pred, dtype=float)
             try:
-                peak = compute_peak_event_score(np.asarray(y_train, dtype=float), y_true_arr, pred_arr)
+                peak = compute_peak_event_score(np.asarray(y_train, dtype=float), np.asarray(y_true, dtype=float), np.asarray(pred, dtype=float))
                 peak_rows.append({"model": model_name, "peak_event_score": safe_float(peak.get("peak_event_score", np.nan))})
             except Exception:
                 peak_rows.append({"model": model_name, "peak_event_score": np.nan})
-            try:
-                ape = np.abs(y_true_arr - pred_arr) / np.where(np.abs(y_true_arr) > 1e-8, np.abs(y_true_arr), np.nan)
-                recent_window = min(4 if freq_alias == "W" else 3, len(ape))
-                horizon_w = np.linspace(1.0, 1.6 if freq_alias == "W" else 1.35, len(ape))
-                recent_local_wape = np.nanmean(ape[-recent_window:]) * 100.0 if recent_window > 0 else np.nan
-                horizon_specific_wape = np.nansum(ape * horizon_w) / np.nansum(np.isfinite(ape) * horizon_w) * 100.0 if len(ape) else np.nan
-                recent_rows.append({"model": model_name, "recent_local_WAPE": safe_float(recent_local_wape), "horizon_specific_WAPE": safe_float(horizon_specific_wape)})
-            except Exception:
-                recent_rows.append({"model": model_name, "recent_local_WAPE": np.nan, "horizon_specific_WAPE": np.nan})
     if peak_rows:
         use_df = use_df.merge(pd.DataFrame(peak_rows), on="model", how="left")
-    if recent_rows:
-        use_df = use_df.merge(pd.DataFrame(recent_rows), on="model", how="left")
 
-    for c in ["BiasPct", "UnderForecastRate", "peak_event_score", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "recent_local_WAPE", "horizon_specific_WAPE"]:
+    for c in ["BiasPct", "UnderForecastRate", "peak_event_score", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE"]:
         if c in use_df.columns:
             use_df[c] = pd.to_numeric(use_df[c], errors="coerce")
         else:
@@ -7598,41 +7515,29 @@ def build_weighted_ensemble(
     use_df["hold_norm"] = _min_norm(use_df["WAPE"])
     use_df["val_norm"] = _min_norm(use_df["val_WAPE"].fillna(use_df["WAPE"]))
     use_df["ro_norm"] = _min_norm(use_df["ro_WAPE"].fillna(use_df["WAPE"]))
-    use_df["recent_norm"] = _min_norm(use_df["recent_local_WAPE"].fillna(use_df["WAPE"]))
-    use_df["horizon_norm"] = _min_norm(use_df["horizon_specific_WAPE"].fillna(use_df["WAPE"]))
     use_df["bias_pen"] = use_df["BiasPct"].abs().fillna(0.0).clip(upper=18.0) / 18.0
     use_df["under_pen"] = (use_df["UnderForecastRate"].fillna(0.5) - 0.52).clip(lower=0.0, upper=0.40) / 0.40
-    use_df["peak_pen"] = (0.74 - use_df["peak_event_score"].fillna(0.0)).clip(lower=0.0, upper=0.74) / 0.74
+    use_df["peak_pen"] = (0.72 - use_df["peak_event_score"].fillna(0.0)).clip(lower=0.0, upper=0.72) / 0.72
     use_df["regime_pen"] = 0.0
     if not regime.get("intermittent_like", False):
-        use_df.loc[use_df["model"].eq("Intermittent"), "regime_pen"] += 0.55
+        use_df.loc[use_df["model"].eq("Intermittent"), "regime_pen"] += 0.35
     if not regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.25
-    if freq_alias == "W":
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.25
+        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.18
     if regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_pen"] -= 0.08
+        use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_pen"] -= 0.05
     if regime.get("volatile_like", False):
-        use_df.loc[use_df["model"].eq("XGBoost"), "regime_pen"] -= 0.05
-
-    # Haftalıkta rolling ve lokal yakın geçmişe daha fazla ağırlık ver
-    if freq_alias == "W":
-        hold_w, val_w, ro_w, recent_w, horiz_w = 0.18, 0.18, 0.26, 0.16, 0.12
-    else:
-        hold_w, val_w, ro_w, recent_w, horiz_w = 0.26, 0.23, 0.24, 0.10, 0.06
+        use_df.loc[use_df["model"].eq("XGBoost"), "regime_pen"] -= 0.04
 
     use_df["birleşik_skor"] = (
-        use_df["hold_norm"].fillna(1.0) * hold_w
-        + use_df["val_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * val_w
-        + use_df["ro_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * ro_w
-        + use_df["recent_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * recent_w
-        + use_df["horizon_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * horiz_w
-        + use_df["peak_pen"].fillna(0.0) * 0.08
+        use_df["hold_norm"].fillna(1.0) * 0.28
+        + use_df["val_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * 0.26
+        + use_df["ro_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * 0.30
+        + use_df["peak_pen"].fillna(0.0) * 0.09
         + use_df["bias_pen"].fillna(0.0) * 0.04
-        + use_df["under_pen"].fillna(0.0) * 0.03
-        + use_df["regime_pen"].fillna(0.0) * 0.10
+        + use_df["under_pen"].fillna(0.0) * 0.02
+        + use_df["regime_pen"].fillna(0.0) * 0.08
     )
-    use_df = use_df.sort_values(["birleşik_skor", "ro_WAPE", "recent_local_WAPE", "WAPE", "val_WAPE"], ascending=[True, True, True, True, True], na_position="last").reset_index(drop=True)
+    use_df = use_df.sort_values(["birleşik_skor", "ro_WAPE", "WAPE", "val_WAPE"], ascending=[True, True, True, True], na_position="last").reset_index(drop=True)
     best_score = float(pd.to_numeric(use_df.iloc[0].get("birleşik_skor", np.nan), errors="coerce")) if len(use_df) else 1.0
     if not np.isfinite(best_score):
         best_score = 1.0
@@ -7640,35 +7545,31 @@ def build_weighted_ensemble(
     pruned = use_df.copy()
     if len(pruned) > 4:
         pruned = pruned.head(4).copy()
-    # Haftalıkta Prophet fallback/uygun olmayan durumlarda erken ele
-    if "Prophet" in pruned["model"].tolist() and freq_alias == "W":
+    if "Prophet" in pruned["model"].tolist():
         prow = pruned.loc[pruned["model"].eq("Prophet")].head(1)
         if len(prow):
             ps = float(pd.to_numeric(prow.iloc[0].get("birleşik_skor", np.nan), errors="coerce"))
-            if pd.notna(ps) and ps > best_score + 0.05 and len(pruned) > 2:
+            if pd.notna(ps) and ps > best_score + 0.12 and len(pruned) > 2:
                 pruned = pruned.loc[~pruned["model"].eq("Prophet")].copy()
 
-    raw = np.exp(-5.5 * (pruned["birleşik_skor"].fillna(1.0) - best_score).clip(lower=0.0))
-    peak_bonus = 0.70 + 0.60 * pruned["peak_event_score"].fillna(0.5).clip(lower=0.0, upper=1.0)
-    bias_factor = np.exp(-0.040 * pruned["BiasPct"].abs().fillna(0.0).clip(upper=18.0))
-    under_factor = np.exp(-2.4 * (pruned["UnderForecastRate"].fillna(0.5) - 0.52).clip(lower=0.0, upper=0.40))
-    regime_factor = np.exp(-2.0 * pruned["regime_pen"].fillna(0.0).clip(lower=0.0, upper=0.80))
-    recent_factor = np.exp(-1.1 * pruned["recent_norm"].fillna(0.5).clip(lower=0.0, upper=1.0))
-    horizon_factor = np.exp(-0.9 * pruned["horizon_norm"].fillna(0.5).clip(lower=0.0, upper=1.0))
-    pruned["HamAğırlık"] = raw
-    pruned["raw_weight"] = raw * peak_bonus * bias_factor * under_factor * regime_factor * recent_factor * horizon_factor
+    raw = np.exp(-4.5 * (pruned["birleşik_skor"].fillna(1.0) - best_score).clip(lower=0.0))
+    peak_bonus = 0.75 + 0.50 * pruned["peak_event_score"].fillna(0.5).clip(lower=0.0, upper=1.0)
+    bias_factor = np.exp(-0.035 * pruned["BiasPct"].abs().fillna(0.0).clip(upper=18.0))
+    under_factor = np.exp(-2.0 * (pruned["UnderForecastRate"].fillna(0.5) - 0.52).clip(lower=0.0, upper=0.40))
+    regime_factor = np.exp(-1.8 * pruned["regime_pen"].fillna(0.0).clip(lower=0.0, upper=0.60))
+    pruned["ham_ağırlık"] = raw
+    pruned["raw_weight"] = raw * peak_bonus * bias_factor * under_factor * regime_factor
     if not regime.get("intermittent_like", False) and "Intermittent" in pruned["model"].tolist():
         idx = pruned.index[pruned["model"].eq("Intermittent")]
-        pruned.loc[idx, "raw_weight"] = np.minimum(pruned.loc[idx, "raw_weight"].astype(float), 0.10 if freq_alias == "W" else 0.15)
-    pruned = pruned.sort_values(["birleşik_skor", "ro_WAPE", "recent_local_WAPE", "WAPE"], ascending=[True, True, True, True], na_position="last").reset_index(drop=True)
+        pruned.loc[idx, "raw_weight"] = np.minimum(pruned.loc[idx, "raw_weight"].astype(float), 0.18)
+    pruned = pruned.sort_values(["birleşik_skor", "ro_WAPE", "WAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
     w = pruned["raw_weight"].astype(float).values
     if not np.isfinite(w).all() or np.sum(w) <= 0:
         w = np.ones(len(pruned), dtype=float)
     w = w / np.sum(w)
-    if len(w) >= 2 and w[0] < (0.55 if freq_alias == "W" else 0.50):
-        target_top = 0.55 if freq_alias == "W" else 0.50
-        deficit = target_top - w[0]
-        w[0] = target_top
+    if len(w) >= 2 and w[0] < 0.52:
+        deficit = 0.52 - w[0]
+        w[0] = 0.52
         rest = w[1:]
         if rest.sum() > 0:
             rest = rest / rest.sum()
@@ -7679,7 +7580,7 @@ def build_weighted_ensemble(
     for _, row in pruned.iterrows():
         pred = np.asarray(pred_map[row["model"]], dtype=float)
         ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
-    out_cols = [c for c in ["model", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "recent_local_WAPE", "horizon_specific_WAPE", "BiasPct", "UnderForecastRate", "peak_event_score", "regime_pen", "birleşik_skor", "HamAğırlık", "raw_weight", "weight"] if c in pruned.columns]
+    out_cols = [c for c in ["model", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "BiasPct", "UnderForecastRate", "peak_event_score", "regime_pen", "birleşik_skor", "ham_ağırlık", "raw_weight", "weight"] if c in pruned.columns]
     return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[out_cols]
 
 def build_model_level_fallback(model_name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, error_message: str) -> Dict[str, Any]:
@@ -8179,162 +8080,34 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     SEARCH_ACCELERATOR.put_result(pipeline_key, outputs)
     return copy.deepcopy(outputs)
 
-def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True, progress_callback=None) -> Dict[str, Any]:
-    targets = list(export_payload["series_profile_report"]["series"].dropna().astype(str).tolist())
-    if not targets:
-        return {
-            "best_summary": pd.DataFrame(),
-            "champion_table": pd.DataFrame(),
-            "batch_outputs": {},
-            "batch_runtime": pd.DataFrame()
-        }
-
-    def _emit_progress(done_count: int, total_count: int, message: str) -> None:
-        if progress_callback is None:
-            return
-        try:
-            progress_callback(done_count / max(total_count, 1), message)
-        except Exception:
-            pass
-
-    def _build_rows_from_output(target_name: str, out: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        mdf = (out.get("metrics_df") or pd.DataFrame()).copy()
-        if len(mdf) == 0:
-            best_row = {"model": "NO_RESULT", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan}
-        else:
-            best_row = mdf.iloc[0].to_dict()
-        best_row["target_col"] = target_name
-        best_row["segment"] = out.get("metadata", {}).get("segment")
-        best_row["abc_xyz"] = out.get("metadata", {}).get("abc_xyz")
-        best_row["best_model"] = out.get("best_model")
-        best_row["production_model"] = out.get("production_model")
-        best_row["production_status"] = out.get("production_status")
-        champion_row = {
-            "target_col": target_name,
-            "champion": out.get("champion_challenger", {}).get("champion"),
-            "challenger": out.get("champion_challenger", {}).get("challenger"),
-            "production_model": out.get("production_model"),
-            "production_status": out.get("production_status"),
-            "segment": out.get("metadata", {}).get("segment"),
-            "abc_xyz": out.get("metadata", {}).get("abc_xyz")
-        }
-        return best_row, champion_row
-
-    rows: List[Dict[str, Any]] = []
-    champion_rows: List[Dict[str, Any]] = []
-    batch_outputs: Dict[str, Any] = {}
-    runtime_rows: List[Dict[str, Any]] = []
-    completed: Dict[str, Any] = {}
-
-    cpu_count = max(1, int(os.cpu_count() or 1))
-    outer_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "batch_max_workers", 2)), len(targets)))
-    if cpu_count <= 2:
-        outer_workers = 1
-    elif len(targets) >= 4:
-        outer_workers = min(outer_workers, 2)
-
-    batch_started = time.perf_counter()
-    runtime_backup = {
-        "search_accelerator_max_workers": FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers,
-        "search_accelerator_candidate_workers": FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers,
-        "xgb_force_single_thread": FORECAST_RUNTIME_CONFIG.xgb_force_single_thread,
-        "sa_max_workers": SEARCH_ACCELERATOR.config.max_workers,
-        "sa_candidate_workers": SEARCH_ACCELERATOR.config.candidate_workers,
-    }
-
-    inner_model_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "batch_inner_model_workers", 2)), cpu_count))
-    inner_candidate_workers = max(1, min(int(getattr(FORECAST_RUNTIME_CONFIG, "batch_inner_candidate_workers", 2)), cpu_count))
-
-    # Batch modunda seri düzeyinde paralellik kullanılır; her seri içindeki paralellik kontrollü tutulur.
-    FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = inner_model_workers
-    FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = inner_candidate_workers
-    FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = bool(getattr(FORECAST_RUNTIME_CONFIG, "batch_force_xgb_single_thread", True))
-    SEARCH_ACCELERATOR.config.max_workers = inner_model_workers
-    SEARCH_ACCELERATOR.config.candidate_workers = inner_candidate_workers
-
-    _emit_progress(0, len(targets), f"Batch forecasting başlatıldı • 0/{len(targets)} seri tamamlandı")
-
-    try:
-        def _run_one(target_name: str) -> Dict[str, Any]:
-            started = time.perf_counter()
-            out = run_full_forecasting_pipeline(export_payload, target_name, horizon, use_exog_for_stat_models, use_exog_for_prophet)
-            elapsed = time.perf_counter() - started
-            return {"target": target_name, "output": out, "elapsed_seconds": elapsed, "error": None}
-
-        if outer_workers <= 1 or len(targets) == 1:
-            for idx, target in enumerate(targets, start=1):
-                try:
-                    result_block = _run_one(target)
-                except Exception as e:
-                    result_block = {"target": target, "output": None, "elapsed_seconds": np.nan, "error": str(e)}
-                completed[target] = result_block
-                _emit_progress(idx, len(targets), f"{idx}/{len(targets)} seri tamamlandı • {target}")
-        else:
-            with ThreadPoolExecutor(max_workers=outer_workers, thread_name_prefix="batch-forecast") as ex:
-                future_map = {
-                    ex.submit(_run_one, target): target
-                    for target in targets
-                }
-                done_count = 0
-                for fut in as_completed(future_map):
-                    target = future_map[fut]
-                    try:
-                        result_block = fut.result()
-                    except Exception as e:
-                        result_block = {"target": target, "output": None, "elapsed_seconds": np.nan, "error": str(e)}
-                    completed[target] = result_block
-                    done_count += 1
-                    _emit_progress(done_count, len(targets), f"{done_count}/{len(targets)} seri tamamlandı • {target}")
-    finally:
-        FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = runtime_backup["search_accelerator_max_workers"]
-        FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = runtime_backup["search_accelerator_candidate_workers"]
-        FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = runtime_backup["xgb_force_single_thread"]
-        SEARCH_ACCELERATOR.config.max_workers = runtime_backup["sa_max_workers"]
-        SEARCH_ACCELERATOR.config.candidate_workers = runtime_backup["sa_candidate_workers"]
-
+def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
+    targets = export_payload["series_profile_report"]["series"].tolist()
+    rows = []
+    champion_rows = []
+    batch_outputs = {}
     for target in targets:
-        block = completed.get(target, {"target": target, "output": None, "elapsed_seconds": np.nan, "error": "Bilinmeyen batch hatası"})
-        runtime_rows.append({
-            "target_col": target,
-            "elapsed_seconds": safe_float(block.get("elapsed_seconds", np.nan)),
-            "status": "ok" if not block.get("error") else "error",
-            "error": block.get("error")
-        })
-        if block.get("error") or block.get("output") is None:
-            rows.append({
+        try:
+            out = run_full_forecasting_pipeline(export_payload, target, horizon, use_exog_for_stat_models, use_exog_for_prophet)
+            batch_outputs[target] = out
+            mdf = out["metrics_df"].copy()
+            best_row = mdf.iloc[0].to_dict()
+            best_row["target_col"] = target
+            best_row["segment"] = out["metadata"]["segment"]
+            best_row["abc_xyz"] = out["metadata"]["abc_xyz"]
+            rows.append(best_row)
+            champion_rows.append({
                 "target_col": target,
-                "model": "ERROR",
-                "MAE": np.nan,
-                "RMSE": np.nan,
-                "MAPE": np.nan,
-                "sMAPE": np.nan,
-                "WAPE": np.nan,
-                "MASE": np.nan,
-                "error": str(block.get("error"))
+                "champion": out["champion_challenger"]["champion"],
+                "challenger": out["champion_challenger"]["challenger"],
+                "segment": out["metadata"]["segment"],
+                "abc_xyz": out["metadata"]["abc_xyz"]
             })
-            continue
-
-        out = block["output"]
-        batch_outputs[target] = out
-        best_row, champion_row = _build_rows_from_output(target, out)
-        rows.append(best_row)
-        champion_rows.append(champion_row)
-
-    total_elapsed = time.perf_counter() - batch_started
-    runtime_rows.append({
-        "target_col": "__BATCH_TOTAL__",
-        "elapsed_seconds": total_elapsed,
-        "status": "ok",
-        "error": None
-    })
-
-    _emit_progress(len(targets), len(targets), f"Batch forecasting tamamlandı • {len(targets)}/{len(targets)} seri işlendi • {total_elapsed:.1f} sn")
-
+        except Exception as e:
+            rows.append({"target_col": target, "model": "ERROR", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan, "error": str(e)})
     return {
         "best_summary": pd.DataFrame(rows),
         "champion_table": pd.DataFrame(champion_rows),
-        "batch_outputs": batch_outputs,
-        "batch_runtime": pd.DataFrame(runtime_rows)
+        "batch_outputs": batch_outputs
     }
 
 
@@ -8683,7 +8456,7 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
     alerts = []
     train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
     prod_pred = np.asarray((outputs.get("predictions") or {}).get(prod_model, np.array([])), dtype=float)
-    recent_mean = float(train_y.tail(min(12, len(train_y))).mean()) if len(train_y) else np.nan
+    recent_mean = float(train_y.tail(min(6, len(train_y))).mean()) if len(train_y) else np.nan
     drift_ratio = float(np.mean(prod_pred) / max(recent_mean, 1e-6)) if len(prod_pred) and pd.notna(recent_mean) else np.nan
     bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
     peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
@@ -8692,9 +8465,7 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
     service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) else pd.DataFrame()
     achieved_service = float(pd.to_numeric(service_row.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce")) if len(service_row) else np.nan
     target_service = float(pd.to_numeric(service_row.iloc[0].get("service_level_target", np.nan), errors="coerce")) if len(service_row) else np.nan
-    freq_alias = str(outputs.get("metadata", {}).get("freq_alias", "")).upper()
     summary_row = {
-        "frekans": freq_alias,
         "üretim_modeli": prod_model,
         "üretim_durumu": production_pack.get("production_status", "eligible"),
         "sapma_yüzde": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
@@ -8734,18 +8505,8 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
     summary["yüksek_alarm_sayısı"] = sum(1 for a in alerts if a["severity"] == "high")
     summary["canlı_kullanım_önerisi"] = recommendation
     summary["karar_açıklaması"] = build_production_decision_explanation(production_pack.get("production_ranking", pd.DataFrame()), prod_model)
-    summary["karar_kartı"] = summary.apply(lambda r: f"Frekans: {r.get('frekans', "?")} | Model: {r['üretim_modeli']} | Sapma: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f} | Fallback: {safe_float(r.get('fallback_oranı', np.nan)):.2f} | Drift: {safe_float(r.get('drift_oranı', np.nan)):.2f} | Servis: {safe_float(r.get('gerçekleşen_servis', np.nan)):.2f}/{safe_float(r.get('hedef_servis', np.nan)):.2f} | Alarm: {int(r.get('alarm_sayısı', 0)) if pd.notna(r.get('alarm_sayısı', np.nan)) else 0}", axis=1)
-    karar_karti = pd.DataFrame([{
-        "Karar": ("Üretime uygun" if recommendation == "guardrailli_üretime_uygun" else "Ek izleme gerekli"),
-        "Frekans": freq_alias,
-        "ÜretimModeli": prod_model,
-        "SapmaYüzde": summary_row.get("sapma_yüzde"),
-        "Kapsama80": summary_row.get("kapsama_80"),
-        "FallbackOranı": summary_row.get("fallback_oranı"),
-        "DriftOranı": summary_row.get("drift_oranı"),
-        "ServisSeviyesi": summary_row.get("gerçekleşen_servis"),
-        "AlarmSayısı": len(alerts),
-    }])
+    summary["karar_kartı"] = summary.apply(lambda r: f"Model: {r['üretim_modeli']} | Sapma: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f} | Fallback: {safe_float(r.get('fallback_oranı', np.nan)):.2f} | Drift: {safe_float(r.get('drift_oranı', np.nan)):.2f} | Servis: {safe_float(r.get('gerçekleşen_servis', np.nan)):.2f}/{safe_float(r.get('hedef_servis', np.nan)):.2f} | Alarm: {int(r.get('alarm_sayısı', 0)) if pd.notna(r.get('alarm_sayısı', np.nan)) else 0}", axis=1)
+
     metric_df = outputs.get("metrics_df", pd.DataFrame())
     prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
     service_level_tables = production_pack.get("service_level_simulation", {}) or {}
@@ -8756,1111 +8517,260 @@ def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[st
         prow = peak_df.loc[peak_df["model"] == model_name].head(1) if len(peak_df) else pd.DataFrame()
         grow = gate_df.loc[gate_df["model"] == model_name].head(1) if len(gate_df) else pd.DataFrame()
         rrow = robt.loc[robt["model"] == model_name].head(1) if len(robt) else pd.DataFrame()
-        qrow = prediction_interval_tables.get(model_name, pd.DataFrame())
-        srow = service_level_tables.get(model_name, pd.DataFrame())
-        achieved = np.nan
-        if isinstance(srow, pd.DataFrame) and len(srow):
-            sr = srow.loc[srow["service_level_target"] == srow["service_level_target"].max()].head(1)
-            if len(sr):
-                achieved = float(pd.to_numeric(sr.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce"))
+        qtbl = prediction_interval_tables.get(model_name, pd.DataFrame())
+        stbl = service_level_tables.get(model_name, pd.DataFrame())
+        srow = stbl.loc[stbl["service_level_target"] == stbl["service_level_target"].max()].head(1) if isinstance(stbl, pd.DataFrame) and len(stbl) else pd.DataFrame()
         health_rows.append({
             "model": model_name,
-            "WAPE": float(pd.to_numeric(mrow.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(mrow) else np.nan,
-            "rolling_WAPE": float(pd.to_numeric(rrow.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(rrow) else np.nan,
-            "bias_pct": float(pd.to_numeric(brow.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(brow) else np.nan,
-            "under_forecast_rate": float(pd.to_numeric(brow.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(brow) else np.nan,
-            "peak_event_score": float(pd.to_numeric(prow.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(prow) else np.nan,
-            "coverage_80": float(qrow["coverage_80"].mean()) if isinstance(qrow, pd.DataFrame) and "coverage_80" in qrow.columns else np.nan,
-            "fallback_used": bool(fallback_flags.get(model_name, False)),
-            "service": achieved,
-            "status": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
+            "WAPE": safe_float(mrow.iloc[0].get("WAPE", np.nan)) if len(mrow) else np.nan,
+            "rolling_WAPE": safe_float(rrow.iloc[0].get("WAPE", np.nan)) if len(rrow) else np.nan,
+            "sapma_yüzde": safe_float(brow.iloc[0].get("bias_pct", np.nan)) if len(brow) else np.nan,
+            "eksik_tahmin_oranı": safe_float(brow.iloc[0].get("under_forecast_rate", np.nan)) if len(brow) else np.nan,
+            "tepe_olay_skoru": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
+            "uygunluk_skoru": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
+            "durum": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
+            "kapsama_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
+            "gerçekleşen_servis": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
+            "fallback_kullanıldı": bool(fallback_flags.get(model_name, False)),
+            "fallback_yöntemi": ((outputs.get(model_name.lower().replace("/", "_").replace("-", "_"), {}) or {}).get("fallback_method") if isinstance(outputs, dict) else None),
         })
-    return {"summary": summary, "alerts": pd.DataFrame(alerts), "model_health_table": pd.DataFrame(health_rows), "karar_karti": karar_karti}
+    model_health_table = pd.DataFrame(health_rows)
+    return {"summary": summary, "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"]), "model_health_table": model_health_table}
 
 
-
-# =========================
-# V29 OVERRIDES
-# =========================
-
-def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[pd.DataFrame], freq_alias: str) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    V29: Frekans farkındalıklı, daha zengin ML feature üretimi.
-    Eksiksiz başlıklar:
-    - holiday proximity
-    - special-event proximity
-    - moving min/max tam entegrasyonu
-    - haftalık için daha güçlü yerel rejim özellikleri
-    """
-    df = full_df[["ds", "y"]].copy().reset_index(drop=True)
-    ds = pd.to_datetime(df["ds"])
-    season_len = infer_season_length_from_freq(freq_alias)
-    fa = str(freq_alias).upper()
-
-    lag_set = [1, 2, 3, 6, 12]
-    if fa == "W":
-        lag_set = [1, 2, 3, 4, 8, 13, 26, 39, 52]
-    elif fa == "D":
-        lag_set = [1, 2, 3, 7, 14, 21, 28, 56]
-    elif fa == "M":
-        lag_set = [1, 2, 3, 6, 12, 18, 24]
-    elif fa == "H":
-        lag_set = [1, 2, 3, 6, 12, 24, 48, 72, 168]
-
-    for lag in sorted(set(lag_set)):
-        df[f"lag_{lag}"] = df["y"].shift(lag)
-
-    if season_len > 1:
-        df[f"seasonal_lag_{season_len}"] = df["y"].shift(season_len)
-        df[f"diff_{season_len}"] = df["y"].diff(season_len)
-        df[f"seasonal_ratio_{season_len}"] = df["y"].shift(1) / df[f"seasonal_lag_{season_len}"].replace(0, np.nan)
-
-    df["diff_1"] = df["y"].diff(1)
-    shifted = df["y"].shift(1)
-
-    roll_windows = sorted(set([2, 3, 4, 6, 8, 12, max(2, season_len)] + ([13, 26, 52] if fa == 'W' else [])))
-    for w in roll_windows:
-        minp = max(2, min(4, w))
-        df[f"roll_mean_{w}"] = shifted.rolling(w, min_periods=minp).mean()
-        df[f"roll_std_{w}"] = shifted.rolling(w, min_periods=minp).std()
-        df[f"roll_min_{w}"] = shifted.rolling(w, min_periods=minp).min()
-        df[f"roll_max_{w}"] = shifted.rolling(w, min_periods=minp).max()
-        df[f"roll_median_{w}"] = shifted.rolling(w, min_periods=minp).median()
-        df[f"roll_range_{w}"] = df[f"roll_max_{w}"] - df[f"roll_min_{w}"]
-        df[f"roll_minmax_pos_{w}"] = (shifted - df[f"roll_min_{w}"]) / df[f"roll_range_{w}"].replace(0, np.nan)
-        df[f"moving_min_{w}"] = df[f"roll_min_{w}"]
-        df[f"moving_max_{w}"] = df[f"roll_max_{w}"]
-        df[f"ewm_mean_{w}"] = shifted.ewm(span=max(2, w), adjust=False).mean()
-        df[f"ewm_std_{w}"] = shifted.ewm(span=max(2, w), adjust=False).std()
-        df[f"trend_slope_{w}"] = shifted.diff().rolling(w, min_periods=minp).mean()
-        df[f"volatility_ratio_{w}"] = df[f"roll_std_{w}"] / df[f"roll_mean_{w}"].abs().replace(0, np.nan)
-
-    if fa == 'W':
-        for w in [4, 8, 13, 26, 52]:
-            base = shifted.rolling(w, min_periods=max(2, min(4, w))).mean()
-            df[f"recent_mean_gap_{w}"] = shifted - base
-            df[f"recent_z_{w}"] = (shifted - base) / shifted.rolling(w, min_periods=max(2, min(4, w))).std().replace(0, np.nan)
-            df[f"momentum_{w}"] = shifted - shifted.shift(w)
-
-    df["year"] = ds.dt.year
-    df["quarter"] = ds.dt.quarter
-    df["month"] = ds.dt.month
-    iso_week = ds.dt.isocalendar().week.astype(int)
-    df["weekofyear"] = iso_week
-    df["dayofweek"] = ds.dt.dayofweek
-    df["dayofmonth"] = ds.dt.day
-    df["is_month_start"] = ds.dt.is_month_start.astype(int)
-    df["is_month_end"] = ds.dt.is_month_end.astype(int)
-    df["is_quarter_start"] = ds.dt.is_quarter_start.astype(int)
-    df["is_quarter_end"] = ds.dt.is_quarter_end.astype(int)
-    if fa == 'H':
-        df["hour"] = ds.dt.hour
-        df["hour_sin"] = np.sin(2 * np.pi * ds.dt.hour.astype(int) / 24.0)
-        df["hour_cos"] = np.cos(2 * np.pi * ds.dt.hour.astype(int) / 24.0)
-
-    month_num = ds.dt.month.fillna(1).astype(int)
-    df["month_sin"] = np.sin(2 * np.pi * month_num / 12.0)
-    df["month_cos"] = np.cos(2 * np.pi * month_num / 12.0)
-    if fa in ["W", "D", "H"]:
-        week_num = iso_week.clip(lower=1)
-        df["week_sin"] = np.sin(2 * np.pi * week_num / 52.0)
-        df["week_cos"] = np.cos(2 * np.pi * week_num / 52.0)
-    if fa in ["D", "H"]:
-        dow = ds.dt.dayofweek.astype(int)
-        df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
-        df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
-
-    # Türkiye tatilleri + tatil yakınlığı + tatil yoğunluğu
-    for c in [
-        "tatil_yakınlık_sonraki", "tatil_yakınlık_onceki", "tatil_yakınlık_min",
-        "tatil_yakın_flag_7", "tatil_yakın_flag_14", "tatil_yakın_flag_28",
-        "tatil_sayısı_sonraki_14g", "tatil_sayısı_sonraki_28g",
-        "dini_olay_yakınlık_min", "dini_olay_flag_14",
-        "ozel_olay_yakınlık_min", "ozel_olay_flag_14", "ozel_olay_flag_30"
-    ]:
-        df[c] = 0
-
-    try:
-        years = sorted(set(ds.dt.year.dropna().astype(int).tolist()))
-        holiday_dates = []
-        dini_dates = []
-        if years:
-            import holidays as _holidays
-            tr_holidays = _holidays.country_holidays("TR", years=years)
-            holiday_dates = sorted(pd.to_datetime(list(tr_holidays.keys())))
-            for d, nm in tr_holidays.items():
-                nm_s = str(nm).lower()
-                if ("ramazan" in nm_s) or ("kurban" in nm_s) or ("bayram" in nm_s):
-                    dini_dates.append(pd.Timestamp(d))
-        if holiday_dates:
-            holiday_arr = np.array([pd.Timestamp(x).to_datetime64() for x in holiday_dates], dtype='datetime64[ns]')
-            current_arr = ds.values.astype('datetime64[ns]')
-            next_gap, prev_gap, cnt14, cnt28 = [], [], [], []
-            for cur in current_arr:
-                diffs = (holiday_arr - cur).astype('timedelta64[D]').astype(int)
-                pos = diffs[diffs >= 0]
-                neg = (-diffs[diffs <= 0])
-                next_gap.append(int(pos.min()) if len(pos) else 999)
-                prev_gap.append(int(neg.min()) if len(neg) else 999)
-                cnt14.append(int(np.sum((diffs >= 0) & (diffs <= 14))))
-                cnt28.append(int(np.sum((diffs >= 0) & (diffs <= 28))))
-            df["tatil_yakınlık_sonraki"] = pd.Series(next_gap).clip(upper=60)
-            df["tatil_yakınlık_onceki"] = pd.Series(prev_gap).clip(upper=60)
-            df["tatil_yakınlık_min"] = np.minimum(df["tatil_yakınlık_sonraki"], df["tatil_yakınlık_onceki"])
-            df["tatil_yakın_flag_7"] = (df["tatil_yakınlık_min"] <= 7).astype(int)
-            df["tatil_yakın_flag_14"] = (df["tatil_yakınlık_min"] <= 14).astype(int)
-            df["tatil_yakın_flag_28"] = (df["tatil_yakınlık_min"] <= 28).astype(int)
-            df["tatil_sayısı_sonraki_14g"] = cnt14
-            df["tatil_sayısı_sonraki_28g"] = cnt28
-        if dini_dates:
-            dini_arr = np.array([pd.Timestamp(x).to_datetime64() for x in sorted(set(dini_dates))], dtype='datetime64[ns]')
-            cur_arr = ds.values.astype('datetime64[ns]')
-            min_gap = []
-            for cur in cur_arr:
-                diffs = np.abs((dini_arr - cur).astype('timedelta64[D]').astype(int))
-                min_gap.append(int(diffs.min()) if len(diffs) else 999)
-            df["dini_olay_yakınlık_min"] = pd.Series(min_gap).clip(upper=60)
-            df["dini_olay_flag_14"] = (df["dini_olay_yakınlık_min"] <= 14).astype(int)
-    except Exception:
-        pass
-
-    # Takvimsel özel olay yakınlığı: yılbaşı, okul açılışı, yılsonu, yaz başlangıcı, grip sezonu vekilleri
-    try:
-        event_dates = []
-        for y in sorted(set(ds.dt.year.dropna().astype(int).tolist())):
-            event_dates.extend([
-                pd.Timestamp(f"{y}-01-01"),
-                pd.Timestamp(f"{y}-09-01"),
-                pd.Timestamp(f"{y}-12-31"),
-                pd.Timestamp(f"{y}-06-15"),
-                pd.Timestamp(f"{y}-11-15"),
-            ])
-        if event_dates:
-            ev_arr = np.array([pd.Timestamp(x).to_datetime64() for x in sorted(set(event_dates))], dtype='datetime64[ns]')
-            cur_arr = ds.values.astype('datetime64[ns]')
-            ev_gap = []
-            for cur in cur_arr:
-                diffs = np.abs((ev_arr - cur).astype('timedelta64[D]').astype(int))
-                ev_gap.append(int(diffs.min()) if len(diffs) else 999)
-            df["ozel_olay_yakınlık_min"] = pd.Series(ev_gap).clip(upper=90)
-            df["ozel_olay_flag_14"] = (df["ozel_olay_yakınlık_min"] <= 14).astype(int)
-            df["ozel_olay_flag_30"] = (df["ozel_olay_yakınlık_min"] <= 30).astype(int)
-        month_day = ds.dt.strftime('%m-%d')
-        df["ozel_olay_yılbaşı_penceresi"] = (((month_day >= '12-20') | (month_day <= '01-10'))).astype(int)
-        df["ozel_olay_okul_açılışı"] = (ds.dt.month == 9).astype(int)
-        df["ozel_olay_yılsonu"] = (ds.dt.month == 12).astype(int)
-        df["ozel_olay_grip_sezonu"] = ds.dt.month.isin([11, 12, 1, 2]).astype(int)
-        df["ozel_olay_yaz_başlangıcı"] = ds.dt.month.isin([6, 7]).astype(int)
-        special_cols = [
-            "ozel_olay_yılbaşı_penceresi", "ozel_olay_okul_açılışı", "ozel_olay_yılsonu",
-            "ozel_olay_grip_sezonu", "ozel_olay_yaz_başlangıcı", "ozel_olay_flag_14", "ozel_olay_flag_30"
-        ]
-        df["ozel_olay_toplam_flag"] = (df[special_cols].sum(axis=1) > 0).astype(int)
-    except Exception:
-        pass
-
-    if existing_exog is not None and len(existing_exog.columns) > 0:
-        exog = existing_exog.copy().reset_index(drop=True)
-        for c in exog.columns:
-            df[f"exog__{c}"] = pd.to_numeric(exog[c], errors="coerce")
-
-    feature_cols = [c for c in df.columns if c not in ["ds", "y"]]
-    return df, feature_cols
-
-
-def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    if not isinstance(validation_df, pd.DataFrame) or len(validation_df) == 0:
-        return pd.DataFrame(columns=["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"])
-    profile = profile or {}
-    regime = infer_runtime_regime_from_profile(profile=profile)
-    out = validation_df.copy()
-    out["bağlamsal_ceza"] = 0.0
-    freq_alias = str(profile.get("freq_alias", "")).upper() if isinstance(profile, dict) else ""
-    # Intermittent, seri gerçekten intermittent değilse validation aşamasında daha erken bastırılır
+def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
+    feature_audit_df = build_feature_availability_audit(export_payload.get("features", pd.DataFrame()), export_payload.get("metadata", {}).get("date_col", "ds"), target_col, outputs.get("metadata", {}).get("stat_exog_cols", []) or [], outputs.get("metadata", {}).get("prophet_exog_cols", []) or [], outputs.get("metadata", {}).get("ml_feature_cols", []) or [])
+    bias_df = build_bias_dashboard(outputs)
+    peak_df = build_peak_event_dashboard(outputs)
+    eligibility_df = build_model_eligibility_gate(outputs, feature_audit_df)
+    eligibility_df = enforce_hard_feature_contract_gate(eligibility_df, feature_audit_df)
+    fva_df = build_forecast_value_add(outputs, freq_alias)
+    quantile_tables: Dict[str, pd.DataFrame] = {}
+    service_tables: Dict[str, pd.DataFrame] = {}
+    full_robt = outputs.get("rolling_origin_backtest", pd.DataFrame())
+    for model_name, pred in (outputs.get("predictions") or {}).items():
+        scale = estimate_model_interval_scale(outputs, model_name)
+        qdf = build_calibrated_prediction_interval_table(outputs["test"], pred, model_name, full_robt, fallback_scale=scale)
+        quantile_tables[model_name] = qdf
+        service_tables[model_name] = build_service_level_simulation(outputs["test"], pred, qdf)
+    metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
+    robt_summary = summarize_full_backtest(full_robt)
+    ranked = metrics_df.copy()
+    if len(robt_summary):
+        ranked = ranked.merge(robt_summary[["model", "WAPE", "MAE"]].rename(columns={"WAPE": "ro_WAPE", "MAE": "ro_MAE"}), on="model", how="left")
+    ranked = ranked.merge(eligibility_df[["model", "status", "eligibility_score"]], on="model", how="left")
+    bias_small = bias_df[["model", "bias_pct", "under_forecast_rate"]] if len(bias_df) else pd.DataFrame(columns=["model", "bias_pct", "under_forecast_rate"])
+    peak_small = peak_df[["model", "peak_event_score"]] if len(peak_df) else pd.DataFrame(columns=["model", "peak_event_score"])
+    ranked = ranked.merge(bias_small, on="model", how="left").merge(peak_small, on="model", how="left")
+    service_rows = []
+    for model_name, sdf in service_tables.items():
+        if isinstance(sdf, pd.DataFrame) and len(sdf):
+            top = sdf.loc[sdf["service_level_target"] == sdf["service_level_target"].max()].head(1)
+            if len(top):
+                tgt = float(pd.to_numeric(top.iloc[0].get("service_level_target", np.nan), errors="coerce"))
+                ach = float(pd.to_numeric(top.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce"))
+                service_rows.append({"model": model_name, "service_level_target": tgt, "achieved_cycle_service": ach, "service_gap": max(tgt - ach, 0.0) if pd.notna(tgt) and pd.notna(ach) else np.nan})
+    service_df = pd.DataFrame(service_rows)
+    if len(service_df):
+        ranked = ranked.merge(service_df[["model", "service_gap", "achieved_cycle_service"]], on="model", how="left")
+    status_rank = {"eligible": 0, "challenger_only": 1, "reject": 2}
+    ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
+    ranked["bias_penalty"] = pd.to_numeric(ranked.get("bias_pct"), errors="coerce").fillna(0.0).abs()
+    ranked["under_penalty"] = (pd.to_numeric(ranked.get("under_forecast_rate"), errors="coerce").fillna(0.0) - 0.50).clip(lower=0.0)
+    ranked["peak_penalty"] = (0.45 - pd.to_numeric(ranked.get("peak_event_score"), errors="coerce").fillna(0.0)).clip(lower=0.0)
+    ranked["service_penalty"] = pd.to_numeric(ranked.get("service_gap"), errors="coerce").fillna(0.0)
+    ranked["ro_WAPE_norm"] = pd.to_numeric(ranked.get("ro_WAPE"), errors="coerce")
+    ranked["hold_WAPE_norm"] = pd.to_numeric(ranked.get("WAPE"), errors="coerce")
+    regime = infer_runtime_regime_from_profile(profile=outputs.get("metadata", {}).get("profile", {}) or {}, y_train=np.asarray(outputs.get("train", pd.DataFrame()).get("y", pd.Series(dtype=float)), dtype=float) if isinstance(outputs.get("train"), pd.DataFrame) and "y" in outputs.get("train", pd.DataFrame()).columns else None)
+    ranked["bağlamsal_ceza"] = 0.0
     if not regime.get("intermittent_like", False):
-        out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 9.00
-        if freq_alias in ["W", "D", "H"]:
-            out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 2.00
+        ranked.loc[ranked["model"].eq("Intermittent"), "bağlamsal_ceza"] += 2.5
     if not regime.get("seasonal_like", False):
-        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 2.00
-    if freq_alias == "W":
-        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.25
-    if regime.get("volatile_like", False):
-        out.loc[out["model"].eq("ARIMA"), "bağlamsal_ceza"] += 0.25
-        out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] += 0.10
-    if regime.get("seasonal_like", False):
-        out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] -= 0.20
-    if regime.get("trendy_like", False):
-        out.loc[out["model"].eq("XGBoost"), "bağlamsal_ceza"] -= 0.10
-    out["bağlamsal_doğrulama_skoru"] = pd.to_numeric(out.get("val_WAPE"), errors="coerce").fillna(99.0) + pd.to_numeric(out.get("val_sMAPE"), errors="coerce").fillna(99.0) * 0.12 + out["bağlamsal_ceza"].fillna(0.0)
-    return out.sort_values(["bağlamsal_doğrulama_skoru", "val_WAPE", "val_sMAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
-
-
-def build_weighted_ensemble(
-    pred_map: Dict[str, np.ndarray],
-    metrics_df: pd.DataFrame,
-    validation_df: Optional[pd.DataFrame] = None,
-    y_train: Optional[np.ndarray] = None,
-    y_true: Optional[np.ndarray] = None,
-    rolling_summary: Optional[pd.DataFrame] = None,
-    profile: Optional[Dict[str, Any]] = None,
-) -> Tuple[np.ndarray, pd.DataFrame]:
-    """
-    V29: gerçekten rolling-aware, bias-aware, peak-aware, regime-aware ve doğrulanabilir ansambl.
-    Çıkış tablosunda rolling metrikler NaN kalmamalı ve ağırlık bileşenleri açık görünmeli.
-    """
-    if not pred_map:
-        raise ValueError("Ansambl için model bulunamadı.")
-    profile = profile or {}
-    regime = infer_runtime_regime_from_profile(profile=profile, y_train=y_train)
-    freq_alias = str(profile.get("freq_alias", "")).upper() if isinstance(profile, dict) else ""
-
-    use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
-    if len(use_df) == 0:
-        raise ValueError("Ansambl için metrik bulunamadı.")
-
-    # Validation
-    if validation_df is not None and len(validation_df) > 0:
-        val_ctx = build_contextual_validation_ranking(validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy(), profile=profile)
-        keep = [c for c in ["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"] if c in val_ctx.columns]
-        use_df = use_df.merge(val_ctx[keep], on="model", how="left")
-    else:
-        use_df["val_WAPE"] = np.nan
-        use_df["val_sMAPE"] = np.nan
-        use_df["bağlamsal_ceza"] = 0.0
-        use_df["bağlamsal_doğrulama_skoru"] = np.nan
-
-    # Rolling summary - NaN bırakmadan doldur
-    roll_map = {}
-    if rolling_summary is not None and len(rolling_summary) > 0:
-        rs = rolling_summary.loc[rolling_summary["model"].isin(pred_map.keys())].copy()
-        if len(rs):
-            if "WAPE" in rs.columns:
-                rs["ro_WAPE"] = pd.to_numeric(rs["WAPE"], errors="coerce")
-            if "MAE" in rs.columns:
-                rs["ro_MAE"] = pd.to_numeric(rs["MAE"], errors="coerce")
-            roll_map = rs.set_index("model")[[c for c in ["ro_WAPE", "ro_MAE"] if c in rs.columns]].to_dict(orient="index")
-    ro_rows = []
-    for m in use_df["model"].tolist():
-        ro_w = roll_map.get(m, {}).get("ro_WAPE", np.nan)
-        ro_m = roll_map.get(m, {}).get("ro_MAE", np.nan)
-        hold_row = use_df.loc[use_df["model"].eq(m)].head(1)
-        hold_w = float(pd.to_numeric(hold_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(hold_row) else np.nan
-        hold_m = float(pd.to_numeric(hold_row.iloc[0].get("MAE", np.nan), errors="coerce")) if len(hold_row) else np.nan
-        ro_rows.append({
-            "model": m,
-            "ro_WAPE": hold_w if pd.isna(ro_w) else float(ro_w),
-            "ro_MAE": hold_m if pd.isna(ro_m) else float(ro_m),
-            "rolling_source": "holdout_proxy" if pd.isna(ro_w) else "rolling_summary"
-        })
-    use_df = use_df.drop(columns=[c for c in ["ro_WAPE", "ro_MAE"] if c in use_df.columns], errors="ignore")
-    use_df = use_df.merge(pd.DataFrame(ro_rows), on="model", how="left")
-
-    # Peak ve yakın dönem / ufuk-özel hata
-    recent_rows = []
-    peak_rows = []
-    if y_train is not None and y_true is not None:
-        y_true_arr = np.asarray(y_true, dtype=float)
-        y_train_arr = np.asarray(y_train, dtype=float)
-        for model_name, pred in pred_map.items():
-            pred_arr = np.asarray(pred, dtype=float)
-            try:
-                peak = compute_peak_event_score(y_train_arr, y_true_arr, pred_arr)
-                peak_rows.append({"model": model_name, "peak_event_score": safe_float(peak.get("peak_event_score", np.nan))})
-            except Exception:
-                peak_rows.append({"model": model_name, "peak_event_score": np.nan})
-            try:
-                ape = np.abs(y_true_arr - pred_arr) / np.where(np.abs(y_true_arr) > 1e-8, np.abs(y_true_arr), np.nan)
-                rw = min(4 if freq_alias == "W" else 3, len(ape))
-                horizon_w = np.linspace(1.0, 1.75 if freq_alias == "W" else 1.35, len(ape))
-                recent_local_wape = np.nanmean(ape[-rw:]) * 100.0 if rw > 0 else np.nan
-                horizon_specific_wape = np.nansum(ape * horizon_w) / np.nansum(np.where(np.isfinite(ape), horizon_w, 0.0)) * 100.0 if len(ape) else np.nan
-                recent_rows.append({"model": model_name, "recent_local_WAPE": safe_float(recent_local_wape), "horizon_specific_WAPE": safe_float(horizon_specific_wape)})
-            except Exception:
-                recent_rows.append({"model": model_name, "recent_local_WAPE": np.nan, "horizon_specific_WAPE": np.nan})
-    use_df = use_df.merge(pd.DataFrame(peak_rows), on="model", how="left") if peak_rows else use_df
-    use_df = use_df.merge(pd.DataFrame(recent_rows), on="model", how="left") if recent_rows else use_df
-
-    num_cols = ["BiasPct", "UnderForecastRate", "peak_event_score", "WAPE", "sMAPE", "MAE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "recent_local_WAPE", "horizon_specific_WAPE"]
-    for c in num_cols:
-        use_df[c] = pd.to_numeric(use_df.get(c), errors="coerce")
-
-    # NaN temizleme: rolling/validation yoksa holdout kullan
-    use_df["val_WAPE"] = use_df["val_WAPE"].fillna(use_df["WAPE"])
-    use_df["val_sMAPE"] = use_df["val_sMAPE"].fillna(use_df["sMAPE"])
-    use_df["ro_WAPE"] = use_df["ro_WAPE"].fillna(use_df["WAPE"])
-    use_df["ro_MAE"] = use_df["ro_MAE"].fillna(use_df["MAE"])
-    use_df["recent_local_WAPE"] = use_df["recent_local_WAPE"].fillna(use_df["WAPE"])
-    use_df["horizon_specific_WAPE"] = use_df["horizon_specific_WAPE"].fillna(use_df["WAPE"])
-    use_df["peak_event_score"] = use_df["peak_event_score"].fillna(use_df["peak_event_score"].median() if use_df["peak_event_score"].notna().any() else 0.5)
-    use_df["BiasPct"] = use_df["BiasPct"].fillna(0.0)
-    use_df["UnderForecastRate"] = use_df["UnderForecastRate"].fillna(0.5)
-
-    def _min_norm(series: pd.Series) -> pd.Series:
-        s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if s.notna().sum() == 0:
-            return pd.Series(1.0, index=series.index, dtype=float)
-        mn, mx = float(s.min()), float(s.max())
-        if not np.isfinite(mn) or not np.isfinite(mx) or abs(mx - mn) < 1e-9:
-            return pd.Series(0.0, index=series.index, dtype=float)
-        return (s - mn) / (mx - mn)
-
-    use_df["hold_norm"] = _min_norm(use_df["WAPE"])
-    use_df["val_norm"] = _min_norm(use_df["val_WAPE"])
-    use_df["ro_norm"] = _min_norm(use_df["ro_WAPE"])
-    use_df["recent_norm"] = _min_norm(use_df["recent_local_WAPE"])
-    use_df["horizon_norm"] = _min_norm(use_df["horizon_specific_WAPE"])
-    use_df["bias_pen"] = use_df["BiasPct"].abs().clip(upper=18.0) / 18.0
-    use_df["under_pen"] = (use_df["UnderForecastRate"] - 0.52).clip(lower=0.0, upper=0.40) / 0.40
-    use_df["peak_pen"] = (0.76 - use_df["peak_event_score"]).clip(lower=0.0, upper=0.76) / 0.76
-    use_df["regime_pen"] = 0.0
-    if not regime.get("intermittent_like", False):
-        use_df.loc[use_df["model"].eq("Intermittent"), "regime_pen"] += 0.75
-    if not regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.30
-    if freq_alias == "W":
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.35
-    if regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_pen"] -= 0.10
-    if regime.get("volatile_like", False):
-        use_df.loc[use_df["model"].eq("XGBoost"), "regime_pen"] -= 0.05
-
-    if freq_alias == "W":
-        hold_w, val_w, ro_w, recent_w, horiz_w = 0.16, 0.18, 0.30, 0.18, 0.12
-    else:
-        hold_w, val_w, ro_w, recent_w, horiz_w = 0.24, 0.22, 0.24, 0.12, 0.08
-
-    use_df["birleşik_skor"] = (
-        use_df["hold_norm"] * hold_w
-        + use_df["val_norm"] * val_w
-        + use_df["ro_norm"] * ro_w
-        + use_df["recent_norm"] * recent_w
-        + use_df["horizon_norm"] * horiz_w
-        + use_df["peak_pen"] * 0.08
-        + use_df["bias_pen"] * 0.04
-        + use_df["under_pen"] * 0.03
-        + use_df["regime_pen"] * 0.10
+        ranked.loc[ranked["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.1
+    ranked["operasyonel_skor"] = (
+        ranked["status_rank"].fillna(9.0) * 1000.0
+        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.78
+        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.10
+        + ranked["service_penalty"].fillna(0.0) * 22.0
+        + ranked["under_penalty"].fillna(0.0) * 14.5
+        + ranked["bias_penalty"].fillna(0.0) * 1.45
+        + ranked["peak_penalty"].fillna(0.0) * 12.5
+        + ranked["bağlamsal_ceza"].fillna(0.0) * 9.5
+        - pd.to_numeric(ranked.get("eligibility_score"), errors="coerce").fillna(0.0) * 0.03
     )
-    use_df = use_df.sort_values(["birleşik_skor", "ro_WAPE", "recent_local_WAPE", "WAPE", "val_WAPE"], ascending=[True, True, True, True, True], na_position="last").reset_index(drop=True)
-    best_score = float(pd.to_numeric(use_df.iloc[0].get("birleşik_skor", np.nan), errors="coerce")) if len(use_df) else 1.0
-    if not np.isfinite(best_score):
-        best_score = 1.0
+    sort_cols = ["operasyonel_skor", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
+    asc = [True, True, True, True, True, True, True, False]
+    ranked = ranked.sort_values(sort_cols, ascending=asc, na_position="last").reset_index(drop=True)
+    production_model = ranked.iloc[0]["model"] if len(ranked) else outputs.get("best_model")
+    production_status = ranked.iloc[0]["status"] if len(ranked) else "eligible"
+    if production_status == "reject":
+        preferred = ["ARIMA", "SARIMA/SARIMAX", outputs.get("best_model")]
+        for cand in preferred:
+            if cand in set(outputs.get("predictions", {}).keys()):
+                production_model = cand
+                break
+        production_status = "guarded_fallback"
+    production_interval = quantile_tables.get(production_model, pd.DataFrame())
+    production_service = service_tables.get(production_model, pd.DataFrame())
+    pack = {"feature_availability_audit": feature_audit_df, "bias_dashboard": bias_df, "peak_event_dashboard": peak_df, "forecast_value_add": fva_df, "model_eligibility_gate": eligibility_df, "quantile_forecasts": quantile_tables, "service_level_simulation": service_tables, "production_model": production_model, "production_status": production_status, "production_interval_table": production_interval, "production_service_table": production_service, "rolling_origin_summary": robt_summary, "production_ranking": ranked, "production_decision_explanation": build_production_decision_explanation(ranked, production_model)}
+    pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, pack)
+    return pack
 
-    pruned = use_df.copy()
-    if len(pruned) > 4:
-        pruned = pruned.head(4).copy()
-    if "Prophet" in pruned["model"].tolist() and freq_alias == "W":
-        prow = pruned.loc[pruned["model"].eq("Prophet")].head(1)
-        if len(prow):
-            ps = float(pd.to_numeric(prow.iloc[0].get("birleşik_skor", np.nan), errors="coerce"))
-            if pd.notna(ps) and ps > best_score + 0.04 and len(pruned) > 2:
-                pruned = pruned.loc[~pruned["model"].eq("Prophet")].copy()
-
-    raw = np.exp(-5.5 * (pruned["birleşik_skor"] - best_score).clip(lower=0.0))
-    peak_bonus = 0.72 + 0.58 * pruned["peak_event_score"].clip(lower=0.0, upper=1.0)
-    bias_factor = np.exp(-0.040 * pruned["BiasPct"].abs().clip(upper=18.0))
-    under_factor = np.exp(-2.4 * (pruned["UnderForecastRate"] - 0.52).clip(lower=0.0, upper=0.40))
-    regime_factor = np.exp(-2.0 * pruned["regime_pen"].clip(lower=0.0, upper=0.90))
-    recent_factor = np.exp(-1.25 * pruned["recent_norm"].clip(lower=0.0, upper=1.0))
-    horizon_factor = np.exp(-1.00 * pruned["horizon_norm"].clip(lower=0.0, upper=1.0))
-    rolling_factor = np.exp(-1.10 * pruned["ro_norm"].clip(lower=0.0, upper=1.0))
-    pruned["ham_agirlik"] = raw
-    pruned["nihai_ham_agirlik"] = raw * peak_bonus * bias_factor * under_factor * regime_factor * recent_factor * horizon_factor * rolling_factor
-    if not regime.get("intermittent_like", False) and "Intermittent" in pruned["model"].tolist():
-        idx = pruned.index[pruned["model"].eq("Intermittent")]
-        pruned.loc[idx, "nihai_ham_agirlik"] = np.minimum(pruned.loc[idx, "nihai_ham_agirlik"].astype(float), 0.08 if freq_alias == "W" else 0.12)
-    w = pruned["nihai_ham_agirlik"].astype(float).values
-    if not np.isfinite(w).all() or np.sum(w) <= 0:
-        w = np.ones(len(pruned), dtype=float)
-    w = w / np.sum(w)
-    if len(w) >= 2 and w[0] < (0.56 if freq_alias == "W" else 0.50):
-        target_top = 0.56 if freq_alias == "W" else 0.50
-        deficit = target_top - w[0]
-        w[0] = target_top
-        rest = w[1:]
-        if rest.sum() > 0:
-            rest = rest / rest.sum()
-            w[1:] = np.maximum(0.0, w[1:] - deficit * rest)
-            w = w / max(w.sum(), 1e-9)
-    pruned["weight"] = w
-
-    ensemble = None
-    for _, row in pruned.iterrows():
-        pred = np.asarray(pred_map[row["model"]], dtype=float)
-        ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
-
-    out_cols = [
-        "model", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "rolling_source",
-        "recent_local_WAPE", "horizon_specific_WAPE", "BiasPct", "UnderForecastRate", "peak_event_score",
-        "regime_pen", "bağlamsal_ceza", "birleşik_skor", "ham_agirlik", "nihai_ham_agirlik", "weight"
-    ]
-    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[[c for c in out_cols if c in pruned.columns]].reset_index(drop=True)
-
-
-def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
-    prod_model = production_pack.get("production_model", outputs.get("best_model"))
-    bias_df = production_pack.get("bias_dashboard", pd.DataFrame())
-    peak_df = production_pack.get("peak_event_dashboard", pd.DataFrame())
-    gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame())
-    interval_df = production_pack.get("production_interval_table", pd.DataFrame())
-    feature_df = production_pack.get("feature_availability_audit", pd.DataFrame())
-    service_df = production_pack.get("production_service_table", pd.DataFrame())
-    full_ro = outputs.get("rolling_origin_backtest", pd.DataFrame())
-    robt = summarize_full_backtest(full_ro)
-    fallback_flags = {
-        "XGBoost": bool((outputs.get("xgboost") or {}).get("fallback_used", False)),
-        "Prophet": bool((outputs.get("prophet") or {}).get("fallback_used", False)),
-        "SARIMA/SARIMAX": bool((outputs.get("sarima") or {}).get("fallback_used", False)),
-        "ARIMA": bool((outputs.get("arima") or {}).get("fallback_used", False)),
-        "Intermittent": bool((outputs.get("intermittent") or {}).get("fallback_used", False)),
-    }
-    fallback_rate = float(np.mean(list(fallback_flags.values()))) if fallback_flags else 0.0
-    alerts = []
-    train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
-    prod_pred = np.asarray((outputs.get("predictions") or {}).get(prod_model, np.array([])), dtype=float)
-    recent_mean = float(train_y.tail(min(12, len(train_y))).mean()) if len(train_y) else np.nan
-    drift_ratio = float(np.mean(prod_pred) / max(recent_mean, 1e-6)) if len(prod_pred) and pd.notna(recent_mean) else np.nan
-    bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
-    peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
-    gate_row = gate_df.loc[gate_df["model"] == prod_model].head(1) if len(gate_df) else pd.DataFrame()
-    ro_row = robt.loc[robt["model"] == prod_model].head(1) if len(robt) else pd.DataFrame()
-    service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) else pd.DataFrame()
-    achieved_service = float(pd.to_numeric(service_row.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce")) if len(service_row) else np.nan
-    target_service = float(pd.to_numeric(service_row.iloc[0].get("service_level_target", np.nan), errors="coerce")) if len(service_row) else np.nan
-    freq_alias = str(outputs.get("metadata", {}).get("freq_alias", "")).upper()
-    freq_desc_map = {"M": "Aylık", "W": "Haftalık", "D": "Günlük", "H": "Saatlik"}
-    freq_desc = freq_desc_map.get(freq_alias, freq_alias or "Bilinmiyor")
-    summary_row = {
-        "frekans": freq_alias,
-        "frekans_açıklama": freq_desc,
-        "frekans_rozeti": f"{freq_desc} Çalışma",
-        "üretim_modeli": prod_model,
-        "üretim_durumu": production_pack.get("production_status", "eligible"),
-        "sapma_yüzde": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "eksik_tahmin_oranı": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "tepe_olay_skoru": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan,
-        "uygunluk_skoru": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan,
-        "rolling_wape": float(pd.to_numeric(ro_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(ro_row) else np.nan,
-        "drift_oranı": drift_ratio,
-        "kapsama_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
-        "kapsama_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
-        "maksimum_özellik_riski": float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max()) if len(feature_df) else np.nan,
-        "fallback_oranı": fallback_rate,
-        "gerçekleşen_servis": achieved_service,
-        "hedef_servis": target_service,
-    }
-    if pd.notna(summary_row["sapma_yüzde"]) and abs(summary_row["sapma_yüzde"]) > 8.0:
-        alerts.append({"severity": "high", "alert": "sapma_alarmı", "detail": f"Sapma yüksek: {summary_row['sapma_yüzde']:.2f}%"})
-    if pd.notna(summary_row["eksik_tahmin_oranı"]) and summary_row["eksik_tahmin_oranı"] > 0.60:
-        alerts.append({"severity": "high", "alert": "eksik_tahmin_alarmı", "detail": f"Eksik tahmin oranı yüksek: {summary_row['eksik_tahmin_oranı']:.2f}"})
-    if pd.notna(summary_row["tepe_olay_skoru"]) and summary_row["tepe_olay_skoru"] < 0.35:
-        alerts.append({"severity": "high", "alert": "tepe_yakalama_alarmı", "detail": f"Tepe olay yakalama zayıf: {summary_row['tepe_olay_skoru']:.2f}"})
-    if pd.notna(summary_row["drift_oranı"]) and not (0.82 <= summary_row["drift_oranı"] <= 1.22):
-        alerts.append({"severity": "medium", "alert": "drift_alarmı", "detail": f"Tahmin/son dönem seviye oranı: {summary_row['drift_oranı']:.2f}"})
-    if pd.notna(summary_row["maksimum_özellik_riski"]) and summary_row["maksimum_özellik_riski"] > 0.25:
-        alerts.append({"severity": "high", "alert": "özellik_kontratı_alarmı", "detail": "Production feature contract tamamen güvenli değil."})
-    if pd.notna(summary_row["gerçekleşen_servis"]) and pd.notna(summary_row["hedef_servis"]) and summary_row["gerçekleşen_servis"] + 1e-9 < summary_row["hedef_servis"]:
-        alerts.append({"severity": "high", "alert": "servis_seviyesi_alarmı", "detail": f"Servis seviyesi hedef altında: {summary_row['gerçekleşen_servis']:.2f} < {summary_row['hedef_servis']:.2f}"})
-    if fallback_rate > 0.20:
-        alerts.append({"severity": "medium", "alert": "fallback_oranı_alarmı", "detail": f"Model ailelerinde fallback oranı yüksek: {fallback_rate:.2f}"})
-    recommendation = "guardrailli_üretime_uygun"
-    if any(a["severity"] == "high" for a in alerts):
-        recommendation = "shadow_mode_zorunlu"
-    elif alerts:
-        recommendation = "şampiyon_meydan_okuyan_paralel"
-    summary = pd.DataFrame([summary_row])
-    summary["alarm_sayısı"] = len(alerts)
-    summary["yüksek_alarm_sayısı"] = sum(1 for a in alerts if a["severity"] == "high")
-    summary["canlı_kullanım_önerisi"] = recommendation
-    summary["karar_açıklaması"] = build_production_decision_explanation(production_pack.get("production_ranking", pd.DataFrame()), prod_model)
-    summary["üst_karar_kartı"] = summary.apply(
-        lambda r: f"{r.get('frekans_rozeti', '')} | Üretim Modeli: {r['üretim_modeli']} | Sapma: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f} | Fallback: {safe_float(r.get('fallback_oranı', np.nan)):.2f} | Drift: {safe_float(r.get('drift_oranı', np.nan)):.2f} | Servis: {safe_float(r.get('gerçekleşen_servis', np.nan)):.2f}/{safe_float(r.get('hedef_servis', np.nan)):.2f} | Alarm: {int(r.get('alarm_sayısı', 0)) if pd.notna(r.get('alarm_sayısı', np.nan)) else 0}",
-        axis=1,
-    )
-    karar_karti = pd.DataFrame([{
-        "Karar": ("Üretime uygun" if recommendation == "guardrailli_üretime_uygun" else "Ek izleme gerekli"),
-        "FrekansRozeti": summary_row.get("frekans_rozeti"),
-        "Frekans": freq_desc,
-        "ÜretimModeli": prod_model,
-        "SapmaYüzde": summary_row.get("sapma_yüzde"),
-        "Kapsama80": summary_row.get("kapsama_80"),
-        "FallbackOranı": summary_row.get("fallback_oranı"),
-        "DriftOranı": summary_row.get("drift_oranı"),
-        "ServisSeviyesi": summary_row.get("gerçekleşen_servis"),
-        "AlarmSayısı": len(alerts),
-        "Açıklama": summary["karar_açıklaması"].iloc[0] if len(summary) else "",
-    }])
-    metric_df = outputs.get("metrics_df", pd.DataFrame())
-    prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
-    service_level_tables = production_pack.get("service_level_simulation", {}) or {}
-    health_rows = []
-    for model_name in metric_df.get("model", pd.Series(dtype=str)).tolist() if isinstance(metric_df, pd.DataFrame) else []:
-        mrow = metric_df.loc[metric_df["model"] == model_name].head(1)
-        brow = bias_df.loc[bias_df["model"] == model_name].head(1) if len(bias_df) else pd.DataFrame()
-        prow = peak_df.loc[peak_df["model"] == model_name].head(1) if len(peak_df) else pd.DataFrame()
-        grow = gate_df.loc[gate_df["model"] == model_name].head(1) if len(gate_df) else pd.DataFrame()
-        rrow = robt.loc[robt["model"] == model_name].head(1) if len(robt) else pd.DataFrame()
-        qrow = prediction_interval_tables.get(model_name, pd.DataFrame())
-        srow = service_level_tables.get(model_name, pd.DataFrame())
-        achieved = np.nan
-        if isinstance(srow, pd.DataFrame) and len(srow):
-            sr = srow.loc[srow["service_level_target"] == srow["service_level_target"].max()].head(1)
-            if len(sr):
-                achieved = float(pd.to_numeric(sr.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce"))
-        health_rows.append({
-            "model": model_name,
-            "WAPE": float(pd.to_numeric(mrow.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(mrow) else np.nan,
-            "rolling_WAPE": float(pd.to_numeric(rrow.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(rrow) else np.nan,
-            "bias_pct": float(pd.to_numeric(brow.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(brow) else np.nan,
-            "under_forecast_rate": float(pd.to_numeric(brow.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(brow) else np.nan,
-            "peak_event_score": float(pd.to_numeric(prow.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(prow) else np.nan,
-            "coverage_80": float(qrow["coverage_80"].mean()) if isinstance(qrow, pd.DataFrame) and "coverage_80" in qrow.columns else np.nan,
-            "fallback_used": bool(fallback_flags.get(model_name, False)),
-            "service": achieved,
-            "status": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
-            "frekans": freq_desc,
-        })
-    return {"summary": summary, "alerts": pd.DataFrame(alerts), "model_health_table": pd.DataFrame(health_rows), "karar_karti": karar_karti}
-
-
-# =========================================================
-# V30 OVERRIDES: frequency-complete weekly enhancements
-# =========================================================
-
-def _build_tr_holiday_event_tables(ds: pd.Series) -> Dict[str, Any]:
-    ds = pd.to_datetime(ds).dropna().sort_values()
-    years = sorted(set(ds.dt.year.astype(int).tolist()))
-    out = {
-        "holiday_dates": [],
-        "holiday_names": {},
-        "ramadan_dates": [],
-        "eid_dates": [],
-        "special_event_dates": [],
-    }
+def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics_df: pd.DataFrame, target_col: str, outputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    notes: List[str] = []
+    status = "guarded_use_only"
     try:
-        import holidays as _holidays
-        if years:
-            tr_holidays = _holidays.country_holidays("TR", years=years)
-            out["holiday_dates"] = sorted(pd.to_datetime(list(tr_holidays.keys())))
-            out["holiday_names"] = {pd.Timestamp(k).normalize(): str(v) for k, v in tr_holidays.items()}
-            for d, name in out["holiday_names"].items():
-                low = str(name).lower()
-                if "ramazan" in low or "eid al-fitr" in low:
-                    out["ramadan_dates"].append(pd.Timestamp(d))
-                if "kurban" in low or "eid al-adha" in low:
-                    out["eid_dates"].append(pd.Timestamp(d))
+        profile_df = export_payload.get("series_profile_report", pd.DataFrame())
+        anomaly_df = export_payload.get("anomaly_governance", pd.DataFrame())
+        if outputs is not None:
+            prod_pack = outputs.get("production_governance", {}) or {}
+            gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
+            live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
+            alerts_df = live_pack.get("alerts", pd.DataFrame()) if isinstance(live_pack, dict) else pd.DataFrame()
+            if len(gate_df):
+                top = gate_df.sort_values(["status", "eligibility_score"], ascending=[True, False]).iloc[0]
+                notes.append(f"Üretim kapısı: {top['model']} -> {TURKCE_DEGER_HARITASI.get(str(top['status']), top['status'])} (skor={safe_float(top.get('eligibility_score')):.1f})")
+            if len(alerts_df):
+                notes.append(f"Canlı izleme için {len(alerts_df)} alarm üretildi; kör tam otomasyon öncesi shadow-mode zorunlu.")
+        if not profile_df.empty and "series" in profile_df.columns:
+            row = profile_df.loc[profile_df["series"] == target_col]
+            if not row.empty:
+                n_obs = float(pd.to_numeric(pd.Series([row.iloc[0].get("n_obs", np.nan)]), errors="coerce").iloc[0])
+                if pd.notna(n_obs) and n_obs < 84:
+                    notes.append(f"Seri uzunluğu {int(n_obs)} gözlem; aylık ilaç planlama için sınırlı ve overfit riski taşır.")
+        if not anomaly_df.empty and "series" in anomaly_df.columns:
+            a = anomaly_df.loc[anomaly_df["series"] == target_col].copy()
+            if len(a) > 0 and "is_training_excluded" in a.columns:
+                excluded = int(a["is_training_excluded"].fillna(False).astype(bool).sum())
+                if excluded > 0:
+                    notes.append(f"Bu seri için eğitim dışı bırakılan {excluded} kayıt var; yönetişim doğru fakat model belirsizliğini artırır.")
+        if not metrics_df.empty and "WAPE" in metrics_df.columns:
+            best_row = metrics_df.copy()
+            best_row["WAPE_num"] = pd.to_numeric(best_row["WAPE"], errors="coerce")
+            best_row["sMAPE_num"] = pd.to_numeric(best_row.get("sMAPE"), errors="coerce") if "sMAPE" in best_row.columns else np.nan
+            best_row = best_row.sort_values(["WAPE_num", "sMAPE_num"], ascending=[True, True])
+            if len(best_row):
+                bw = best_row.iloc[0]["WAPE_num"]
+                bs = best_row.iloc[0]["sMAPE_num"]
+                if pd.notna(bw) and pd.notna(bs):
+                    if bw <= 7 and bs <= 6:
+                        notes.append("Holdout performansı güçlü; kontrollü karar desteği için uygundur.")
+                    else:
+                        notes.append("Holdout performansı kabul edilebilir olsa da tam otomatik üretim kullanımı için ek onay katmanı gerekir.")
     except Exception:
-        pass
+        notes.append("Üretim uygunluğu değerlendirmesi hesaplanırken hata oluştu; temkinli kullanım önerilir.")
+    if not notes:
+        notes.append("Bu çıktı tez ve analitik inceleme için uygundur; tam otomatik gerçek hayat kullanımı için ek doğrulama gerekir.")
+    return {"status": status, "notes": notes}
 
-    # Approximate business special-event calendar windows
-    special_dates = set()
-    for x in out["holiday_dates"]:
-        special_dates.add(pd.Timestamp(x).normalize())
-    # year-end / year-start, school opening, flu season proxy
-    for y in years:
-        for d in [f"{y}-12-20", f"{y}-12-27", f"{y}-01-03", f"{y}-09-01", f"{y}-10-01", f"{y}-11-01"]:
-            try:
-                special_dates.add(pd.Timestamp(d).normalize())
-            except Exception:
-                pass
-    out["special_event_dates"] = sorted(special_dates)
+def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
+    satirlar = []
+    hold_df = outputs.get("metrics_df", pd.DataFrame())
+    val_df = outputs.get("validation_metrics_df", pd.DataFrame())
+    profile = outputs.get("metadata", {}).get("profile", {}) or {}
+    val_rank = build_contextual_validation_ranking(val_df, profile=profile)
+    ro_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    prod_pack = outputs.get("production_governance", {}) or {}
+    prod_rank = prod_pack.get("production_ranking", pd.DataFrame())
+    hold_winner = hold_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).iloc[0]["model"] if len(hold_df) else None
+    val_winner = val_rank.iloc[0]["model"] if len(val_rank) else None
+    ro_winner = ro_df.sort_values(["WAPE", "MAE"], ascending=[True, True]).iloc[0]["model"] if len(ro_df) else None
+    prod_winner = prod_rank.iloc[0]["model"] if len(prod_rank) else outputs.get("production_model")
+    satirlar.append({"karar_kademesi": "Holdout kazananı", "model": hold_winner})
+    satirlar.append({"karar_kademesi": "Doğrulama kazananı", "model": val_winner})
+    satirlar.append({"karar_kademesi": "Rolling-origin kazananı", "model": ro_winner})
+    satirlar.append({"karar_kademesi": "Üretim kazananı", "model": prod_winner})
+    return pd.DataFrame(satirlar)
+
+
+
+def build_karar_hiyerarsisi_ozeti(outputs: Dict[str, Any]) -> pd.DataFrame:
+    lider = build_model_liderleri(outputs)
+    aciklama_map = {
+        "Holdout kazananı": "Son test penceresinde en düşük hata üreten model.",
+        "Doğrulama kazananı": "İç doğrulama bölmesinde en iyi model; bağlamsal ceza uygulanmıştır.",
+        "Rolling-origin kazananı": "Zaman boyunca en stabil geri test performansını veren model.",
+        "Üretim kazananı": "Risk, stabilite, uygulanabilirlik ve canlı yönetişim kurallarından sonra önerilen model.",
+    }
+    karar_map = {
+        "Holdout kazananı": "Kısa dönem doğruluk",
+        "Doğrulama kazananı": "Aşırı öğrenme kontrolü",
+        "Rolling-origin kazananı": "Zamana karşı dayanıklılık",
+        "Üretim kazananı": "Canlı kullanım kararı",
+    }
+    if len(lider) == 0:
+        return pd.DataFrame(columns=["KararAşaması", "KazananModel", "KararAmacı", "Anlamı"])
+    out = lider.rename(columns={"karar_kademesi": "KararAşaması", "model": "KazananModel"}).copy()
+    out["KararAmacı"] = out["KararAşaması"].map(karar_map)
+    out["Anlamı"] = out["KararAşaması"].map(aciklama_map)
+    prod_expl = ((outputs.get("production_governance", {}) or {}).get("production_decision_explanation") if isinstance(outputs, dict) else None)
+    if prod_expl:
+        extra = pd.DataFrame([{"KararAşaması": "Üretim karar açıklaması", "KazananModel": str((outputs.get("production_governance", {}) or {}).get("production_model", "-")), "KararAmacı": "Neden seçildi?", "Anlamı": str(prod_expl)}])
+        out = pd.concat([out, extra], axis=0, ignore_index=True)
     return out
 
 
-def _proximity_features(ds: pd.Series, anchor_dates: List[pd.Timestamp], prefix: str, clip_days: int = 60) -> pd.DataFrame:
-    idx = pd.to_datetime(ds).reset_index(drop=True)
-    feat = pd.DataFrame(index=range(len(idx)))
-    if not anchor_dates:
-        feat[f"{prefix}_yakınlık_sonraki"] = clip_days
-        feat[f"{prefix}_yakınlık_onceki"] = clip_days
-        feat[f"{prefix}_yakınlık_min"] = clip_days
-        feat[f"{prefix}_yakın_flag_3"] = 0
-        feat[f"{prefix}_yakın_flag_7"] = 0
-        feat[f"{prefix}_yakın_flag_14"] = 0
-        feat[f"{prefix}_yakın_flag_28"] = 0
-        return feat
 
-    anchor_arr = np.array([pd.Timestamp(x).normalize().to_datetime64() for x in anchor_dates], dtype="datetime64[ns]")
-    next_gap, prev_gap = [], []
-    for cur in idx.dt.normalize().values.astype("datetime64[ns]"):
-        diffs = (anchor_arr - cur).astype("timedelta64[D]").astype(int)
-        pos = diffs[diffs >= 0]
-        neg = (-diffs[diffs <= 0])
-        next_gap.append(int(pos.min()) if len(pos) else clip_days)
-        prev_gap.append(int(neg.min()) if len(neg) else clip_days)
-    feat[f"{prefix}_yakınlık_sonraki"] = pd.Series(next_gap).clip(lower=0, upper=clip_days)
-    feat[f"{prefix}_yakınlık_onceki"] = pd.Series(prev_gap).clip(lower=0, upper=clip_days)
-    feat[f"{prefix}_yakınlık_min"] = np.minimum(feat[f"{prefix}_yakınlık_sonraki"], feat[f"{prefix}_yakınlık_onceki"])
-    for w in [3, 7, 14, 28]:
-        feat[f"{prefix}_yakın_flag_{w}"] = (feat[f"{prefix}_yakınlık_min"] <= w).astype(int)
-    return feat
-
-
-def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[pd.DataFrame], freq_alias: str) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    V30 override:
-    - holiday proximity
-    - special-event proximity
-    - moving min/max full integration
-    - weekly feature enrichment
-    """
-    df = full_df[["ds", "y"]].copy().reset_index(drop=True)
-    ds = pd.to_datetime(df["ds"])
-    season_len = infer_season_length_from_freq(freq_alias)
-
-    lag_set = [1, 2, 3, 6, 12]
-    if freq_alias == "W":
-        lag_set = [1, 2, 3, 4, 6, 8, 13, 26, 39, 52]
-    elif freq_alias == "D":
-        lag_set = [1, 2, 3, 7, 14, 21, 28, 56]
-    elif freq_alias == "M":
-        lag_set = [1, 2, 3, 6, 12, 18, 24]
-    elif freq_alias == "H":
-        lag_set = [1, 2, 3, 6, 12, 24, 48, 72, 168]
-
-    for lag in sorted(set(lag_set)):
-        df[f"lag_{lag}"] = df["y"].shift(lag)
-
-    if season_len > 1:
-        df[f"seasonal_lag_{season_len}"] = df["y"].shift(season_len)
-        df[f"diff_{season_len}"] = df["y"].diff(season_len)
-    df["diff_1"] = df["y"].diff(1)
-
-    shifted = df["y"].shift(1)
-    win_set = [3, 6, 12, max(2, season_len)]
-    if freq_alias == "W":
-        win_set += [4, 8, 13, 26, 52]
-    elif freq_alias == "D":
-        win_set += [7, 14, 28]
-    elif freq_alias == "H":
-        win_set += [24, 48, 72, 168]
-    for w in sorted(set([int(x) for x in win_set if int(x) > 1])):
-        min_p = max(2, min(4, w))
-        roll = shifted.rolling(w, min_periods=min_p)
-        df[f"roll_mean_{w}"] = roll.mean()
-        df[f"roll_std_{w}"] = roll.std()
-        df[f"roll_min_{w}"] = roll.min()
-        df[f"roll_max_{w}"] = roll.max()
-        df[f"roll_range_{w}"] = df[f"roll_max_{w}"] - df[f"roll_min_{w}"]
-        df[f"roll_median_{w}"] = roll.median()
-        df[f"roll_q25_{w}"] = roll.quantile(0.25)
-        df[f"roll_q75_{w}"] = roll.quantile(0.75)
-        df[f"roll_iqr_{w}"] = df[f"roll_q75_{w}"] - df[f"roll_q25_{w}"]
-        df[f"ewm_mean_{w}"] = shifted.ewm(span=max(2, w), adjust=False).mean()
-        df[f"trend_slope_{w}"] = shifted.diff().rolling(w, min_periods=min_p).mean()
-
-    if freq_alias == "W":
-        for w in [4, 8, 13, 26, 52]:
-            min_p = max(2, min(4, w))
-            s = shifted.rolling(w, min_periods=min_p).mean()
-            st = shifted.rolling(w, min_periods=min_p).std().replace(0, np.nan)
-            df[f"recent_mean_gap_{w}"] = shifted - s
-            df[f"recent_z_{w}"] = (shifted - s) / st
-            df[f"roll_min_gap_{w}"] = shifted - shifted.rolling(w, min_periods=min_p).min()
-            df[f"roll_max_gap_{w}"] = shifted.rolling(w, min_periods=min_p).max() - shifted
-
-    # calendar
-    df["year"] = ds.dt.year
-    df["quarter"] = ds.dt.quarter
-    df["month"] = ds.dt.month
-    iso_week = ds.dt.isocalendar().week.astype(int)
-    df["weekofyear"] = iso_week
-    df["dayofweek"] = ds.dt.dayofweek
-    df["dayofmonth"] = ds.dt.day
-    df["is_month_start"] = ds.dt.is_month_start.astype(int)
-    df["is_month_end"] = ds.dt.is_month_end.astype(int)
-    df["is_quarter_start"] = ds.dt.is_quarter_start.astype(int)
-    df["is_quarter_end"] = ds.dt.is_quarter_end.astype(int)
-    df["is_year_start"] = ds.dt.is_year_start.astype(int)
-    df["is_year_end"] = ds.dt.is_year_end.astype(int)
-
-    month_num = ds.dt.month.fillna(1).astype(int)
-    df["month_sin"] = np.sin(2 * np.pi * month_num / 12.0)
-    df["month_cos"] = np.cos(2 * np.pi * month_num / 12.0)
-    if freq_alias in ["W", "D"]:
-        week_num = iso_week.clip(lower=1)
-        df["week_sin"] = np.sin(2 * np.pi * week_num / 52.0)
-        df["week_cos"] = np.cos(2 * np.pi * week_num / 52.0)
-    if freq_alias in ["D", "H", "W"]:
-        dow = ds.dt.dayofweek.astype(int)
-        df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
-        df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
-    if freq_alias == "H":
-        hour = ds.dt.hour.astype(int)
-        df["hour"] = hour
-        df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
-        df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
-
-    # holiday and special-event proximity
-    cal = _build_tr_holiday_event_tables(ds)
-    hol_df = _proximity_features(ds, cal.get("holiday_dates", []), "tatil")
-    spec_df = _proximity_features(ds, cal.get("special_event_dates", []), "ozel_olay")
-    ram_df = _proximity_features(ds, cal.get("ramadan_dates", []), "ramazan")
-    eid_df = _proximity_features(ds, cal.get("eid_dates", []), "kurban")
-    for block in [hol_df, spec_df, ram_df, eid_df]:
-        for c in block.columns:
-            df[c] = block[c].values
-
-    # lightweight semantic holiday categories
-    normalized_dates = ds.dt.normalize()
-    holiday_name_map = cal.get("holiday_names", {})
-    holiday_names = normalized_dates.map(lambda x: holiday_name_map.get(pd.Timestamp(x), ""))
-    df["resmi_tatil_flag"] = holiday_names.ne("").astype(int)
-    df["ramazan_bayramı_flag"] = holiday_names.astype(str).str.contains("ramazan|fıtr|fitr", case=False, regex=True).astype(int)
-    df["kurban_bayramı_flag"] = holiday_names.astype(str).str.contains("kurban|adha", case=False, regex=True).astype(int)
-    df["yılbaşı_penceresi_flag"] = ((normalized_dates.dt.month.eq(12) & normalized_dates.dt.day.ge(20)) | (normalized_dates.dt.month.eq(1) & normalized_dates.dt.day.le(10))).astype(int)
-    df["okul_açılış_penceresi_flag"] = ((normalized_dates.dt.month.eq(9) & normalized_dates.dt.day.le(21))).astype(int)
-    df["grip_sezonu_flag"] = normalized_dates.dt.month.isin([11, 12, 1, 2, 3]).astype(int)
-    df["özel_olay_toplam_flag"] = (df[[
-        "ramazan_bayramı_flag", "kurban_bayramı_flag", "yılbaşı_penceresi_flag",
-        "okul_açılış_penceresi_flag", "grip_sezonu_flag", "resmi_tatil_flag"
-    ]].sum(axis=1) > 0).astype(int)
-
-    if existing_exog is not None and len(existing_exog.columns) > 0:
-        exog = existing_exog.copy().reset_index(drop=True)
-        for c in exog.columns:
-            df[f"exog__{c}"] = pd.to_numeric(exog[c], errors="coerce")
-
-    feature_cols = [c for c in df.columns if c not in ["ds", "y"]]
-    return df, feature_cols
-
-
-def build_weighted_ensemble(
-    pred_map: Dict[str, np.ndarray],
-    metrics_df: pd.DataFrame,
-    validation_df: Optional[pd.DataFrame] = None,
-    y_train: Optional[np.ndarray] = None,
-    y_true: Optional[np.ndarray] = None,
-    rolling_summary: Optional[pd.DataFrame] = None,
-    profile: Optional[Dict[str, Any]] = None,
-) -> Tuple[np.ndarray, pd.DataFrame]:
-    """
-    V30 override:
-    - clean weekly rolling-aware ensemble
-    - no NaN rolling components in output table
-    - peak/bias/recent/horizon aware weighting
-    """
-    if not pred_map:
-        raise ValueError("Ansambl için model bulunamadı.")
-    profile = profile or {}
-    regime = infer_runtime_regime_from_profile(profile=profile, y_train=y_train)
-    freq_alias = str(profile.get("freq_alias", "")).upper()
-
-    use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
-    if len(use_df) == 0:
-        raise ValueError("Ansambl için metrik bulunamadı.")
-
-    # validation
-    if validation_df is not None and len(validation_df) > 0:
-        val_ctx = build_contextual_validation_ranking(validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy(), profile=profile)
-        keep = [c for c in ["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"] if c in val_ctx.columns]
-        use_df = use_df.merge(val_ctx[keep], on="model", how="left")
-    use_df["val_WAPE"] = pd.to_numeric(use_df.get("val_WAPE"), errors="coerce")
-    use_df["val_sMAPE"] = pd.to_numeric(use_df.get("val_sMAPE"), errors="coerce")
-    use_df["bağlamsal_ceza"] = pd.to_numeric(use_df.get("bağlamsal_ceza"), errors="coerce").fillna(0.0)
-    use_df["bağlamsal_doğrulama_skoru"] = pd.to_numeric(use_df.get("bağlamsal_doğrulama_skoru"), errors="coerce")
-
-    # rolling
-    ro_rows = []
-    ro_df = rolling_summary.copy() if isinstance(rolling_summary, pd.DataFrame) else pd.DataFrame()
-    for model_name in use_df["model"].tolist():
-        row = ro_df.loc[ro_df["model"].eq(model_name)].head(1) if len(ro_df) else pd.DataFrame()
-        ro_rows.append({
-            "model": model_name,
-            "rolling_wape_bileşeni": float(pd.to_numeric(row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(row) else np.nan,
-            "rolling_mae_bileşeni": float(pd.to_numeric(row.iloc[0].get("MAE", np.nan), errors="coerce")) if len(row) else np.nan,
-        })
-    use_df = use_df.drop(columns=[c for c in ["rolling_wape_bileşeni", "rolling_mae_bileşeni"] if c in use_df.columns], errors="ignore")
-    use_df = use_df.merge(pd.DataFrame(ro_rows), on="model", how="left")
-
-    # peak / recent / horizon
-    recent_rows = []
-    peak_rows = []
-    if y_train is not None and y_true is not None:
-        y_train_arr = np.asarray(y_train, dtype=float)
-        y_true_arr = np.asarray(y_true, dtype=float)
-        for model_name, pred in pred_map.items():
-            pred_arr = np.asarray(pred, dtype=float)
-            peak = compute_peak_event_score(y_train_arr, y_true_arr, pred_arr)
-            peak_rows.append({
-                "model": model_name,
-                "peak_event_score": safe_float(peak.get("peak_event_score", np.nan)),
-                "peak_precision_component": safe_float(peak.get("peak_precision", np.nan)),
-                "peak_recall_component": safe_float(peak.get("peak_recall", np.nan)),
-            })
-            ape = np.abs(y_true_arr - pred_arr) / np.where(np.abs(y_true_arr) > 1e-8, np.abs(y_true_arr), np.nan)
-            rw = min(4 if freq_alias == "W" else 3, len(ape))
-            recent_local_wape = np.nanmean(ape[-rw:]) * 100.0 if rw > 0 else np.nan
-            horizon_weights = np.linspace(1.0, 1.8 if freq_alias == "W" else 1.35, len(ape))
-            horizon_specific_wape = np.nansum(ape * horizon_weights) / np.nansum(np.where(np.isfinite(ape), horizon_weights, 0.0)) * 100.0 if len(ape) else np.nan
-            recent_rows.append({
-                "model": model_name,
-                "recent_local_WAPE": safe_float(recent_local_wape),
-                "horizon_specific_WAPE": safe_float(horizon_specific_wape),
-            })
-
-    if peak_rows:
-        use_df = use_df.merge(pd.DataFrame(peak_rows), on="model", how="left")
-    if recent_rows:
-        use_df = use_df.merge(pd.DataFrame(recent_rows), on="model", how="left")
-
-    for c in ["WAPE", "sMAPE", "MAE", "BiasPct", "UnderForecastRate", "val_WAPE", "val_sMAPE",
-              "rolling_wape_bileşeni", "rolling_mae_bileşeni", "recent_local_WAPE", "horizon_specific_WAPE",
-              "peak_event_score", "peak_precision_component", "peak_recall_component"]:
-        use_df[c] = pd.to_numeric(use_df.get(c), errors="coerce")
-
-    # fill all output columns
-    use_df["val_WAPE"] = use_df["val_WAPE"].fillna(use_df["WAPE"])
-    use_df["val_sMAPE"] = use_df["val_sMAPE"].fillna(use_df["sMAPE"])
-    use_df["rolling_wape_bileşeni"] = use_df["rolling_wape_bileşeni"].fillna(use_df["WAPE"])
-    use_df["rolling_mae_bileşeni"] = use_df["rolling_mae_bileşeni"].fillna(use_df["MAE"])
-    use_df["recent_local_WAPE"] = use_df["recent_local_WAPE"].fillna(use_df["WAPE"])
-    use_df["horizon_specific_WAPE"] = use_df["horizon_specific_WAPE"].fillna(use_df["WAPE"])
-    use_df["peak_event_score"] = use_df["peak_event_score"].fillna(0.5)
-    use_df["peak_precision_component"] = use_df["peak_precision_component"].fillna(0.5)
-    use_df["peak_recall_component"] = use_df["peak_recall_component"].fillna(0.5)
-    use_df["BiasPct"] = use_df["BiasPct"].fillna(0.0)
-    use_df["UnderForecastRate"] = use_df["UnderForecastRate"].fillna(0.5)
-
-    def _norm(s: pd.Series) -> pd.Series:
-        x = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if x.notna().sum() == 0:
-            return pd.Series(0.0, index=s.index, dtype=float)
-        mn, mx = float(x.min()), float(x.max())
-        if not np.isfinite(mn) or not np.isfinite(mx) or abs(mx - mn) < 1e-12:
-            return pd.Series(0.0, index=s.index, dtype=float)
-        return (x - mn) / (mx - mn)
-
-    use_df["holdout_norm"] = _norm(use_df["WAPE"])
-    use_df["validation_norm"] = _norm(use_df["val_WAPE"])
-    use_df["rolling_norm"] = _norm(use_df["rolling_wape_bileşeni"])
-    use_df["recent_norm"] = _norm(use_df["recent_local_WAPE"])
-    use_df["horizon_norm"] = _norm(use_df["horizon_specific_WAPE"])
-    use_df["bias_penalty"] = use_df["BiasPct"].abs().clip(upper=18.0) / 18.0
-    use_df["under_penalty"] = (use_df["UnderForecastRate"] - 0.52).clip(lower=0.0, upper=0.40) / 0.40
-    use_df["peak_penalty"] = (0.80 - use_df["peak_event_score"]).clip(lower=0.0, upper=0.80) / 0.80
-    use_df["regime_penalty"] = 0.0
-
-    if not regime.get("intermittent_like", False):
-        use_df.loc[use_df["model"].eq("Intermittent"), "regime_penalty"] += 0.85
-    if freq_alias == "W":
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_penalty"] += 0.50
-    if not regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_penalty"] += 0.25
-    if regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_penalty"] -= 0.08
-
-    if freq_alias == "W":
-        weights_cfg = {"hold": 0.14, "val": 0.16, "roll": 0.32, "recent": 0.18, "horizon": 0.12}
+def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFrame:
+    if not isinstance(prophet_result, dict) or len(prophet_result) == 0:
+        return pd.DataFrame(columns=["Alan", "Değer"])
+    mode = prophet_result.get("fit_mode", "bilinmiyor")
+    fallback_used = bool(prophet_result.get("fallback_used", False))
+    fallback_method = prophet_result.get("fallback_method")
+    note = prophet_result.get("fit_visibility_note", "")
+    if mode == "gercek_prophet_fit" and not fallback_used:
+        rozet = "Gerçek Prophet"
+        production_note = "Üretimde ancak doğrulama ve uygunluk kapısından geçerse kullanılmalı."
+    elif fallback_used:
+        rozet = "Fallback Prophet"
+        production_note = "Production’da kullanılmaz; görselde soluk gösterilir ve yalnız meydan okuyucu/tanısal amaçla kullanılır."
     else:
-        weights_cfg = {"hold": 0.22, "val": 0.22, "roll": 0.24, "recent": 0.12, "horizon": 0.08}
+        rozet = "Prophet belirsiz"
+        production_note = "Bu çalışma modu temkinli yorumlanmalı."
+    return pd.DataFrame([
+        {"Alan": "Prophet rozeti", "Değer": rozet},
+        {"Alan": "Prophet çalışma modu", "Değer": mode},
+        {"Alan": "Gerçek Prophet fit kullanıldı mı?", "Değer": "evet" if (mode == "gercek_prophet_fit" and not fallback_used) else "hayır"},
+        {"Alan": "Fallback kullanıldı mı?", "Değer": "evet" if fallback_used else "hayır"},
+        {"Alan": "Fallback yöntemi", "Değer": fallback_method or "yok"},
+        {"Alan": "Üretim notu", "Değer": production_note},
+        {"Alan": "Açıklama", "Değer": note or "-"},
+    ])
 
-    use_df["birleşik_skor"] = (
-        use_df["holdout_norm"] * weights_cfg["hold"]
-        + use_df["validation_norm"] * weights_cfg["val"]
-        + use_df["rolling_norm"] * weights_cfg["roll"]
-        + use_df["recent_norm"] * weights_cfg["recent"]
-        + use_df["horizon_norm"] * weights_cfg["horizon"]
-        + use_df["peak_penalty"] * 0.08
-        + use_df["bias_penalty"] * 0.04
-        + use_df["under_penalty"] * 0.04
-        + use_df["regime_penalty"] * 0.10
-        + use_df["bağlamsal_ceza"] * 0.05
-    )
-    use_df = use_df.sort_values(["birleşik_skor", "rolling_wape_bileşeni", "WAPE", "val_WAPE"], ascending=[True, True, True, True], na_position="last").reset_index(drop=True)
 
-    pruned = use_df.head(4).copy() if len(use_df) > 4 else use_df.copy()
-    if "Prophet" in pruned["model"].tolist() and freq_alias == "W":
-        ps = float(pd.to_numeric(pruned.loc[pruned["model"].eq("Prophet"), "birleşik_skor"].iloc[0], errors="coerce"))
-        best = float(pd.to_numeric(pruned["birleşik_skor"].min(), errors="coerce"))
-        if np.isfinite(ps) and np.isfinite(best) and ps > best + 0.03 and len(pruned) > 2:
-            pruned = pruned.loc[~pruned["model"].eq("Prophet")].copy()
 
-    raw = np.exp(-5.8 * (pruned["birleşik_skor"] - float(pruned["birleşik_skor"].min())).clip(lower=0.0))
-    peak_factor = 0.70 + 0.60 * pruned["peak_event_score"].clip(lower=0.0, upper=1.0)
-    bias_factor = np.exp(-0.045 * pruned["BiasPct"].abs().clip(upper=18.0))
-    under_factor = np.exp(-2.6 * (pruned["UnderForecastRate"] - 0.52).clip(lower=0.0, upper=0.40))
-    regime_factor = np.exp(-2.2 * pruned["regime_penalty"].clip(lower=0.0, upper=1.0))
-    recent_factor = np.exp(-1.35 * pruned["recent_norm"].clip(lower=0.0, upper=1.0))
-    horizon_factor = np.exp(-1.10 * pruned["horizon_norm"].clip(lower=0.0, upper=1.0))
-    rolling_factor = np.exp(-1.35 * pruned["rolling_norm"].clip(lower=0.0, upper=1.0))
-
-    pruned["ham_ağırlık"] = raw
-    pruned["nihai_ham_ağırlık"] = raw * peak_factor * bias_factor * under_factor * regime_factor * recent_factor * horizon_factor * rolling_factor
-
-    if not regime.get("intermittent_like", False) and "Intermittent" in pruned["model"].tolist():
-        idx = pruned.index[pruned["model"].eq("Intermittent")]
-        pruned.loc[idx, "nihai_ham_ağırlık"] = np.minimum(pruned.loc[idx, "nihai_ham_ağırlık"].astype(float), 0.06 if freq_alias == "W" else 0.10)
-
-    w = pruned["nihai_ham_ağırlık"].astype(float).values
-    if not np.isfinite(w).all() or np.sum(w) <= 0:
-        w = np.ones(len(pruned), dtype=float)
-    w = w / np.sum(w)
-
-    # force a meaningful leader without over-dominance
-    if len(w) >= 2:
-        top_target = 0.54 if freq_alias == "W" else 0.50
-        if w[0] < top_target:
-            deficit = top_target - w[0]
-            w[0] = top_target
-            if w[1:].sum() > 0:
-                rest = w[1:] / w[1:].sum()
-                w[1:] = np.maximum(0.0, w[1:] - deficit * rest)
-                w = w / max(w.sum(), 1e-9)
-
-    pruned["ağırlık"] = w
-
-    ensemble = None
-    for _, row in pruned.iterrows():
-        pred = np.asarray(pred_map[row["model"]], dtype=float)
-        ensemble = pred * row["ağırlık"] if ensemble is None else ensemble + pred * row["ağırlık"]
-
-    out_cols = [
-        "model", "WAPE", "sMAPE", "MAE", "val_WAPE", "val_sMAPE",
-        "rolling_wape_bileşeni", "rolling_mae_bileşeni",
-        "recent_local_WAPE", "horizon_specific_WAPE",
-        "BiasPct", "UnderForecastRate",
-        "peak_event_score", "peak_precision_component", "peak_recall_component",
-        "bağlamsal_ceza", "holdout_norm", "validation_norm", "rolling_norm",
-        "recent_norm", "horizon_norm", "bias_penalty", "under_penalty",
-        "peak_penalty", "regime_penalty", "birleşik_skor",
-        "ham_ağırlık", "nihai_ham_ağırlık", "ağırlık"
+def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
+    adaylar: List[Tuple[str, pd.DataFrame]] = [
+        ("ModelKarşılaştırma", outputs.get("metrics_df", pd.DataFrame())),
+        ("DoğrulamaMetrikleri", outputs.get("validation_metrics_df", pd.DataFrame())),
+        ("KararHiyerarşisi", build_karar_hiyerarsisi_ozeti(outputs)),
+        ("AnsamblAğırlıkları", outputs.get("ensemble_weights", pd.DataFrame())),
+        ("RollingOrigin", outputs.get("rolling_origin_backtest", pd.DataFrame())),
+        ("BiasDashboard", prod_pack.get("bias_dashboard", pd.DataFrame())),
+        ("PeakDashboard", prod_pack.get("peak_event_dashboard", pd.DataFrame())),
+        ("CanlıİzlemeÖzeti", (prod_pack.get("live_monitoring_pack", {}) or {}).get("summary", pd.DataFrame())),
+        ("ÜretimAlarmları", (prod_pack.get("live_monitoring_pack", {}) or {}).get("alerts", pd.DataFrame())),
+        ("ÜretimSıralaması", prod_pack.get("production_ranking", pd.DataFrame())),
+        ("ÖzellikDenetimi", prod_pack.get("feature_availability_audit", pd.DataFrame())),
+        ("ServisSeviyesi", prod_pack.get("production_service_table", pd.DataFrame())),
+        ("TahminAralığı", prod_pack.get("production_interval_table", pd.DataFrame())),
     ]
-    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[[c for c in out_cols if c in pruned.columns]].reset_index(drop=True)
-
-
-def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
-    prod_model = production_pack.get("production_model", outputs.get("best_model"))
-    bias_df = production_pack.get("bias_dashboard", pd.DataFrame())
-    peak_df = production_pack.get("peak_event_dashboard", pd.DataFrame())
-    gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame())
-    interval_df = production_pack.get("production_interval_table", pd.DataFrame())
-    feature_df = production_pack.get("feature_availability_audit", pd.DataFrame())
-    service_df = production_pack.get("production_service_table", pd.DataFrame())
-    full_ro = outputs.get("rolling_origin_backtest", pd.DataFrame())
-    robt = summarize_full_backtest(full_ro)
-    fallback_flags = {
-        "XGBoost": bool((outputs.get("xgboost") or {}).get("fallback_used", False)),
-        "Prophet": bool((outputs.get("prophet") or {}).get("fallback_used", False)),
-        "SARIMA/SARIMAX": bool((outputs.get("sarima") or {}).get("fallback_used", False)),
-        "ARIMA": bool((outputs.get("arima") or {}).get("fallback_used", False)),
-        "Intermittent": bool((outputs.get("intermittent") or {}).get("fallback_used", False)),
-    }
-    fallback_rate = float(np.mean(list(fallback_flags.values()))) if fallback_flags else 0.0
-    alerts = []
-    train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
-    prod_pred = np.asarray((outputs.get("predictions") or {}).get(prod_model, np.array([])), dtype=float)
-    recent_mean = float(train_y.tail(min(12, len(train_y))).mean()) if len(train_y) else np.nan
-    drift_ratio = float(np.mean(prod_pred) / max(recent_mean, 1e-6)) if len(prod_pred) and pd.notna(recent_mean) else np.nan
-    bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
-    peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
-    gate_row = gate_df.loc[gate_df["model"] == prod_model].head(1) if len(gate_df) else pd.DataFrame()
-    ro_row = robt.loc[robt["model"] == prod_model].head(1) if len(robt) else pd.DataFrame()
-    service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) else pd.DataFrame()
-    achieved_service = float(pd.to_numeric(service_row.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce")) if len(service_row) else np.nan
-    target_service = float(pd.to_numeric(service_row.iloc[0].get("service_level_target", np.nan), errors="coerce")) if len(service_row) else np.nan
-
-    freq_alias = str(outputs.get("metadata", {}).get("freq_alias", "")).upper()
-    freq_desc_map = {"M": "Aylık", "W": "Haftalık", "D": "Günlük", "H": "Saatlik"}
-    freq_desc = freq_desc_map.get(freq_alias, freq_alias or "Bilinmiyor")
-
-    summary_row = {
-        "frekans": freq_alias,
-        "frekans_açıklama": freq_desc,
-        "frekans_rozeti": f"{freq_desc} Çalışma",
-        "üretim_modeli": prod_model,
-        "üretim_durumu": production_pack.get("production_status", "eligible"),
-        "sapma_yüzde": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "eksik_tahmin_oranı": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "tepe_olay_skoru": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan,
-        "uygunluk_skoru": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan,
-        "rolling_wape": float(pd.to_numeric(ro_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(ro_row) else np.nan,
-        "drift_oranı": drift_ratio,
-        "kapsama_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
-        "kapsama_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
-        "maksimum_özellik_riski": float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max()) if len(feature_df) else np.nan,
-        "fallback_oranı": fallback_rate,
-        "gerçekleşen_servis": achieved_service,
-        "hedef_servis": target_service,
-    }
-
-    if pd.notna(summary_row["sapma_yüzde"]) and abs(summary_row["sapma_yüzde"]) > 8.0:
-        alerts.append({"severity": "high", "alert": "sapma_alarmı", "detail": f"Sapma yüksek: {summary_row['sapma_yüzde']:.2f}%"})
-    if pd.notna(summary_row["eksik_tahmin_oranı"]) and summary_row["eksik_tahmin_oranı"] > 0.60:
-        alerts.append({"severity": "high", "alert": "eksik_tahmin_alarmı", "detail": f"Eksik tahmin oranı yüksek: {summary_row['eksik_tahmin_oranı']:.2f}"})
-    if pd.notna(summary_row["tepe_olay_skoru"]) and summary_row["tepe_olay_skoru"] < 0.35:
-        alerts.append({"severity": "high", "alert": "tepe_yakalama_alarmı", "detail": f"Tepe olay yakalama zayıf: {summary_row['tepe_olay_skoru']:.2f}"})
-    if pd.notna(summary_row["drift_oranı"]) and not (0.82 <= summary_row["drift_oranı"] <= 1.22):
-        alerts.append({"severity": "medium", "alert": "drift_alarmı", "detail": f"Tahmin/son dönem seviye oranı: {summary_row['drift_oranı']:.2f}"})
-    if pd.notna(summary_row["maksimum_özellik_riski"]) and summary_row["maksimum_özellik_riski"] > 0.25:
-        alerts.append({"severity": "high", "alert": "özellik_kontratı_alarmı", "detail": "Production feature contract tamamen güvenli değil."})
-    if pd.notna(summary_row["gerçekleşen_servis"]) and pd.notna(summary_row["hedef_servis"]) and summary_row["gerçekleşen_servis"] + 1e-9 < summary_row["hedef_servis"]:
-        alerts.append({"severity": "high", "alert": "servis_seviyesi_alarmı", "detail": f"Servis seviyesi hedef altında: {summary_row['gerçekleşen_servis']:.2f} < {summary_row['hedef_servis']:.2f}"})
-    if fallback_rate > 0.20:
-        alerts.append({"severity": "medium", "alert": "fallback_oranı_alarmı", "detail": f"Model ailelerinde fallback oranı yüksek: {fallback_rate:.2f}"})
-
-    recommendation = "guardrailli_üretime_uygun"
-    if any(a["severity"] == "high" for a in alerts):
-        recommendation = "shadow_mode_zorunlu"
-    elif alerts:
-        recommendation = "şampiyon_meydan_okuyan_paralel"
-
-    summary = pd.DataFrame([summary_row])
-    summary["alarm_sayısı"] = len(alerts)
-    summary["yüksek_alarm_sayısı"] = sum(1 for a in alerts if a["severity"] == "high")
-    summary["canlı_kullanım_önerisi"] = recommendation
-    summary["karar_açıklaması"] = build_production_decision_explanation(production_pack.get("production_ranking", pd.DataFrame()), prod_model)
-    summary["üst_karar_kartı"] = summary.apply(
-        lambda r: f"{r.get('frekans_rozeti', '')} | Üretim: {r['üretim_modeli']} | Sapma: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | K80: {safe_float(r.get('kapsama_80', np.nan)):.2f} | K90: {safe_float(r.get('kapsama_90', np.nan)):.2f} | Fallback: {safe_float(r.get('fallback_oranı', np.nan)):.2f} | Drift: {safe_float(r.get('drift_oranı', np.nan)):.2f} | Servis: {safe_float(r.get('gerçekleşen_servis', np.nan)):.2f}/{safe_float(r.get('hedef_servis', np.nan)):.2f} | Alarm: {int(r.get('alarm_sayısı', 0))}",
-        axis=1,
-    )
-    karar_karti = pd.DataFrame([{
-        "Karar": ("Üretime uygun" if recommendation == "guardrailli_üretime_uygun" else "Ek izleme gerekli"),
-        "FrekansRozeti": summary_row.get("frekans_rozeti"),
-        "Frekans": freq_desc,
-        "ÜretimModeli": prod_model,
-        "SapmaYüzde": summary_row.get("sapma_yüzde"),
-        "Kapsama80": summary_row.get("kapsama_80"),
-        "Kapsama90": summary_row.get("kapsama_90"),
-        "FallbackOranı": summary_row.get("fallback_oranı"),
-        "DriftOranı": summary_row.get("drift_oranı"),
-        "ServisSeviyesi": summary_row.get("gerçekleşen_servis"),
-        "AlarmSayısı": len(alerts),
-        "Açıklama": summary["karar_açıklaması"].iloc[0] if len(summary) else "",
-        "CanlıKullanımÖnerisi": recommendation,
-    }])
-
-    metric_df = outputs.get("metrics_df", pd.DataFrame())
-    prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
-    service_level_tables = production_pack.get("service_level_simulation", {}) or {}
-    health_rows = []
-    for model_name in metric_df.get("model", pd.Series(dtype=str)).tolist() if isinstance(metric_df, pd.DataFrame) else []:
-        mrow = metric_df.loc[metric_df["model"] == model_name].head(1)
-        brow = bias_df.loc[bias_df["model"] == model_name].head(1) if len(bias_df) else pd.DataFrame()
-        prow = peak_df.loc[peak_df["model"] == model_name].head(1) if len(peak_df) else pd.DataFrame()
-        grow = gate_df.loc[gate_df["model"] == model_name].head(1) if len(gate_df) else pd.DataFrame()
-        rrow = robt.loc[robt["model"] == model_name].head(1) if len(robt) else pd.DataFrame()
-        qrow = prediction_interval_tables.get(model_name, pd.DataFrame())
-        srow = service_level_tables.get(model_name, pd.DataFrame())
-        achieved = np.nan
-        if isinstance(srow, pd.DataFrame) and len(srow):
-            sr = srow.loc[srow["service_level_target"] == srow["service_level_target"].max()].head(1)
-            if len(sr):
-                achieved = float(pd.to_numeric(sr.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce"))
-        health_rows.append({
-            "model": model_name,
-            "WAPE": float(pd.to_numeric(mrow.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(mrow) else np.nan,
-            "rolling_WAPE": float(pd.to_numeric(rrow.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(rrow) else np.nan,
-            "bias_pct": float(pd.to_numeric(brow.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(brow) else np.nan,
-            "under_forecast_rate": float(pd.to_numeric(brow.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(brow) else np.nan,
-            "peak_event_score": float(pd.to_numeric(prow.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(prow) else np.nan,
-            "coverage_80": float(qrow["coverage_80"].mean()) if isinstance(qrow, pd.DataFrame) and "coverage_80" in qrow.columns else np.nan,
-            "fallback_used": bool(fallback_flags.get(model_name, False)),
-            "service": achieved,
-            "status": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
-            "frekans": freq_desc,
-        })
-    return {"summary": summary, "alerts": pd.DataFrame(alerts), "model_health_table": pd.DataFrame(health_rows), "karar_karti": karar_karti}
+    rows = []
+    seen = {}
+    for rapor_adi, df in adaylar:
+        if not isinstance(df, pd.DataFrame) or len(df) == 0:
+            continue
+        try:
+            key = hashlib.sha1(df.to_csv(index=False).encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            key = f"{rapor_adi}_{len(df)}_{len(df.columns)}"
+        duplicate_of = seen.get(key)
+        if duplicate_of is None:
+            seen[key] = rapor_adi
+            rows.append({"Rapor": rapor_adi, "SatırSayısı": int(len(df)), "KolonSayısı": int(len(df.columns)), "Durum": "benzersiz", "TekrarEttiğiRapor": ""})
+        else:
+            rows.append({"Rapor": rapor_adi, "SatırSayısı": int(len(df)), "KolonSayısı": int(len(df.columns)), "Durum": "yinelenen_içerik", "TekrarEttiğiRapor": duplicate_of})
+    return pd.DataFrame(rows)
 
 def render_streamlit_app():
     st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
@@ -9970,15 +8880,7 @@ def render_streamlit_app():
                     if mode == "Tek seri":
                         cached_obj = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
                     else:
-                        batch_progress_bar = st.progress(0)
-                        batch_progress_text = st.empty()
-                        def _batch_progress_callback(progress_fraction: float, message: str) -> None:
-                            pct = int(max(0, min(100, round(float(progress_fraction) * 100))))
-                            batch_progress_bar.progress(pct)
-                            batch_progress_text.caption(message)
-                        cached_obj = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet, progress_callback=_batch_progress_callback)
-                        batch_progress_bar.progress(100)
-                        batch_progress_text.success("Batch forecasting tamamlandı.")
+                        cached_obj = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet)
                     st.session_state["forecast_run_cache"][forecast_cache_key] = cached_obj
 
                 if mode == "Tek seri":
@@ -10189,6 +9091,7 @@ def render_streamlit_app():
             suggestions.append("Seri dengeli; champion-challenger ve ensemble izlemesi yeterli görünüyor.")
         for s in suggestions:
             st.write(f"- {s}")
+
 
 
 def _resolve_streamlit_entrypoint():
