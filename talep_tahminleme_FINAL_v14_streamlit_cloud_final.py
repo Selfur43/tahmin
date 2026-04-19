@@ -8067,6 +8067,178 @@ def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Di
     }
 
 
+
+
+def _safe_sort_columns(df: pd.DataFrame, preferred_cols: List[str], fallback_cols: Optional[List[str]] = None) -> List[str]:
+    if df is None or len(df) == 0:
+        return []
+    cols = [c for c in preferred_cols if c in df.columns]
+    if cols:
+        return cols
+    fallback_cols = fallback_cols or []
+    return [c for c in fallback_cols if c in df.columns]
+
+
+def _derive_production_ranking(outputs: Dict[str, Any]) -> pd.DataFrame:
+    prod_pack = outputs.get("production_governance", {}) or {}
+    existing = prod_pack.get("production_ranking", pd.DataFrame())
+    if isinstance(existing, pd.DataFrame) and len(existing) > 0:
+        return existing.copy()
+
+    metrics_df = outputs.get("metrics_df", pd.DataFrame())
+    if not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
+        return pd.DataFrame(columns=["model", "status", "eligibility_score", "WAPE", "sMAPE", "MAE"])
+
+    ranked = metrics_df.copy()
+    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
+    if isinstance(gate_df, pd.DataFrame) and len(gate_df) > 0 and "model" in gate_df.columns:
+        merge_cols = [c for c in ["model", "status", "eligibility_score"] if c in gate_df.columns]
+        ranked = ranked.merge(gate_df[merge_cols].drop_duplicates(subset=["model"]), on="model", how="left")
+
+    if "status" not in ranked.columns:
+        ranked["status"] = outputs.get("production_status", "eligible")
+    if "eligibility_score" not in ranked.columns:
+        ranked["eligibility_score"] = np.nan
+
+    status_rank = {"eligible": 0, "guarded_fallback": 1, "challenger_only": 2, "reject": 3}
+    ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
+
+    sort_cols = [c for c in ["status_rank", "WAPE", "sMAPE", "MAE", "eligibility_score"] if c in ranked.columns]
+    ascending = []
+    for c in sort_cols:
+        ascending.append(False if c == "eligibility_score" else True)
+    if sort_cols:
+        ranked = ranked.sort_values(sort_cols, ascending=ascending, na_position="last").reset_index(drop=True)
+    return ranked
+
+
+def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
+    satirlar = []
+    hold_df = outputs.get("metrics_df", pd.DataFrame())
+    val_df = outputs.get("validation_metrics_df", pd.DataFrame())
+    ro_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    prod_rank = _derive_production_ranking(outputs)
+
+    hold_cols = _safe_sort_columns(hold_df, ["WAPE", "sMAPE", "RMSE"], ["WAPE", "sMAPE", "MAE"])
+    val_cols = _safe_sort_columns(val_df, ["validation_operational_score", "val_WAPE", "val_sMAPE"], ["val_WAPE", "val_sMAPE"])
+    ro_cols = _safe_sort_columns(ro_df, ["WAPE", "sMAPE", "MAE"], ["WAPE", "MAE"])
+
+    hold_winner = hold_df.sort_values(hold_cols, ascending=[True] * len(hold_cols)).iloc[0]["model"] if isinstance(hold_df, pd.DataFrame) and len(hold_df) > 0 and hold_cols else outputs.get("best_model")
+    val_winner = val_df.sort_values(val_cols, ascending=[True] * len(val_cols)).iloc[0]["model"] if isinstance(val_df, pd.DataFrame) and len(val_df) > 0 and val_cols else outputs.get("best_model")
+    ro_winner = ro_df.sort_values(ro_cols, ascending=[True] * len(ro_cols)).iloc[0]["model"] if isinstance(ro_df, pd.DataFrame) and len(ro_df) > 0 and ro_cols else outputs.get("best_model")
+    prod_winner = prod_rank.iloc[0]["model"] if isinstance(prod_rank, pd.DataFrame) and len(prod_rank) > 0 and "model" in prod_rank.columns else outputs.get("production_model", outputs.get("best_model"))
+
+    satirlar.append({"karar_kademesi": "Holdout kazananı", "model": hold_winner})
+    satirlar.append({"karar_kademesi": "Doğrulama kazananı", "model": val_winner})
+    satirlar.append({"karar_kademesi": "Rolling-origin kazananı", "model": ro_winner})
+    satirlar.append({"karar_kademesi": "Üretim kazananı", "model": prod_winner})
+    return pd.DataFrame(satirlar)
+
+
+def build_karar_hiyerarsisi_ozeti(outputs: Dict[str, Any]) -> pd.DataFrame:
+    lider = build_model_liderleri(outputs)
+    aciklama_map = {
+        "Holdout kazananı": "Son test ufkunda en düşük hata üreten model.",
+        "Doğrulama kazananı": "İç doğrulama / arama sonuçlarına göre öne çıkan model.",
+        "Rolling-origin kazananı": "Zaman boyunca geri testte daha stabil performans veren model.",
+        "Üretim kazananı": "Uygunluk, risk ve operasyonel kullanılabilirlik açısından canlı kullanım için önerilen model.",
+    }
+    karar_amaci_map = {
+        "Holdout kazananı": "Kısa dönem doğruluk",
+        "Doğrulama kazananı": "Model seçimi doğrulaması",
+        "Rolling-origin kazananı": "Zamansal dayanıklılık",
+        "Üretim kazananı": "Canlı kullanım kararı",
+    }
+    if not isinstance(lider, pd.DataFrame) or len(lider) == 0:
+        return pd.DataFrame(columns=["KararAşaması", "KazananModel", "KararAmacı", "Anlamı"])
+
+    out = lider.rename(columns={"karar_kademesi": "KararAşaması", "model": "KazananModel"}).copy()
+    out["KararAmacı"] = out["KararAşaması"].map(karar_amaci_map)
+    out["Anlamı"] = out["KararAşaması"].map(aciklama_map)
+
+    prod_pack = outputs.get("production_governance", {}) or {}
+    prod_expl = prod_pack.get("production_decision_explanation")
+    if not prod_expl:
+        try:
+            prod_expl = build_production_decision_explanation(_derive_production_ranking(outputs), outputs.get("production_model", outputs.get("best_model")))
+        except Exception:
+            prod_expl = None
+    if prod_expl:
+        extra = pd.DataFrame([{
+            "KararAşaması": "Üretim karar açıklaması",
+            "KazananModel": str(outputs.get("production_model", outputs.get("best_model", "-"))),
+            "KararAmacı": "Neden seçildi?",
+            "Anlamı": str(prod_expl),
+        }])
+        out = pd.concat([out, extra], axis=0, ignore_index=True)
+    return out
+
+
+def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFrame:
+    if not isinstance(prophet_result, dict) or len(prophet_result) == 0:
+        return pd.DataFrame(columns=["Alan", "Değer"])
+
+    mode = prophet_result.get("fit_mode") or prophet_result.get("mode") or "bilinmiyor"
+    fallback_used = bool(prophet_result.get("fallback_used", False))
+    fallback_method = prophet_result.get("fallback_method") or prophet_result.get("fallback_reason")
+    note = prophet_result.get("fit_visibility_note") or prophet_result.get("note") or prophet_result.get("status_note") or "-"
+
+    return pd.DataFrame([
+        {"Alan": "Prophet çalışma modu", "Değer": mode},
+        {"Alan": "Gerçek Prophet fit kullanıldı mı?", "Değer": "evet" if (str(mode) == "gercek_prophet_fit" and not fallback_used) else "hayır"},
+        {"Alan": "Fallback kullanıldı mı?", "Değer": "evet" if fallback_used else "hayır"},
+        {"Alan": "Fallback yöntemi", "Değer": fallback_method or "yok"},
+        {"Alan": "Açıklama", "Değer": note},
+    ])
+
+
+def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
+    prod_pack = prod_pack or {}
+    production_ranking = prod_pack.get("production_ranking", pd.DataFrame())
+    if not isinstance(production_ranking, pd.DataFrame) or len(production_ranking) == 0:
+        production_ranking = _derive_production_ranking(outputs)
+
+    live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
+    if not isinstance(live_pack, dict):
+        live_pack = {}
+
+    adaylar: List[Tuple[str, pd.DataFrame]] = [
+        ("ModelKarşılaştırma", outputs.get("metrics_df", pd.DataFrame())),
+        ("DoğrulamaMetrikleri", outputs.get("validation_metrics_df", pd.DataFrame())),
+        ("KararHiyerarşisi", build_karar_hiyerarsisi_ozeti(outputs)),
+        ("ModelLiderleri", build_model_liderleri(outputs)),
+        ("AnsamblAğırlıkları", outputs.get("ensemble_weights", pd.DataFrame())),
+        ("RollingOriginÖzet", summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))),
+        ("FallbackÖzeti", outputs.get("fallback_summary", pd.DataFrame())),
+        ("ProphetGörünürlük", build_prophet_gorunurluk_ozeti(outputs.get("prophet", {}))),
+        ("ÜretimUygunlukKapısı", prod_pack.get("model_eligibility_gate", pd.DataFrame())),
+        ("ÜretimSıralaması", production_ranking),
+        ("BiasDashboard", prod_pack.get("bias_dashboard", pd.DataFrame())),
+        ("PeakEventDashboard", prod_pack.get("peak_event_dashboard", pd.DataFrame())),
+        ("ForecastValueAdd", prod_pack.get("forecast_value_add", pd.DataFrame())),
+        ("FeatureAudit", prod_pack.get("feature_availability_audit", pd.DataFrame())),
+        ("PredictionIntervals", prod_pack.get("production_interval_table", pd.DataFrame())),
+        ("ServiceLevelSimulation", prod_pack.get("production_service_table", pd.DataFrame())),
+        ("CanlıİzlemeÖzet", live_pack.get("summary", pd.DataFrame())),
+        ("CanlıİzlemeAlarm", live_pack.get("alerts", pd.DataFrame())),
+        ("StageTiming", outputs.get("stage_timing_table", pd.DataFrame())),
+    ]
+
+    rows = []
+    for rapor_adi, df in adaylar:
+        if not isinstance(df, pd.DataFrame) or len(df) == 0:
+            continue
+        rows.append({
+            "Rapor": rapor_adi,
+            "SatırSayısı": int(len(df)),
+            "KolonSayısı": int(len(df.columns)),
+            "Kolonlar": ", ".join(map(str, df.columns.tolist()[:12])) + (" ..." if len(df.columns) > 12 else ""),
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["Rapor", "SatırSayısı", "KolonSayısı", "Kolonlar"])
+    return pd.DataFrame(rows).sort_values(["Rapor"], ascending=[True]).reset_index(drop=True)
+
 def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
     manifest = export_payload["manifest"]
     date_col = manifest.loc[manifest["key"] == "date_column", "value"].iloc[0]
