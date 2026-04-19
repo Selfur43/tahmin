@@ -4797,7 +4797,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.2.1"
 
 
 
@@ -8250,6 +8250,168 @@ def _derive_production_ranking(outputs: Dict[str, Any]) -> pd.DataFrame:
     return ranked
 
 
+
+def _build_minimum_live_summary(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
+    prod_model = prod_pack.get("production_model") or outputs.get("production_model") or outputs.get("best_model")
+    prod_status = prod_pack.get("production_status") or outputs.get("production_status") or "eligible"
+    metrics_df = outputs.get("metrics_df", pd.DataFrame())
+    bias_df = prod_pack.get("bias_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    peak_df = prod_pack.get("peak_event_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    interval_df = prod_pack.get("production_interval_table", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    service_df = prod_pack.get("production_service_table", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    robt = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    metric_row = metrics_df.loc[metrics_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) and "model" in metrics_df.columns else pd.DataFrame()
+    bias_row = bias_df.loc[bias_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(bias_df, pd.DataFrame) and len(bias_df) and "model" in bias_df.columns else pd.DataFrame()
+    peak_row = peak_df.loc[peak_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(peak_df, pd.DataFrame) and len(peak_df) and "model" in peak_df.columns else pd.DataFrame()
+    gate_row = gate_df.loc[gate_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(gate_df, pd.DataFrame) and len(gate_df) and "model" in gate_df.columns else pd.DataFrame()
+    ro_row = robt.loc[robt["model"].astype(str) == str(prod_model)].head(1) if isinstance(robt, pd.DataFrame) and len(robt) and "model" in robt.columns else pd.DataFrame()
+    service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) and "service_level_target" in service_df.columns else pd.DataFrame()
+    fallback_summary = outputs.get("fallback_summary", pd.DataFrame())
+    fb_rate = np.nan
+    if isinstance(fallback_summary, pd.DataFrame) and len(fallback_summary) and "fallback_used" in fallback_summary.columns:
+        fb_rate = float(pd.to_numeric(fallback_summary["fallback_used"], errors="coerce").fillna(0).mean())
+    elif isinstance(outputs, dict):
+        fb_flags = []
+        for k in ["xgboost", "prophet", "sarima", "arima", "intermittent"]:
+            fb_flags.append(bool((outputs.get(k) or {}).get("fallback_used", False)))
+        fb_rate = float(np.mean(fb_flags)) if fb_flags else np.nan
+    row = {
+        "üretim_modeli": prod_model,
+        "üretim_durumu": prod_status,
+        "frekans": outputs.get("metadata", {}).get("freq_alias", "?"),
+        "holdout_wape": safe_float(metric_row.iloc[0].get("WAPE", np.nan)) if len(metric_row) else np.nan,
+        "sapma_yüzde": safe_float(bias_row.iloc[0].get("bias_pct", metric_row.iloc[0].get("BiasPct", np.nan) if len(metric_row) else np.nan)) if (len(bias_row) or len(metric_row)) else np.nan,
+        "eksik_tahmin_oranı": safe_float(bias_row.iloc[0].get("under_forecast_rate", metric_row.iloc[0].get("UnderForecastRate", np.nan) if len(metric_row) else np.nan)) if (len(bias_row) or len(metric_row)) else np.nan,
+        "tepe_olay_skoru": safe_float(peak_row.iloc[0].get("peak_event_score", np.nan)) if len(peak_row) else np.nan,
+        "uygunluk_skoru": safe_float(gate_row.iloc[0].get("eligibility_score", np.nan)) if len(gate_row) else np.nan,
+        "rolling_wape": safe_float(ro_row.iloc[0].get("WAPE", np.nan)) if len(ro_row) else np.nan,
+        "kapsama_80": safe_float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
+        "kapsama_90": safe_float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
+        "fallback_oranı": safe_float(fb_rate),
+        "gerçekleşen_servis": safe_float(service_row.iloc[0].get("achieved_cycle_service", np.nan)) if len(service_row) else np.nan,
+        "hedef_servis": safe_float(service_row.iloc[0].get("service_level_target", np.nan)) if len(service_row) else np.nan,
+    }
+    out = pd.DataFrame([row])
+    out["alarm_sayısı"] = 0
+    out["yüksek_alarm_sayısı"] = 0
+    out["canlı_kullanım_önerisi"] = prod_status
+    out["karar_açıklaması"] = prod_pack.get("production_decision_explanation") or build_production_decision_explanation(prod_pack.get("production_ranking", pd.DataFrame()), prod_model)
+    out["karar_kartı"] = out.apply(lambda r: f"Model: {r['üretim_modeli']} | WAPE: {safe_float(r.get('holdout_wape', np.nan)):.2f} | Rolling: {safe_float(r.get('rolling_wape', np.nan)):.2f} | Bias: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f}", axis=1)
+    return out
+
+
+def _build_minimum_model_health_table(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
+    metrics_df = outputs.get("metrics_df", pd.DataFrame())
+    if not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
+        preds = outputs.get("predictions", {}) or {}
+        metrics_df = pd.DataFrame([{"model": k} for k in preds.keys()]) if preds else pd.DataFrame(columns=["model"])
+    bias_df = prod_pack.get("bias_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    peak_df = prod_pack.get("peak_event_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    qtables = prod_pack.get("quantile_forecasts", {}) if isinstance(prod_pack, dict) else {}
+    stables = prod_pack.get("service_level_simulation", {}) if isinstance(prod_pack, dict) else {}
+    robt = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    fallback_map = {
+        "XGBoost": outputs.get("xgboost", {}) or {},
+        "Prophet": outputs.get("prophet", {}) or {},
+        "SARIMA/SARIMAX": outputs.get("sarima", {}) or {},
+        "ARIMA": outputs.get("arima", {}) or {},
+        "Intermittent": outputs.get("intermittent", {}) or {},
+        "Ensemble": {},
+    }
+    rows = []
+    models = metrics_df.get("model", pd.Series(dtype=str)).astype(str).tolist() if "model" in metrics_df.columns else []
+    for model_name in models:
+        mrow = metrics_df.loc[metrics_df["model"].astype(str) == str(model_name)].head(1) if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) and "model" in metrics_df.columns else pd.DataFrame()
+        brow = bias_df.loc[bias_df["model"].astype(str) == str(model_name)].head(1) if isinstance(bias_df, pd.DataFrame) and len(bias_df) and "model" in bias_df.columns else pd.DataFrame()
+        prow = peak_df.loc[peak_df["model"].astype(str) == str(model_name)].head(1) if isinstance(peak_df, pd.DataFrame) and len(peak_df) and "model" in peak_df.columns else pd.DataFrame()
+        grow = gate_df.loc[gate_df["model"].astype(str) == str(model_name)].head(1) if isinstance(gate_df, pd.DataFrame) and len(gate_df) and "model" in gate_df.columns else pd.DataFrame()
+        rrow = robt.loc[robt["model"].astype(str) == str(model_name)].head(1) if isinstance(robt, pd.DataFrame) and len(robt) and "model" in robt.columns else pd.DataFrame()
+        qtbl = qtables.get(model_name, pd.DataFrame()) if isinstance(qtables, dict) else pd.DataFrame()
+        stbl = stables.get(model_name, pd.DataFrame()) if isinstance(stables, dict) else pd.DataFrame()
+        srow = stbl.loc[stbl["service_level_target"] == stbl["service_level_target"].max()].head(1) if isinstance(stbl, pd.DataFrame) and len(stbl) and "service_level_target" in stbl.columns else pd.DataFrame()
+        fallback_obj = fallback_map.get(model_name, {}) or {}
+        rows.append({
+            "model": model_name,
+            "WAPE": safe_float(mrow.iloc[0].get("WAPE", np.nan)) if len(mrow) else np.nan,
+            "rolling_WAPE": safe_float(rrow.iloc[0].get("WAPE", np.nan)) if len(rrow) else np.nan,
+            "sapma_yüzde": safe_float(brow.iloc[0].get("bias_pct", mrow.iloc[0].get("BiasPct", np.nan) if len(mrow) else np.nan)) if (len(brow) or len(mrow)) else np.nan,
+            "eksik_tahmin_oranı": safe_float(brow.iloc[0].get("under_forecast_rate", mrow.iloc[0].get("UnderForecastRate", np.nan) if len(mrow) else np.nan)) if (len(brow) or len(mrow)) else np.nan,
+            "tepe_olay_skoru": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
+            "uygunluk_skoru": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
+            "durum": grow.iloc[0].get("status", prod_pack.get("production_status", "eligible")) if len(grow) else prod_pack.get("production_status", "eligible"),
+            "kapsama_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
+            "gerçekleşen_servis": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
+            "fallback_kullanıldı": bool(fallback_obj.get("fallback_used", False)),
+            "fallback_yöntemi": fallback_obj.get("fallback_method"),
+        })
+    cols = ["model", "WAPE", "rolling_WAPE", "sapma_yüzde", "eksik_tahmin_oranı", "tepe_olay_skoru", "uygunluk_skoru", "durum", "kapsama_80", "gerçekleşen_servis", "fallback_kullanıldı", "fallback_yöntemi"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def ensure_production_reporting_tables(outputs: Dict[str, Any], export_payload: Optional[Dict[str, pd.DataFrame]] = None, target_col: Optional[str] = None, freq_alias: Optional[str] = None) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    prod_pack = outputs.get("production_governance", {}) or {}
+    if not isinstance(prod_pack, dict):
+        prod_pack = {}
+
+    if (not prod_pack) and export_payload is not None and target_col is not None and freq_alias is not None:
+        try:
+            prod_pack = build_production_governance_pack(outputs, export_payload, target_col, freq_alias) or {}
+        except Exception:
+            prod_pack = {}
+
+    ranking = prod_pack.get("production_ranking", pd.DataFrame())
+    if not isinstance(ranking, pd.DataFrame) or len(ranking) == 0:
+        tmp_outputs = dict(outputs)
+        tmp_outputs["production_governance"] = prod_pack
+        ranking = _derive_production_ranking(tmp_outputs)
+        prod_pack["production_ranking"] = ranking
+
+    if not prod_pack.get("production_model"):
+        if isinstance(ranking, pd.DataFrame) and len(ranking) and "model" in ranking.columns:
+            prod_pack["production_model"] = ranking.iloc[0]["model"]
+        else:
+            prod_pack["production_model"] = outputs.get("best_model")
+    if not prod_pack.get("production_status"):
+        if isinstance(ranking, pd.DataFrame) and len(ranking) and "status" in ranking.columns:
+            prod_pack["production_status"] = ranking.iloc[0]["status"]
+        else:
+            prod_pack["production_status"] = outputs.get("production_status", "eligible")
+
+    outputs["production_model"] = prod_pack.get("production_model", outputs.get("best_model"))
+    outputs["production_status"] = prod_pack.get("production_status", outputs.get("production_status", "eligible"))
+
+    live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
+    need_live_rebuild = (
+        not isinstance(live_pack, dict)
+        or not isinstance(live_pack.get("summary"), pd.DataFrame)
+        or len(live_pack.get("summary", pd.DataFrame())) == 0
+        or not isinstance(live_pack.get("model_health_table"), pd.DataFrame)
+        or len(live_pack.get("model_health_table", pd.DataFrame())) == 0
+    )
+    if need_live_rebuild:
+        try:
+            live_pack = build_live_monitoring_pack(outputs, prod_pack)
+        except Exception:
+            live_pack = {}
+
+    if not isinstance(live_pack, dict):
+        live_pack = {}
+    if not isinstance(live_pack.get("summary"), pd.DataFrame) or len(live_pack.get("summary", pd.DataFrame())) == 0:
+        live_pack["summary"] = _build_minimum_live_summary(outputs, prod_pack)
+    if not isinstance(live_pack.get("model_health_table"), pd.DataFrame) or len(live_pack.get("model_health_table", pd.DataFrame())) == 0:
+        live_pack["model_health_table"] = _build_minimum_model_health_table(outputs, prod_pack)
+    if not isinstance(live_pack.get("alerts"), pd.DataFrame):
+        live_pack["alerts"] = pd.DataFrame(columns=["severity", "alert", "detail"])
+
+    prod_pack["live_monitoring_pack"] = live_pack
+    prod_pack["production_decision_explanation"] = prod_pack.get("production_decision_explanation") or build_production_decision_explanation(prod_pack.get("production_ranking", pd.DataFrame()), prod_pack.get("production_model"))
+    outputs["production_governance"] = prod_pack
+    return outputs
+
 def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
     satirlar = []
     hold_df = outputs.get("metrics_df", pd.DataFrame())
@@ -8475,6 +8637,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         {"model": "Intermittent", "fallback_used": bool((outputs.get("intermittent") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("intermittent") or {}).get("fallback_method")},
     ])
     outputs["production_governance"] = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
+    outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
     outputs["production_model"] = outputs["production_governance"].get("production_model", outputs.get("best_model"))
     outputs["production_status"] = outputs["production_governance"].get("production_status", "eligible")
     outputs["model_gorsel_stil_haritasi"] = build_model_visual_style_map(outputs)
@@ -9148,6 +9311,7 @@ def render_streamlit_app():
             for note in outputs.get("metadata", {}).get("runtime_guardrails", []):
                 st.write(f"- {note}")
 
+    outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
     readiness = assess_production_readiness(export_payload, outputs["metrics_df"], target_col, outputs=outputs)
     prod_pack = outputs.get("production_governance", {}) or {}
     prod_model = outputs.get("production_model", outputs.get("best_model"))
