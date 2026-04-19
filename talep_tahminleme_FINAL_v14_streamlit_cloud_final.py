@@ -45,6 +45,10 @@ Main capabilities:
 import os
 os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
 os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import re
 import io
 import json
@@ -4895,7 +4899,11 @@ class ForecastRuntimeConfig:
         }
     ))
 
-FORECAST_RUNTIME_CONFIG = ForecastRuntimeConfig()
+FORECAST_RUNTIME_CONFIG = ForecastRuntimeConfig(
+    xgb_force_single_thread=True,
+    search_accelerator_max_workers=1,
+    search_accelerator_candidate_workers=1
+)
 _PROPhet_BACKEND_PROBE_CACHE = {"done": False, "ok": None, "message": "not_checked"}
 
 @dataclass
@@ -5807,6 +5815,195 @@ def style_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 def dataframe_to_download_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
+
+def _safe_artifact_name(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', "_", str(name)).strip()
+
+def _df_or_empty(obj: Any) -> pd.DataFrame:
+    return obj if isinstance(obj, pd.DataFrame) else pd.DataFrame()
+
+def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    prod_pack = outputs.get("production_governance", {}) or {}
+    live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
+
+    named = {
+        "Model karşılaştırma tablosu": style_metric_dataframe(_df_or_empty(outputs.get("metrics_df"))),
+        "Çalışma süresi - performans özeti": style_metric_dataframe(_df_or_empty(outputs.get("stage_timing_table"))),
+        "Otomatik model uygunluk kapısı": style_metric_dataframe(_df_or_empty(prod_pack.get("model_eligibility_gate"))),
+        "Karar kademelerine göre model liderleri": style_metric_dataframe(_df_or_empty(build_model_liderleri(outputs))),
+        "SARIMA-SARIMAX - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("SARIMA/SARIMAX"))),
+        "SARIMA-SARIMAX - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("sarima") or {}).get("search_table"))),
+        "Prophet görünürlüğü (gerçek fit mi, fallback mi)": style_metric_dataframe(_df_or_empty(outputs.get("prophet_gorunurluk_ozeti"))),
+        "Prophet - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("Prophet"))),
+        "Prophet - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("prophet") or {}).get("search_table"))),
+        "XGBoost - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("XGBoost"))),
+        "XGBoost - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("search_table"))),
+        "XGBoost - Strateji karşılaştırması": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("strategy_comparison"))),
+        "XGBoost - Özellik önemleri": _df_or_empty((outputs.get("xgboost") or {}).get("feature_importance")),
+        "Karar hiyerarşisi özeti": style_metric_dataframe(_df_or_empty(outputs.get("karar_hiyerarsisi"))),
+        "Holdout sıralaması": style_metric_dataframe(_df_or_empty((outputs.get("champion_challenger") or {}).get("ranking"))),
+        "Ansambl ağırlıkları (peak-aware + bias-aware)": style_metric_dataframe(_df_or_empty(outputs.get("ensemble_weights"))),
+        "Ansambl gerçek ve tahmin": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("Ensemble"))),
+        "Gerçek vs tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("all_predictions_long"))),
+        "Rolling-origin geri test (tam katman)": style_metric_dataframe(_df_or_empty(outputs.get("rolling_origin_backtest"))),
+        "Doğrulama temelli model kalitesi": style_metric_dataframe(_df_or_empty(outputs.get("validation_metrics_df"))),
+        "Karar hiyerarşisi": style_metric_dataframe(_df_or_empty(outputs.get("karar_hiyerarsisi"))),
+        "Merkezî canlı izleme özeti": style_metric_dataframe(_df_or_empty(live_pack.get("summary"))),
+        "Model sağlık tablosu (bias, kapsama, fallback, servis seviyesi)": style_metric_dataframe(_df_or_empty(live_pack.get("model_health_table"))),
+        "Üretim alarmları": style_metric_dataframe(_df_or_empty(live_pack.get("alerts"))),
+        "Üretim sıralaması (holdout, doğrulama ve rolling-origin birlikte)": style_metric_dataframe(_df_or_empty(prod_pack.get("production_ranking"))),
+        "Tahmin katkı değeri (baseline'a göre)": style_metric_dataframe(_df_or_empty(prod_pack.get("forecast_value_add"))),
+        "Bias dashboard": style_metric_dataframe(_df_or_empty(prod_pack.get("bias_dashboard"))),
+        "Tepe olay yakalama skoru": style_metric_dataframe(_df_or_empty(prod_pack.get("peak_event_dashboard"))),
+        "Üretim özellik erişilebilirlik denetimi": style_metric_dataframe(_df_or_empty(prod_pack.get("feature_availability_audit"))),
+        "Üretim modeli için tahmin aralığı - quantile forecast": style_metric_dataframe(_df_or_empty(prod_pack.get("production_interval_table"))),
+        "Servis seviyesi - stok etkisi simülasyonu": style_metric_dataframe(_df_or_empty(prod_pack.get("production_service_table"))),
+        "Servis seviyesi - stok etkisi simülasyonu (referans duplicate capture)": style_metric_dataframe(_df_or_empty(prod_pack.get("production_service_table"))),
+        "Benzersiz rapor kataloğu (yinelenen içerik temizliği)": style_metric_dataframe(_df_or_empty(outputs.get("benzersiz_rapor_katalogu"))),
+        "Kalite raporu": _df_or_empty(export_payload.get("quality_report")),
+        "Seri profil raporu": _df_or_empty(export_payload.get("series_profile_report")),
+        "Anomali yönetişimi": _df_or_empty(export_payload.get("anomaly_governance")),
+        "Review queue": _df_or_empty(export_payload.get("review_queue")),
+        "Proxy backtest raporu": _df_or_empty(export_payload.get("proxy_backtest_report")),
+        "Raw vs Clean backtest karşılaştırması": _df_or_empty(export_payload.get("raw_vs_clean_backtest_report")),
+    }
+
+    cleaned: Dict[str, pd.DataFrame] = {}
+    for report_name, df in named.items():
+        if isinstance(df, pd.DataFrame):
+            cleaned[report_name] = df.copy()
+    return cleaned
+
+def _forecast_png_bytes(train_df: pd.DataFrame, test_df: pd.DataFrame, pred_map: Dict[str, np.ndarray], title: str) -> bytes:
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.plot(train_df["ds"], train_df["y"], label="Train", linewidth=2)
+    ax.plot(test_df["ds"], test_df["y"], label="Gerçek", linewidth=2, marker="o")
+    for model_name, pred in pred_map.items():
+        arr = np.asarray(pred, dtype=float)
+        if len(arr) == len(test_df):
+            ax.plot(test_df["ds"], arr, label=model_name, linewidth=2, marker="o")
+    ax.set_title(title)
+    ax.set_xlabel("Tarih")
+    ax.set_ylabel("Talep")
+    ax.legend()
+    ax.grid(alpha=0.25)
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+def _acf_pacf_png_bytes(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int) -> Optional[bytes]:
+    try:
+        df_series = make_series_analysis_frame(export_payload, target_col)
+        train_df_preview, _ = train_test_split_series(df_series, horizon)
+        fig = build_acf_pacf_figure(train_df_preview, target_col)
+        if fig is None:
+            return None
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+def build_batch_zip_bytes(export_payload: Dict[str, pd.DataFrame], batch_result: Dict[str, Any], selected_sheet: str, horizon: int) -> bytes:
+    mem = io.BytesIO()
+    sheet_root = _safe_artifact_name(selected_sheet) or "batch_forecasting_outputs"
+
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        common_tables = {
+            "Kalite raporu": export_payload.get("quality_report", pd.DataFrame()),
+            "Seri profil raporu": export_payload.get("series_profile_report", pd.DataFrame()),
+            "Anomali yönetişimi": export_payload.get("anomaly_governance", pd.DataFrame()),
+            "Review queue": export_payload.get("review_queue", pd.DataFrame()),
+            "Proxy backtest raporu": export_payload.get("proxy_backtest_report", pd.DataFrame()),
+            "Raw vs Clean backtest karşılaştırması": export_payload.get("raw_vs_clean_backtest_report", pd.DataFrame()),
+        }
+
+        for name, df in common_tables.items():
+            if isinstance(df, pd.DataFrame):
+                zf.writestr(
+                    f"{sheet_root}/common/{_safe_artifact_name(name)}.csv",
+                    df.to_csv(index=False, encoding="utf-8-sig")
+                )
+
+        zf.writestr(
+            f"{sheet_root}/batch/Batch forecasting özeti.csv",
+            batch_result["best_summary"].to_csv(index=False, encoding="utf-8-sig")
+        )
+        zf.writestr(
+            f"{sheet_root}/batch/Champion - Challenger tablosu.csv",
+            batch_result["champion_table"].to_csv(index=False, encoding="utf-8-sig")
+        )
+
+        manifest = {
+            "selected_sheet": selected_sheet,
+            "targets": list(batch_result.get("batch_outputs", {}).keys()),
+            "horizon": int(horizon),
+            "artifact_schema": "batch_forecast_zip_v1",
+            "app_version": APP_VERSION
+        }
+        zf.writestr(
+            f"{sheet_root}/manifest.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2)
+        )
+
+        try:
+            script_path = Path(__file__)
+            if script_path.exists():
+                zf.writestr(f"{sheet_root}/{script_path.name}", script_path.read_bytes())
+        except Exception:
+            pass
+
+        try:
+            requirements_path = Path(__file__).with_name("requirements.txt")
+            if requirements_path.exists():
+                zf.writestr(f"{sheet_root}/requirements.txt", requirements_path.read_bytes())
+        except Exception:
+            pass
+
+        for target, outputs in (batch_result.get("batch_outputs") or {}).items():
+            target_root = f"{sheet_root}/{_safe_artifact_name(target)}"
+
+            named_tables = outputs.get("named_output_tables", {})
+            for report_name, df in named_tables.items():
+                if isinstance(df, pd.DataFrame):
+                    zf.writestr(
+                        f"{target_root}/{_safe_artifact_name(report_name)}.csv",
+                        df.to_csv(index=False, encoding="utf-8-sig")
+                    )
+
+            acf_bytes = _acf_pacf_png_bytes(export_payload, target, horizon)
+            if acf_bytes is not None:
+                zf.writestr(f"{target_root}/{_safe_artifact_name(target)} - ACF ve PACF.png", acf_bytes)
+
+            zf.writestr(
+                f"{target_root}/{_safe_artifact_name(target)} - Gerçek vs Tahmin.png",
+                _forecast_png_bytes(outputs["train"], outputs["test"], outputs["predictions"], f"{target} - Gerçek vs Tahmin")
+            )
+
+            for model_name, file_stub in {
+                "SARIMA/SARIMAX": "SARIMA-SARIMAX",
+                "XGBoost": "XGBoost",
+                "Ensemble": "Ensemble"
+            }.items():
+                if model_name in outputs.get("predictions", {}):
+                    zf.writestr(
+                        f"{target_root}/{_safe_artifact_name(target)} - {file_stub}.png",
+                        _forecast_png_bytes(
+                            outputs["train"],
+                            outputs["test"],
+                            {model_name: outputs["predictions"][model_name]},
+                            f"{target} - {file_stub}"
+                        )
+                    )
+
+    mem.seek(0)
+    return mem.getvalue()
 
 def build_acf_pacf_figure(train_df: pd.DataFrame, target_col: str):
     if not HAS_FORECAST_STATSMODELS:
@@ -8647,36 +8844,65 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     SEARCH_ACCELERATOR.put_result(pipeline_key, outputs)
     return copy.deepcopy(outputs)
 
-def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
-    targets = export_payload["series_profile_report"]["series"].tolist()
+def run_batch_forecasting(
+    export_payload: Dict[str, pd.DataFrame],
+    horizon: int,
+    selected_sheet: str,
+    use_exog_for_stat_models: bool = True,
+    use_exog_for_prophet: bool = True,
+    selected_targets: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    targets = list(selected_targets) if selected_targets else export_payload["series_profile_report"]["series"].tolist()
     rows = []
     champion_rows = []
     batch_outputs = {}
+
     for target in targets:
         try:
-            out = run_full_forecasting_pipeline(export_payload, target, horizon, use_exog_for_stat_models, use_exog_for_prophet)
+            out = run_full_forecasting_pipeline(
+                export_payload,
+                target,
+                horizon,
+                use_exog_for_stat_models,
+                use_exog_for_prophet
+            )
+            out["named_output_tables"] = build_named_output_tables(out, export_payload)
             batch_outputs[target] = out
+
             mdf = out["metrics_df"].copy()
             best_row = mdf.iloc[0].to_dict()
             best_row["target_col"] = target
             best_row["segment"] = out["metadata"]["segment"]
             best_row["abc_xyz"] = out["metadata"]["abc_xyz"]
             rows.append(best_row)
+
             champion_rows.append({
                 "target_col": target,
                 "champion": out["champion_challenger"]["champion"],
-                "challenger": out["champion_challenger"]["challenger"],
+                "challenger": out["champion_challenger"].get("challenger"),
                 "segment": out["metadata"]["segment"],
                 "abc_xyz": out["metadata"]["abc_xyz"]
             })
         except Exception as e:
-            rows.append({"target_col": target, "model": "ERROR", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan, "error": str(e)})
-    return {
+            rows.append({
+                "target_col": target,
+                "model": "ERROR",
+                "MAE": np.nan,
+                "RMSE": np.nan,
+                "MAPE": np.nan,
+                "sMAPE": np.nan,
+                "WAPE": np.nan,
+                "MASE": np.nan,
+                "error": str(e)
+            })
+
+    result = {
         "best_summary": pd.DataFrame(rows),
         "champion_table": pd.DataFrame(champion_rows),
         "batch_outputs": batch_outputs
     }
-
+    result["zip_bytes"] = build_batch_zip_bytes(export_payload, result, selected_sheet, horizon)
+    return result
 
 
 
@@ -9218,9 +9444,22 @@ def render_streamlit_app():
     mode = st.radio("Çalışma modu", ["Tek seri", "Çok serili batch forecasting"], horizontal=True)
     default_target = target_cols[0] if target_cols else None
     if mode == "Tek seri":
+        batch_targets = [default_target] if default_target else []
         target_col = st.selectbox("Tahminlenecek seri", target_cols, index=0 if default_target else None)
     else:
-        target_col = default_target
+        batch_targets = st.multiselect(
+            "Batch'e alınacak seriler",
+            options=target_cols,
+            default=target_cols
+        )
+        if not batch_targets:
+            st.warning("Batch için en az bir seri seçmelisin.")
+            return
+        target_col = st.selectbox(
+            "Detay panosunda gösterilecek seri",
+            options=batch_targets,
+            index=0
+        )
 
     default_horizon = min(infer_default_horizon(freq_alias), max(2, len(export_payload["clean_model_input"]) // 5))
     horizon = st.slider("Test ufku", min_value=2, max_value=min(24, max(2, len(export_payload["clean_model_input"]) // 3)), value=default_horizon)
@@ -9248,10 +9487,12 @@ def render_streamlit_app():
     except Exception:
         pass
 
+    cache_target_signature = "|".join(sorted(batch_targets)) if mode == "Çok serili batch forecasting" else str(target_col)
+
     forecast_cache_key = "||".join([
         cache_key,
         str(mode),
-        str(target_col),
+        cache_target_signature,
         str(horizon),
         str(int(use_exog_stat)),
         str(int(use_exog_prophet)),
@@ -9268,7 +9509,14 @@ def render_streamlit_app():
                     if mode == "Tek seri":
                         cached_obj = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
                     else:
-                        cached_obj = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet)
+                        cached_obj = run_batch_forecasting(
+                            export_payload=export_payload,
+                            horizon=horizon,
+                            selected_sheet=selected_sheet,
+                            use_exog_for_stat_models=use_exog_stat,
+                            use_exog_for_prophet=use_exog_prophet,
+                            selected_targets=batch_targets
+                        )
                     st.session_state["forecast_run_cache"][forecast_cache_key] = cached_obj
 
                 if mode == "Tek seri":
@@ -9288,17 +9536,38 @@ def render_streamlit_app():
         if batch is None:
             st.info("Batch sonucu görmek için butona bas.")
             return
+
         st.subheader("Batch forecasting özeti")
         st.dataframe(style_metric_dataframe(batch["best_summary"]), width="stretch")
+
         st.subheader("Champion - Challenger tablosu")
         st.dataframe(batch["champion_table"], width="stretch")
-        st.download_button("Batch özetini indir (CSV)", data=dataframe_to_download_bytes(batch["best_summary"]), file_name=f"{selected_sheet}_batch_forecasting_summary.csv", mime="text/csv")
-        return
 
-    outputs = st.session_state.get("forecast_outputs")
-    if outputs is None or st.session_state.get("forecast_target") != target_col:
-        st.info("Model karşılaştırmasını görmek için butona bas.")
-        return
+        st.download_button(
+            "Batch özetini indir (CSV)",
+            data=dataframe_to_download_bytes(batch["best_summary"]),
+            file_name=f"{selected_sheet}_batch_forecasting_summary.csv",
+            mime="text/csv"
+        )
+        st.download_button(
+            "Tüm batch çıktıları indir (ZIP)",
+            data=batch.get("zip_bytes", b""),
+            file_name=f"{selected_sheet}_batch_full_outputs.zip",
+            mime="application/zip"
+        )
+
+        if target_col not in batch.get("batch_outputs", {}):
+            st.warning("Seçilen seri batch sonuçları içinde bulunamadı.")
+            return
+
+        outputs = batch["batch_outputs"][target_col]
+        profile = get_profile_row(export_payload, target_col)
+
+    else:
+        outputs = st.session_state.get("forecast_outputs")
+        if outputs is None or st.session_state.get("forecast_target") != target_col:
+            st.info("Model karşılaştırmasını görmek için butona bas.")
+            return
 
     st.subheader("Model karşılaştırma tablosu")
     metrics_df = style_metric_dataframe(outputs["metrics_df"])
