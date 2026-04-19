@@ -8701,6 +8701,146 @@ def build_production_decision_explanation(production_ranking: pd.DataFrame, prod
     durum = TURKCE_DEGER_HARITASI.get(str(row.get("status", "eligible")), str(row.get("status", "eligible")))
     return f"{production_model} seçildi; çünkü {', '.join(nedenler[:4])} ve üretim durumu '{durum}' olarak değerlendirildi."
 
+
+
+def assess_production_readiness(
+    export_payload: Dict[str, pd.DataFrame],
+    metrics_df: pd.DataFrame,
+    target_col: str,
+    outputs: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    outputs = outputs or {}
+    notes: List[str] = []
+
+    prod_pack = outputs.get("production_governance", {}) or {}
+    prod_model = outputs.get("production_model", prod_pack.get("production_model", outputs.get("best_model")))
+    prod_status = outputs.get("production_status", prod_pack.get("production_status", "eligible"))
+    freq_alias = str(outputs.get("metadata", {}).get("freq_alias", "")).upper() or str(export_payload.get("metadata", {}).get("freq_alias", "")).upper()
+
+    train_df = outputs.get("train", pd.DataFrame())
+    test_df = outputs.get("test", pd.DataFrame())
+    train_n = int(len(train_df)) if isinstance(train_df, pd.DataFrame) else 0
+    test_n = int(len(test_df)) if isinstance(test_df, pd.DataFrame) else 0
+    total_n = train_n + test_n
+
+    notes.append(f"Üretim adayı model: {prod_model or '-'} | durum: {prod_status}.")
+    notes.append(f"Seri frekansı: {freq_alias or '-'} | eğitim gözlemi: {train_n} | test gözlemi: {test_n} | toplam gözlem: {total_n}.")
+
+    if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) > 0:
+        row = metrics_df.loc[metrics_df["model"].astype(str) == str(prod_model)].head(1) if "model" in metrics_df.columns else pd.DataFrame()
+        if len(row) == 0:
+            row = metrics_df.sort_values([c for c in ["WAPE", "sMAPE", "MAE"] if c in metrics_df.columns], ascending=True, na_position="last").head(1)
+        if len(row) > 0:
+            row = row.iloc[0]
+            hold_bits = []
+            for c in ["WAPE", "sMAPE", "MAE", "RMSE"]:
+                if pd.notna(row.get(c)):
+                    hold_bits.append(f"{c}={safe_float(row.get(c)):.2f}")
+            if hold_bits:
+                notes.append(f"Holdout performansı: {', '.join(hold_bits)}.")
+
+    val_df = outputs.get("validation_metrics_df", pd.DataFrame())
+    if isinstance(val_df, pd.DataFrame) and len(val_df) > 0 and "model" in val_df.columns:
+        row = val_df.loc[val_df["model"].astype(str) == str(prod_model)].head(1)
+        if len(row) > 0:
+            row = row.iloc[0]
+            val_bits = []
+            for c in ["val_WAPE", "val_sMAPE", "validation_operational_score"]:
+                if pd.notna(row.get(c)):
+                    label = c.replace("validation_operational_score", "validation_score")
+                    val_bits.append(f"{label}={safe_float(row.get(c)):.2f}")
+            if val_bits:
+                notes.append(f"İç doğrulama: {', '.join(val_bits)}.")
+
+    ro_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    if isinstance(ro_df, pd.DataFrame) and len(ro_df) > 0 and "model" in ro_df.columns:
+        row = ro_df.loc[ro_df["model"].astype(str) == str(prod_model)].head(1)
+        if len(row) > 0:
+            row = row.iloc[0]
+            ro_bits = []
+            for c in ["WAPE", "sMAPE", "MAE"]:
+                if pd.notna(row.get(c)):
+                    ro_bits.append(f"{c}={safe_float(row.get(c)):.2f}")
+            if ro_bits:
+                notes.append(f"Rolling-origin kararlılığı: {', '.join(ro_bits)}.")
+
+    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
+    readiness_score = np.nan
+    if isinstance(gate_df, pd.DataFrame) and len(gate_df) > 0 and "model" in gate_df.columns:
+        row = gate_df.loc[gate_df["model"].astype(str) == str(prod_model)].head(1)
+        if len(row) > 0:
+            row = row.iloc[0]
+            readiness_score = safe_float(row.get("eligibility_score"))
+            status_txt = str(row.get("status", prod_status))
+            reason_txt = str(row.get("reasons", "") or "").strip()
+            if pd.notna(readiness_score):
+                notes.append(f"Üretim uygunluk skoru: {readiness_score:.1f}/100 | kapı durumu: {status_txt}.")
+            else:
+                notes.append(f"Üretim kapısı durumu: {status_txt}.")
+            if reason_txt:
+                notes.append(f"Uygunluk gerekçesi: {reason_txt}")
+
+    feature_df = prod_pack.get("feature_availability_audit", pd.DataFrame())
+    if isinstance(feature_df, pd.DataFrame) and len(feature_df) > 0 and "availability_risk_score" in feature_df.columns:
+        max_risk = float(pd.to_numeric(feature_df["availability_risk_score"], errors="coerce").max())
+        risky = feature_df[pd.to_numeric(feature_df["availability_risk_score"], errors="coerce") >= 0.40]
+        notes.append(f"Maksimum feature kullanılabilirlik riski: {max_risk:.2f}.")
+        if len(risky) > 0 and "feature" in risky.columns:
+            risky_features = ", ".join(risky["feature"].astype(str).head(5).tolist())
+            notes.append(f"Takip edilmesi gereken feature(lar): {risky_features}.")
+
+    bias_df = prod_pack.get("bias_dashboard", pd.DataFrame())
+    if isinstance(bias_df, pd.DataFrame) and len(bias_df) > 0 and "model" in bias_df.columns:
+        row = bias_df.loc[bias_df["model"].astype(str) == str(prod_model)].head(1)
+        if len(row) > 0:
+            row = row.iloc[0]
+            bias = safe_float(row.get("bias_pct"))
+            under = safe_float(row.get("under_forecast_rate"))
+            parts = []
+            if pd.notna(bias):
+                parts.append(f"bias={bias:.2f}%")
+            if pd.notna(under):
+                parts.append(f"eksik_tahmin_oranı={under:.2f}")
+            if parts:
+                notes.append(f"Sapma görünümü: {', '.join(parts)}.")
+
+    peak_df = prod_pack.get("peak_event_dashboard", pd.DataFrame())
+    if isinstance(peak_df, pd.DataFrame) and len(peak_df) > 0 and "model" in peak_df.columns:
+        row = peak_df.loc[peak_df["model"].astype(str) == str(prod_model)].head(1)
+        if len(row) > 0 and pd.notna(row.iloc[0].get("peak_event_score")):
+            notes.append(f"Tepe olay yakalama skoru: {safe_float(row.iloc[0].get('peak_event_score')):.3f}.")
+
+    service_df = prod_pack.get("production_service_table", pd.DataFrame())
+    if isinstance(service_df, pd.DataFrame) and len(service_df) > 0:
+        row = service_df.sort_values("service_level_target", ascending=False).head(1) if "service_level_target" in service_df.columns else service_df.head(1)
+        if len(row) > 0:
+            row = row.iloc[0]
+            achieved = safe_float(row.get("achieved_cycle_service"))
+            target_service = safe_float(row.get("service_level_target"))
+            if pd.notna(achieved) and pd.notna(target_service):
+                notes.append(f"Servis seviyesi simülasyonu: gerçekleşen={achieved:.2f}, hedef={target_service:.2f}.")
+
+    fallback_flags = []
+    for model_key in ["sarima", "arima", "prophet", "xgboost", "intermittent"]:
+        model_obj = outputs.get(model_key)
+        if isinstance(model_obj, dict) and bool(model_obj.get("fallback_used", False)):
+            fallback_flags.append(model_key.upper())
+    if fallback_flags:
+        notes.append(f"Fallback ile çalışan model aileleri: {', '.join(fallback_flags)}.")
+
+    summary = {
+        "production_model": prod_model,
+        "production_status": prod_status,
+        "readiness_score": readiness_score,
+        "notes": notes
+    }
+    return summary
+
+
+def infer_seasonal_period(freq_alias: str) -> int:
+    return infer_season_length_from_freq(freq_alias)
+
+
 def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
     prod_model = production_pack.get("production_model", outputs.get("best_model"))
     bias_df = production_pack.get("bias_dashboard", pd.DataFrame())
