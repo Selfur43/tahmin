@@ -66,9 +66,17 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.impute import KNNImputer
 
-# GUI
-import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+# GUI (optional; Streamlit Cloud does not provide _tkinter)
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, simpledialog
+    HAS_TKINTER = True
+except Exception:
+    tk = None
+    filedialog = None
+    messagebox = None
+    simpledialog = None
+    HAS_TKINTER = False
 
 try:
     import rarfile  # optional; requires rarfile package and available backend on the host machine
@@ -301,6 +309,8 @@ def normalize_colname(col: str) -> str:
 
 
 def _choose_item_from_list(title: str, prompt: str, items: List[str]) -> str:
+    if not HAS_TKINTER:
+        raise RuntimeError('Bu seçim ekranı tkinter gerektirir. Streamlit ortamında uygulama arayüzündeki dosya/sheet seçimini kullanın.')
     root = tk.Tk()
     root.withdraw()
 
@@ -373,6 +383,8 @@ def _extract_excel_from_archive(archive_path: str, member_name: str) -> Tuple[st
 
 
 def choose_excel_file() -> Dict[str, Optional[str]]:
+    if not HAS_TKINTER:
+        raise RuntimeError('Tkinter bu ortamda kullanılamıyor. Streamlit içinde dosya yükleme akışını kullanın.')
     root = tk.Tk()
     root.withdraw()
     selected_path = filedialog.askopenfilename(
@@ -420,6 +432,8 @@ def choose_excel_file() -> Dict[str, Optional[str]]:
 
 
 def choose_sheets(sheet_names: List[str]) -> List[str]:
+    if not HAS_TKINTER:
+        raise RuntimeError('Tkinter bu ortamda kullanılamıyor. Streamlit içinde sheet seçimini kullanın.')
     root = tk.Tk()
     root.withdraw()
 
@@ -4457,9 +4471,10 @@ def main():
     except Exception as e:
         print(f"[ERROR] {str(e)}")
         print(traceback.format_exc())
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Hata", str(e))
+        if HAS_TKINTER and messagebox is not None:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Hata", str(e))
 
 
 
