@@ -11321,14 +11321,18 @@ def _resolve_streamlit_entrypoint():
 
 
 def _is_running_under_streamlit() -> bool:
-    if st is None:
-        return False
     try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-        if get_script_run_ctx() is not None:
-            return True
+        ensure_forecasting_runtime_dependencies(include_streamlit=True)
     except Exception:
         pass
+
+    if st is not None:
+        try:
+            from streamlit.runtime.scriptrunner import get_script_run_ctx
+            if get_script_run_ctx() is not None:
+                return True
+        except Exception:
+            pass
 
     try:
         argv_text = " ".join(str(x) for x in sys.argv)
@@ -11341,26 +11345,32 @@ def _is_running_under_streamlit() -> bool:
         "STREAMLIT_BROWSER_GATHER_USAGE_STATS",
         "STREAMLIT_SHARING_MODE",
         "STREAMLIT_RUNTIME",
+        "STREAMLIT_THEME_BASE",
     ]
     if any(os.environ.get(k) for k in env_markers):
         return True
-    if "streamlit run" in argv_text.lower():
+    if "streamlit run" in argv_text.lower() or "streamlit.web.cli" in argv_text.lower():
         return True
     return False
 
 
 def _should_launch_streamlit_entrypoint(argv: Optional[List[str]] = None) -> bool:
     argv = list(argv or [])
+
+    try:
+        ensure_forecasting_runtime_dependencies(include_streamlit=True)
+    except Exception:
+        pass
+
     if _is_running_under_streamlit():
         return True
     if any(str(a).strip().lower() == "--streamlit" for a in argv):
         return True
-    if st is None:
-        return False
 
-    # Streamlit Cloud / headless ortamlarda tkinter yoktur; bu durumda
-    # parametresiz çalıştırma yerel diyalog akışına değil Streamlit girişine gitmelidir.
-    if not argv and not HAS_TKINTER:
+    # Streamlit kurulu ve tkinter yoksa, parametresiz başlatma yerel diyalog
+    # akışına girmek yerine Streamlit UI'yi açmalıdır. Bu özellikle Streamlit Cloud
+    # ve headless Linux ortamlarda kritik davranıştır.
+    if not argv and st is not None and not HAS_TKINTER:
         return True
     return False
 
@@ -11926,6 +11936,11 @@ def build_cli_arg_parser() -> argparse.ArgumentParser:
 
 
 def run_cli_main(argv: Optional[List[str]] = None) -> int:
+    try:
+        ensure_forecasting_runtime_dependencies(include_streamlit=True)
+    except Exception:
+        pass
+
     parser = build_cli_arg_parser()
     args = parser.parse_args(argv)
 
@@ -11965,6 +11980,7 @@ def run_cli_main(argv: Optional[List[str]] = None) -> int:
 
 
 def main():
+    ensure_forecasting_runtime_dependencies(include_streamlit=True)
     if st is None:
         raise ImportError(
             "Bu dosya Streamlit uygulamasıdır. Çalıştırmak için: streamlit run <dosya_adı>.py veya python <dosya_adı>.py --input ..."
