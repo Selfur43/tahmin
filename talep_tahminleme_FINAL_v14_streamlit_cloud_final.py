@@ -11325,9 +11325,44 @@ def _is_running_under_streamlit() -> bool:
         return False
     try:
         from streamlit.runtime.scriptrunner import get_script_run_ctx
-        return get_script_run_ctx() is not None
+        if get_script_run_ctx() is not None:
+            return True
     except Exception:
+        pass
+
+    try:
+        argv_text = " ".join(str(x) for x in sys.argv)
+    except Exception:
+        argv_text = ""
+
+    env_markers = [
+        "STREAMLIT_SERVER_PORT",
+        "STREAMLIT_SERVER_HEADLESS",
+        "STREAMLIT_BROWSER_GATHER_USAGE_STATS",
+        "STREAMLIT_SHARING_MODE",
+        "STREAMLIT_RUNTIME",
+    ]
+    if any(os.environ.get(k) for k in env_markers):
+        return True
+    if "streamlit run" in argv_text.lower():
+        return True
+    return False
+
+
+def _should_launch_streamlit_entrypoint(argv: Optional[List[str]] = None) -> bool:
+    argv = list(argv or [])
+    if _is_running_under_streamlit():
+        return True
+    if any(str(a).strip().lower() == "--streamlit" for a in argv):
+        return True
+    if st is None:
         return False
+
+    # Streamlit Cloud / headless ortamlarda tkinter yoktur; bu durumda
+    # parametresiz çalıştırma yerel diyalog akışına değil Streamlit girişine gitmelidir.
+    if not argv and not HAS_TKINTER:
+        return True
+    return False
 
 
 def configure_local_runtime_stability() -> None:
@@ -11894,7 +11929,7 @@ def run_cli_main(argv: Optional[List[str]] = None) -> int:
     parser = build_cli_arg_parser()
     args = parser.parse_args(argv)
 
-    if args.streamlit:
+    if _should_launch_streamlit_entrypoint(argv):
         if st is None:
             raise ImportError("Streamlit kurulu değil. 'streamlit run <dosya>.py' ile veya streamlit paketi kurulu halde çalıştırın.")
         entrypoint = _resolve_streamlit_entrypoint()
@@ -11940,7 +11975,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        if _is_running_under_streamlit():
+        if _should_launch_streamlit_entrypoint(sys.argv[1:]):
             main()
         else:
             raise SystemExit(run_cli_main(sys.argv[1:]))
