@@ -43,21 +43,11 @@ Main capabilities:
 """
 
 import os
-os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
-os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import re
 import io
 import json
 import math
 import time
-import copy
-import gc
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
 import hashlib
 import traceback
@@ -66,9 +56,6 @@ import tempfile
 import zipfile
 import shutil
 import atexit
-import argparse
-import sys
-from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -78,22 +65,10 @@ import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.impute import KNNImputer
-try:
-    from sklearn.linear_model import Ridge
-except Exception:
-    Ridge = None
 
-# GUI (desktop optional; Streamlit Cloud/mobile does not use tkinter)
-try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, simpledialog
-    HAS_TKINTER = True
-except Exception:
-    tk = None
-    filedialog = None
-    messagebox = None
-    simpledialog = None
-    HAS_TKINTER = False
+# GUI
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
 
 try:
     import rarfile  # optional; requires rarfile package and available backend on the host machine
@@ -108,125 +83,6 @@ except Exception:
     HAS_STATSMODELS = False
 
 warnings.filterwarnings("ignore")
-
-
-# =========================================================
-# LOCAL PROGRESS / RUN LOGGING
-# =========================================================
-
-LOCAL_PROGRESS_REPORTER = None
-
-
-class LocalProgressReporter:
-    def __init__(self, run_label: str, output_dir: Optional[str] = None, heartbeat_seconds: int = 60):
-        self.run_label = str(run_label)
-        self.output_dir = os.path.abspath(output_dir or os.getcwd())
-        os.makedirs(self.output_dir, exist_ok=True)
-        self.started_at = time.time()
-        self.last_update_at = self.started_at
-        self.current_stage = "Başlatılıyor"
-        self.current_target = None
-        self.heartbeat_seconds = max(20, int(heartbeat_seconds))
-        self._lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._heartbeat_thread = None
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", self.run_label).strip("_") or "forecast_run"
-        self.log_path = os.path.join(self.output_dir, f"{safe_label}_{ts}.log")
-        self._fh = open(self.log_path, "a", encoding="utf-8")
-        self.log("INFO", "Başlatma", f"Çalışma başlatıldı. Günlük dosyası: {self.log_path}")
-
-    def _elapsed_text(self) -> str:
-        elapsed = max(0.0, time.time() - self.started_at)
-        mins, secs = divmod(int(elapsed), 60)
-        hours, mins = divmod(mins, 60)
-        if hours:
-            return f"{hours:02d}:{mins:02d}:{secs:02d}"
-        return f"{mins:02d}:{secs:02d}"
-
-    def start(self):
-        if self._heartbeat_thread is None:
-            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="local-progress-heartbeat", daemon=True)
-            self._heartbeat_thread.start()
-        return self
-
-    def stop(self, success: bool = True, final_message: Optional[str] = None):
-        message = final_message or ("Çalışma tamamlandı." if success else "Çalışma hata ile sonlandı.")
-        self.log("SUCCESS" if success else "ERROR", "Kapanış", message)
-        self._stop_event.set()
-        if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join(timeout=1.0)
-        try:
-            self._fh.flush()
-            self._fh.close()
-        except Exception:
-            pass
-
-    def _emit_line(self, line: str):
-        print(line, flush=True)
-        try:
-            self._fh.write(line + "\n")
-            self._fh.flush()
-        except Exception:
-            pass
-
-    def log(self, level: str, stage: str, message: str, target: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
-        with self._lock:
-            self.last_update_at = time.time()
-            self.current_stage = str(stage)
-            self.current_target = None if target is None else str(target)
-            parts = [
-                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]",
-                f"[{str(level).upper()}]",
-                f"[+{self._elapsed_text()}]",
-                f"[Aşama: {stage}]",
-            ]
-            if target is not None:
-                parts.append(f"[Seri: {target}]")
-            line = " ".join(parts) + f" {message}"
-            if extra:
-                extra_pairs = [f"{k}={v}" for k, v in extra.items()]
-                if extra_pairs:
-                    line += " | " + ", ".join(extra_pairs)
-            self._emit_line(line)
-
-    def _heartbeat_loop(self):
-        while not self._stop_event.wait(self.heartbeat_seconds):
-            with self._lock:
-                silent_for = time.time() - self.last_update_at
-                stage = self.current_stage
-                target = self.current_target
-            if silent_for >= self.heartbeat_seconds:
-                msg = f"İşlem devam ediyor. Son bilinen aşama: {stage}."
-                if target:
-                    msg += f" Aktif seri: {target}."
-                msg += f" Son {int(silent_for)} saniyede yeni kayıt oluşmadı; süreç muhtemelen ağır model araması veya rapor üretimi içinde çalışıyor."
-                self.log("HEARTBEAT", stage, msg, target=target)
-
-
-def activate_local_progress_reporter(run_label: str, output_dir: Optional[str] = None, heartbeat_seconds: int = 60) -> LocalProgressReporter:
-    global LOCAL_PROGRESS_REPORTER
-    if LOCAL_PROGRESS_REPORTER is not None:
-        try:
-            LOCAL_PROGRESS_REPORTER.stop(success=False, final_message="Yeni çalışma başlatıldığı için önceki loglayıcı kapatıldı.")
-        except Exception:
-            pass
-    LOCAL_PROGRESS_REPORTER = LocalProgressReporter(run_label=run_label, output_dir=output_dir, heartbeat_seconds=heartbeat_seconds).start()
-    return LOCAL_PROGRESS_REPORTER
-
-
-def deactivate_local_progress_reporter(success: bool = True, final_message: Optional[str] = None) -> None:
-    global LOCAL_PROGRESS_REPORTER
-    reporter = LOCAL_PROGRESS_REPORTER
-    LOCAL_PROGRESS_REPORTER = None
-    if reporter is not None:
-        reporter.stop(success=success, final_message=final_message)
-
-
-def progress_log(stage: str, message: str, level: str = "INFO", target: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> None:
-    reporter = LOCAL_PROGRESS_REPORTER
-    if reporter is not None:
-        reporter.log(level=level, stage=stage, message=message, target=target, extra=extra)
 
 
 # =========================================================
@@ -445,9 +301,24 @@ def normalize_colname(col: str) -> str:
 
 
 def _choose_item_from_list(title: str, prompt: str, items: List[str]) -> str:
-    if not HAS_TKINTER:
-        raise RuntimeError('Bu seçim ekranı tkinter gerektirir. Streamlit/telefon kullanımında dosya ve sheet seçimi uygulama arayüzünden yapılmalıdır.')
-    return ask_choice_dialog(title=title, prompt=prompt, items=list(items), default_index=0)
+    root = tk.Tk()
+    root.withdraw()
+
+    item_text = "\n".join([f"{i+1}. {s}" for i, s in enumerate(items)])
+    answer = simpledialog.askstring(title, f"{prompt}\n\n{item_text}\n\nÖrnek: 1")
+
+    if not answer:
+        raise ValueError("Seçim yapılmadı.")
+
+    answer = answer.strip()
+    if not answer.isdigit():
+        raise ValueError("Geçerli bir seçim yapılmadı.")
+
+    idx = int(answer) - 1
+    if not (0 <= idx < len(items)):
+        raise ValueError("Geçerli bir seçim yapılmadı.")
+
+    return items[idx]
 
 
 def _list_excel_files_in_archive(archive_path: str) -> List[str]:
@@ -501,162 +372,21 @@ def _extract_excel_from_archive(archive_path: str, member_name: str) -> Tuple[st
     return extracted_path, temp_dir
 
 
-def _best_local_initial_dir() -> str:
-    candidates = []
-    try:
-        home = os.path.expanduser("~")
-        if home:
-            candidates.extend([
-                os.path.join(home, "Desktop"),
-                os.path.join(home, "Masaüstü"),
-                os.path.join(home, "Documents"),
-                os.path.join(home, "Belgeler"),
-                home,
-            ])
-    except Exception:
-        pass
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return candidate
-    return os.getcwd()
-
-
-def _prepare_tk_root(hidden: bool = True) -> Any:
-    if not HAS_TKINTER:
-        raise RuntimeError('Tkinter bu ortamda kullanılamıyor. Streamlit dosya yükleme akışını kullanın.')
+def choose_excel_file() -> Dict[str, Optional[str]]:
     root = tk.Tk()
-    try:
-        root.attributes('-topmost', True)
-    except Exception:
-        pass
-    if hidden:
-        try:
-            root.withdraw()
-        except Exception:
-            pass
-    else:
-        try:
-            root.geometry('1x1+0+0')
-            root.overrideredirect(True)
-            root.attributes('-alpha', 0.0)
-            root.deiconify()
-        except Exception:
-            try:
-                root.withdraw()
-                root.deiconify()
-            except Exception:
-                pass
-    try:
-        root.update_idletasks()
-        root.update()
-    except Exception:
-        pass
-    return root
-
-
-def _finalize_tk_window(window: Any) -> None:
-    try:
-        window.update_idletasks()
-    except Exception:
-        pass
-    try:
-        width = max(int(window.winfo_width()), int(window.winfo_reqwidth()), 420)
-        height = max(int(window.winfo_height()), int(window.winfo_reqheight()), 220)
-        screen_w = int(window.winfo_screenwidth())
-        screen_h = int(window.winfo_screenheight())
-        x = max(0, (screen_w - width) // 2)
-        y = max(0, (screen_h - height) // 3)
-        window.geometry(f"{width}x{height}+{x}+{y}")
-    except Exception:
-        pass
-    for fn in ('lift', 'focus_force'):
-        try:
-            getattr(window, fn)()
-        except Exception:
-            pass
-    try:
-        window.attributes('-topmost', True)
-        window.after(250, lambda: window.attributes('-topmost', False))
-    except Exception:
-        pass
-
-
-def _create_modal_dialog(owner: Any, title: str, geometry: str) -> Any:
-    dialog = tk.Toplevel(owner)
-    dialog.title(title)
-    dialog.geometry(geometry)
-    dialog.minsize(420, 220)
-    try:
-        dialog.transient(owner)
-    except Exception:
-        pass
-    try:
-        dialog.attributes('-topmost', True)
-    except Exception:
-        pass
-    dialog.protocol('WM_DELETE_WINDOW', dialog.destroy)
-    dialog.bind('<Escape>', lambda _e: dialog.destroy())
-    dialog.after(10, lambda: _finalize_tk_window(dialog))
-    try:
-        dialog.grab_set()
-    except Exception:
-        pass
-    try:
-        dialog.lift()
-        dialog.focus_force()
-    except Exception:
-        pass
-    return dialog
-
-
-def choose_excel_file(dialog_mode: str = "excel_or_archive") -> Dict[str, Optional[str]]:
-    if not HAS_TKINTER:
-        raise RuntimeError('Tkinter bu ortamda kullanılamıyor. Streamlit dosya yükleme akışını kullanın.')
-
-    root = _prepare_tk_root(hidden=True)
-    initial_dir = _best_local_initial_dir()
-
-    if dialog_mode == "excel_only":
-        title = "Excel dosyasını seçin"
-        filetypes = [
-            ("Excel files", "*.xlsx *.xls"),
-            ("Excel workbook (*.xlsx)", "*.xlsx"),
-            ("Legacy Excel (*.xls)", "*.xls"),
-            ("All files", "*.*"),
-        ]
-    elif dialog_mode == "archive_only":
-        title = "ZIP veya RAR arşivini seçin"
-        filetypes = [
-            ("Archive files", "*.zip *.rar"),
-            ("ZIP archives", "*.zip"),
-            ("RAR archives", "*.rar"),
-            ("All files", "*.*"),
-        ]
-    else:
-        title = "Excel dosyasını, ZIP/RAR arşivini seçin"
-        filetypes = [
+    root.withdraw()
+    selected_path = filedialog.askopenfilename(
+        title="Excel dosyasını veya ZIP/RAR arşivini seçin",
+        filetypes=[
             ("Excel and archives", "*.xlsx *.xls *.zip *.rar"),
             ("Excel files", "*.xlsx *.xls"),
             ("ZIP archives", "*.zip"),
             ("RAR archives", "*.rar"),
-            ("All files", "*.*"),
         ]
-
-    selected_path = filedialog.askopenfilename(
-        title=title,
-        filetypes=filetypes,
-        initialdir=initial_dir,
-        parent=root,
     )
-    try:
-        root.destroy()
-    except Exception:
-        pass
-
     if not selected_path:
         raise FileNotFoundError("Dosya seçilmedi.")
 
-    selected_path = os.path.abspath(selected_path)
     lower = selected_path.lower()
     if lower.endswith(('.xlsx', '.xls')):
         return {
@@ -686,213 +416,36 @@ def choose_excel_file(dialog_mode: str = "excel_or_archive") -> Dict[str, Option
             'source_type': 'archive'
         }
 
-    raise ValueError("Desteklenmeyen dosya türü seçildi. Lütfen .xlsx, .xls, .zip veya .rar seçin.")
-
+    raise ValueError("Desteklenmeyen dosya türü seçildi.")
 
 
 def choose_sheets(sheet_names: List[str]) -> List[str]:
-    if not HAS_TKINTER:
-        raise RuntimeError('Tkinter bu ortamda kullanılamıyor. Streamlit sheet seçimini kullanın.')
-    return ask_multiselect_dialog(
-        title="Sheet Seçimi",
-        prompt="Kullanılacak sheet(ler)i seçin.",
-        items=[str(s) for s in sheet_names],
-        default_items=[str(sheet_names[0])] if sheet_names else []
+    root = tk.Tk()
+    root.withdraw()
+
+    sheet_text = "\n".join([f"{i+1}. {s}" for i, s in enumerate(sheet_names)])
+    prompt = (
+        "Kullanmak istediğiniz sheet numaralarını virgülle girin.\n\n"
+        f"{sheet_text}\n\n"
+        "Örnek: 1,2 veya sadece 2"
     )
+    answer = simpledialog.askstring("Sheet Seçimi", prompt)
 
+    if not answer:
+        raise ValueError("Sheet seçimi yapılmadı.")
 
-def ask_choice_dialog(title: str, prompt: str, items: List[str], default_index: int = 0) -> str:
-    if not items:
-        raise ValueError("Seçilecek öğe bulunamadı.")
-    if not HAS_TKINTER:
-        return items[max(0, min(default_index, len(items) - 1))]
+    idxs = []
+    for x in answer.split(","):
+        x = x.strip()
+        if x.isdigit():
+            idx = int(x) - 1
+            if 0 <= idx < len(sheet_names):
+                idxs.append(idx)
 
-    owner = _prepare_tk_root(hidden=False)
-    result = {"value": None}
-    dialog = _create_modal_dialog(owner, title, "760x520")
-    dialog.resizable(True, True)
+    if not idxs:
+        raise ValueError("Geçerli bir sheet seçimi yapılmadı.")
 
-    tk.Label(dialog, text=prompt, justify="left", anchor="w", wraplength=700).pack(fill="x", padx=12, pady=(12, 6))
-    frame = tk.Frame(dialog)
-    frame.pack(fill="both", expand=True, padx=12, pady=6)
-    scrollbar = tk.Scrollbar(frame, orient="vertical")
-    listbox = tk.Listbox(frame, exportselection=False, height=min(18, max(8, len(items))), yscrollcommand=scrollbar.set)
-    scrollbar.config(command=listbox.yview)
-    scrollbar.pack(side="right", fill="y")
-    listbox.pack(side="left", fill="both", expand=True)
-    for item in items:
-        listbox.insert("end", item)
-    idx = max(0, min(default_index, len(items) - 1))
-    listbox.selection_set(idx)
-    listbox.see(idx)
-
-    def confirm(_event=None):
-        sel = listbox.curselection()
-        if not sel:
-            messagebox.showwarning(title, "Lütfen bir seçim yapın.", parent=dialog)
-            return
-        result["value"] = items[int(sel[0])]
-        dialog.destroy()
-
-    def cancel(_event=None):
-        dialog.destroy()
-
-    listbox.bind("<Double-Button-1>", confirm)
-    listbox.bind("<Return>", confirm)
-    btns = tk.Frame(dialog)
-    btns.pack(fill="x", padx=12, pady=(6, 12))
-    tk.Button(btns, text="İptal", command=cancel, width=12).pack(side="right", padx=(6, 0))
-    tk.Button(btns, text="Seç", command=confirm, width=12).pack(side="right")
-    dialog.protocol('WM_DELETE_WINDOW', cancel)
-    dialog.after(20, lambda: listbox.focus_set())
-    owner.wait_window(dialog)
-    try:
-        owner.destroy()
-    except Exception:
-        pass
-
-    if result["value"] is None:
-        raise ValueError("Seçim yapılmadı.")
-    return str(result["value"])
-
-
-def ask_multiselect_dialog(title: str, prompt: str, items: List[str], default_items: Optional[List[str]] = None) -> List[str]:
-    if not items:
-        return []
-    default_items = list(default_items or [])
-    if not HAS_TKINTER:
-        return default_items or items
-
-    owner = _prepare_tk_root(hidden=False)
-    result = {"values": None}
-    dialog = _create_modal_dialog(owner, title, "820x620")
-    dialog.resizable(True, True)
-
-    tk.Label(dialog, text=prompt, justify="left", anchor="w", wraplength=760).pack(fill="x", padx=12, pady=(12, 6))
-    frame = tk.Frame(dialog)
-    frame.pack(fill="both", expand=True, padx=12, pady=6)
-    scrollbar = tk.Scrollbar(frame, orient="vertical")
-    listbox = tk.Listbox(frame, selectmode="multiple", exportselection=False, yscrollcommand=scrollbar.set)
-    scrollbar.config(command=listbox.yview)
-    scrollbar.pack(side="right", fill="y")
-    listbox.pack(side="left", fill="both", expand=True)
-    for item in items:
-        listbox.insert("end", item)
-    default_set = set(default_items)
-    for i, item in enumerate(items):
-        if item in default_set:
-            listbox.selection_set(i)
-
-    def select_all():
-        listbox.selection_set(0, "end")
-
-    def clear_all():
-        listbox.selection_clear(0, "end")
-
-    def confirm(_event=None):
-        sels = [items[int(i)] for i in listbox.curselection()]
-        if not sels:
-            messagebox.showwarning(title, "Lütfen en az bir seri seçin.", parent=dialog)
-            return
-        result["values"] = sels
-        dialog.destroy()
-
-    def cancel(_event=None):
-        dialog.destroy()
-
-    btns = tk.Frame(dialog)
-    btns.pack(fill="x", padx=12, pady=(6, 12))
-    tk.Button(btns, text="Tümünü Seç", command=select_all, width=14).pack(side="left")
-    tk.Button(btns, text="Temizle", command=clear_all, width=14).pack(side="left", padx=(6, 0))
-    tk.Button(btns, text="İptal", command=cancel, width=12).pack(side="right", padx=(6, 0))
-    tk.Button(btns, text="Onayla", command=confirm, width=12).pack(side="right")
-    dialog.protocol('WM_DELETE_WINDOW', cancel)
-    dialog.bind('<Return>', confirm)
-    dialog.after(20, lambda: listbox.focus_set())
-    owner.wait_window(dialog)
-    try:
-        owner.destroy()
-    except Exception:
-        pass
-
-    if result["values"] is None:
-        raise ValueError("Seçim yapılmadı.")
-    return list(result["values"])
-
-
-def ask_integer_dialog(title: str, prompt: str, initial: int, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
-    if not HAS_TKINTER:
-        return int(initial)
-
-    owner = _prepare_tk_root(hidden=False)
-    result = {"value": None}
-    dialog = _create_modal_dialog(owner, title, "560x280")
-    dialog.resizable(False, False)
-
-    tk.Label(dialog, text=prompt, justify="left", anchor="w", wraplength=520).pack(fill="x", padx=12, pady=(12, 6))
-    body = tk.Frame(dialog)
-    body.pack(fill='x', padx=12, pady=6)
-    value_var = tk.StringVar(value=str(int(initial)))
-    entry = tk.Entry(body, textvariable=value_var, width=16)
-    entry.pack(side='left', padx=(0, 8))
-    hint = []
-    if min_value is not None:
-        hint.append(f"min={min_value}")
-    if max_value is not None:
-        hint.append(f"max={max_value}")
-    tk.Label(body, text=("Geçerli aralık: " + ", ".join(hint)) if hint else "Tamsayı girin.").pack(side='left')
-
-    def confirm(_event=None):
-        raw = value_var.get().strip()
-        try:
-            value = int(raw)
-        except Exception:
-            messagebox.showwarning(title, "Lütfen geçerli bir tam sayı girin.", parent=dialog)
-            return
-        if min_value is not None and value < min_value:
-            messagebox.showwarning(title, f"Değer en az {min_value} olmalıdır.", parent=dialog)
-            return
-        if max_value is not None and value > max_value:
-            messagebox.showwarning(title, f"Değer en fazla {max_value} olmalıdır.", parent=dialog)
-            return
-        result['value'] = int(value)
-        dialog.destroy()
-
-    def cancel(_event=None):
-        dialog.destroy()
-
-    btns = tk.Frame(dialog)
-    btns.pack(fill='x', padx=12, pady=(6, 12))
-    tk.Button(btns, text='İptal', command=cancel, width=12).pack(side='right', padx=(6, 0))
-    tk.Button(btns, text='Onayla', command=confirm, width=12).pack(side='right')
-    dialog.protocol('WM_DELETE_WINDOW', cancel)
-    dialog.bind('<Return>', confirm)
-    dialog.after(20, lambda: entry.focus_set())
-    owner.wait_window(dialog)
-    try:
-        owner.destroy()
-    except Exception:
-        pass
-    if result['value'] is None:
-        raise ValueError('Sayısal seçim iptal edildi.')
-    return int(result['value'])
-
-
-def choose_single_sheet(sheet_names: List[str], always_prompt: bool = True) -> str:
-    sheet_names = [str(s) for s in sheet_names]
-    if not sheet_names:
-        raise ValueError("Sheet bulunamadı.")
-    if len(sheet_names) == 1 and not always_prompt:
-        return str(sheet_names[0])
-    prompt = "Tahminleme için kullanılacak sheet'i seçin."
-    if len(sheet_names) == 1:
-        prompt = "Tek bir sheet bulundu. Devam etmek için seçimi onaylayın."
-    return ask_choice_dialog(
-        title="Sheet Seçimi",
-        prompt=prompt,
-        items=list(sheet_names),
-        default_index=0,
-    )
+    return [sheet_names[i] for i in sorted(set(idxs))]
 
 
 def create_output_dir(base_path: str, output_dir_name: str) -> str:
@@ -900,143 +453,6 @@ def create_output_dir(base_path: str, output_dir_name: str) -> str:
     out_dir = os.path.join(base_folder, output_dir_name)
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
-
-
-def save_uploaded_file(uploaded_file) -> str:
-    """
-    Streamlit uploaded file nesnesini güvenli bir geçici klasöre yazar ve dosya yolunu döndürür.
-    Hem .xlsx hem .xls için çalışır. Aynı isimli tekrar yüklemelerde çakışmayı önler.
-    """
-    if uploaded_file is None:
-        raise ValueError("Yüklenecek dosya bulunamadı.")
-
-    original_name = os.path.basename(getattr(uploaded_file, 'name', 'uploaded.xlsx'))
-    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', original_name)
-    suffix = os.path.splitext(safe_name)[1] or '.xlsx'
-
-    temp_dir = os.path.join(tempfile.gettempdir(), 'talep_tahminleme_streamlit_uploads')
-    os.makedirs(temp_dir, exist_ok=True)
-
-    unique_name = f"{uuid.uuid4().hex}_{safe_name}"
-    save_path = os.path.join(temp_dir, unique_name)
-
-    file_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file.read()
-    if file_bytes is None:
-        raise ValueError('Yüklenen dosya okunamadı.')
-
-    with open(save_path, 'wb') as f:
-        f.write(file_bytes)
-
-    if not os.path.exists(save_path) or os.path.getsize(save_path) == 0:
-        raise IOError('Yüklenen dosya diske yazılamadı.')
-
-    if suffix.lower() not in ['.xlsx', '.xls']:
-        raise ValueError('Desteklenmeyen dosya türü. Lütfen Excel dosyası yükleyin.')
-
-    return save_path
-
-
-
-def _check_optional_excel_dependency(ext: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    ext = str(ext).lower()
-    if ext == '.xlsx':
-        try:
-            import openpyxl  # noqa: F401
-            return True, 'openpyxl', None
-        except Exception as e:
-            return False, None, f".xlsx dosyalarını okumak için openpyxl gerekir: {e}"
-    if ext == '.xls':
-        try:
-            import xlrd  # noqa: F401
-            return True, 'xlrd', None
-        except Exception as e:
-            return False, None, f".xls dosyalarını okumak için xlrd gerekir: {e}"
-    return False, None, f"Desteklenmeyen Excel uzantısı: {ext}"
-
-
-def safe_excel_file(excel_path: str) -> pd.ExcelFile:
-    ext = os.path.splitext(str(excel_path))[1].lower()
-    ok, engine, msg = _check_optional_excel_dependency(ext)
-    if not ok:
-        raise ImportError(msg)
-    try:
-        return pd.ExcelFile(excel_path, engine=engine)
-    except Exception as e:
-        raise ImportError(f"Excel dosyası açılamadı ({os.path.basename(excel_path)}): {e}")
-
-
-def safe_read_excel(excel_path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
-    ext = os.path.splitext(str(excel_path))[1].lower()
-    ok, engine, msg = _check_optional_excel_dependency(ext)
-    if not ok:
-        raise ImportError(msg)
-    try:
-        return pd.read_excel(excel_path, sheet_name=sheet_name, engine=engine)
-    except Exception as e:
-        raise ImportError(f"Excel sayfası okunamadı ({os.path.basename(excel_path)} / {sheet_name}): {e}")
-
-def run_preprocessing_for_sheet(excel_path: str, sheet_name: str, output_dir: str) -> Dict[str, pd.DataFrame]:
-    """Streamlit için tek sheet preprocessing wrapper'ı."""
-    config = PreprocessConfig(
-        output_dir_name="forecast_preprocessing_outputs",
-        force_regular_frequency=True,
-        allow_month_start_to_month_end_alignment_fix=True,
-        max_interpolation_gap=1,
-        use_knn_for_dense_missing_blocks=False,
-        impute_method_preference="seasonal_local",
-        min_action_confidence_for_auto_fix=0.75,
-        auto_fix_business_spike_dip=False,
-        auto_fix_unknown_anomaly=False,
-        auto_fix_data_error=True,
-        auto_fix_structural_event=False,
-        scaler_for_deep_learning="robust",
-        export_log1p_version=True,
-        generate_modeling_ready_feature_pack=True,
-        exclude_textual_columns_from_modeling_features=True,
-        drop_low_signal_calendar_features_for_monthly=True,
-        export_training_exclusion_masks=True,
-        save_validation_excel=True,
-        save_validation_csv=True,
-        save_validation_plots=True,
-        create_domain_validation_template=True,
-        leakage_check_enabled=True,
-        max_plot_series=50,
-        run_internal_unit_tests=True,
-        run_synthetic_tests=True,
-        run_business_rule_tests=True,
-        run_manual_sample_audit=True,
-        run_proxy_backtest_validation=True,
-        manual_sample_size=20,
-        random_seed=42,
-        backtest_horizon=3,
-        backtest_min_train_size_monthly=24,
-        backtest_min_train_size_weekly=52,
-        backtest_min_train_size_daily=60,
-        backtest_min_train_size_hourly=24 * 14,
-        review_if_outlier_fraction_gt=0.05,
-        review_if_structural_zero_events_gt=1,
-        review_if_clean_zero_ratio_gt=0.10,
-        review_if_proxy_smape_gt=60.0,
-        save_excel=True,
-        save_csv=True,
-        save_metadata_json=True,
-        save_quality_report=True
-    )
-
-    os.makedirs(output_dir, exist_ok=True)
-    progress_log("Önişleme", "Tam önişleme başlatıldı.", extra={"sheet": sheet_name, "output_dir": output_dir})
-    preprocessor = DemandForecastPreprocessor(config=config)
-    export_payload = preprocessor.preprocess_sheet(
-        file_path=excel_path,
-        sheet_name=sheet_name,
-        output_dir=output_dir
-    )
-    progress_log("Önişleme", "Tam önişleme başarıyla tamamlandı.", level="SUCCESS", extra={"sheet": sheet_name, "targets": int(len(export_payload.get("series_profile_report", pd.DataFrame())))})
-    try:
-        preprocessor.save_global_metadata(output_dir)
-    except Exception:
-        pass
-    return export_payload
 
 
 def choose_scaler(name: str):
@@ -2503,94 +1919,6 @@ def _seasonal_period_from_freq(freq_alias: str) -> int:
     return 12
 
 
-def _make_unique_text_labels(labels: List[Any]) -> List[str]:
-    seen: Dict[str, int] = {}
-    out: List[str] = []
-    for raw in list(labels):
-        base = str(raw)
-        if base not in seen:
-            seen[base] = 0
-            out.append(base)
-        else:
-            seen[base] += 1
-            out.append(f"{base}__{seen[base]}")
-    return out
-
-
-def _plot_tick_step(n_labels: int) -> int:
-    if n_labels <= 20:
-        return 1
-    if n_labels <= 40:
-        return 2
-    if n_labels <= 80:
-        return 4
-    if n_labels <= 120:
-        return 6
-    return 8
-
-
-def _safe_save_matrix_heatmap(matrix: pd.DataFrame, title: str, output_path: str) -> bool:
-    try:
-        if matrix is None or matrix.empty:
-            return False
-        row_labels = _make_unique_text_labels(matrix.index.tolist())
-        col_labels = _make_unique_text_labels(matrix.columns.tolist())
-        arr = np.asarray(matrix.values, dtype=float)
-        fig, ax = plt.subplots(figsize=(max(10, 0.24 * len(col_labels)), max(8, 0.24 * len(row_labels))))
-        im = ax.imshow(arr, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
-        fig.colorbar(im, ax=ax)
-        x_step = _plot_tick_step(len(col_labels))
-        y_step = _plot_tick_step(len(row_labels))
-        x_pos = np.arange(0, len(col_labels), x_step)
-        y_pos = np.arange(0, len(row_labels), y_step)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels([col_labels[i] for i in x_pos], rotation=90, fontsize=8)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels([row_labels[i] for i in y_pos], fontsize=8)
-        ax.set_title(title)
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=150)
-        plt.close(fig)
-        return True
-    except Exception:
-        try:
-            plt.close('all')
-        except Exception:
-            pass
-        return False
-
-
-def _safe_save_pivot_heatmap(piv: pd.DataFrame, title: str, output_path: str) -> bool:
-    try:
-        if piv is None or piv.empty:
-            return False
-        row_labels = _make_unique_text_labels(piv.index.tolist())
-        col_labels = _make_unique_text_labels(piv.columns.tolist())
-        arr = np.asarray(piv.values, dtype=float)
-        fig, ax = plt.subplots(figsize=(max(8, 0.42 * len(col_labels)), max(6, 0.32 * len(row_labels))))
-        im = ax.imshow(arr, aspect="auto", cmap="viridis")
-        fig.colorbar(im, ax=ax)
-        x_step = _plot_tick_step(len(col_labels))
-        y_step = _plot_tick_step(len(row_labels))
-        x_pos = np.arange(0, len(col_labels), x_step)
-        y_pos = np.arange(0, len(row_labels), y_step)
-        ax.set_xticks(x_pos)
-        ax.set_xticklabels([col_labels[i] for i in x_pos], fontsize=8)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels([row_labels[i] for i in y_pos], fontsize=8)
-        ax.set_title(title)
-        fig.tight_layout()
-        fig.savefig(output_path, dpi=150)
-        plt.close(fig)
-        return True
-    except Exception:
-        try:
-            plt.close('all')
-        except Exception:
-            pass
-        return False
-
-
 def save_correlation_analysis(
     df_for_corr: pd.DataFrame,
     target_cols: List[str],
@@ -2607,63 +1935,48 @@ def save_correlation_analysis(
         corr_long = pd.DataFrame(columns=["target_series", "variable", "correlation", "abs_correlation"])
         return corr_matrix, corr_long
 
-    original_numeric_cols = list(numeric_df.columns)
-    unique_numeric_cols = _make_unique_text_labels(original_numeric_cols)
-    numeric_df.columns = unique_numeric_cols
-    target_name_map: Dict[str, List[str]] = {}
-    for orig_name, unique_name in zip(original_numeric_cols, unique_numeric_cols):
-        target_name_map.setdefault(str(orig_name), []).append(unique_name)
-
     corr_matrix = numeric_df.corr(method="pearson")
     corr_matrix.to_csv(os.path.join(sheet_dir, "correlation_matrix.csv"), encoding="utf-8-sig")
     corr_matrix.to_excel(os.path.join(sheet_dir, "correlation_matrix.xlsx"))
 
-    _safe_save_matrix_heatmap(
-        corr_matrix,
-        "Correlation Matrix",
-        os.path.join(plot_dir, "correlation_matrix_heatmap.png")
-    )
+    plt.figure(figsize=(max(10, 0.45 * len(corr_matrix.columns)), max(8, 0.45 * len(corr_matrix.columns))))
+    plt.imshow(corr_matrix.values, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
+    plt.colorbar()
+    plt.xticks(range(len(corr_matrix.columns)), corr_matrix.columns, rotation=90)
+    plt.yticks(range(len(corr_matrix.index)), corr_matrix.index)
+    plt.title("Correlation Matrix")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, "correlation_matrix_heatmap.png"), dpi=150)
+    plt.close()
 
     rows = []
     for target in target_cols:
-        mapped_targets = target_name_map.get(str(target), [])
-        if not mapped_targets:
+        if target not in corr_matrix.columns:
             continue
-        for mapped_target in mapped_targets:
-            if mapped_target not in corr_matrix.columns:
-                continue
-            tmp = corr_matrix[mapped_target].drop(labels=[mapped_target], errors="ignore").reset_index()
-            if tmp.shape[1] < 2:
-                continue
-            tmp = tmp.iloc[:, :2].copy()
-            tmp.columns = ["variable", "correlation"]
-            tmp["target_series"] = str(target)
-            tmp["abs_correlation"] = pd.to_numeric(tmp["correlation"], errors="coerce").abs()
-            tmp = tmp.sort_values("abs_correlation", ascending=False)
-            rows.append(tmp[["target_series", "variable", "correlation", "abs_correlation"]])
+        tmp = corr_matrix[target].drop(labels=[target], errors="ignore").reset_index()
+        tmp.columns = ["variable", "correlation"]
+        tmp["target_series"] = target
+        tmp["abs_correlation"] = tmp["correlation"].abs()
+        tmp = tmp.sort_values("abs_correlation", ascending=False)
+        rows.append(tmp[["target_series", "variable", "correlation", "abs_correlation"]])
 
-            top_n = min(20, len(tmp))
-            if top_n > 0:
-                try:
-                    plt.figure(figsize=(10, max(5, 0.35 * top_n)))
-                    tmp_plot = tmp.head(top_n).sort_values("correlation")
-                    plt.barh(tmp_plot["variable"].astype(str), tmp_plot["correlation"].astype(float))
-                    plt.axvline(0.0, linewidth=1.0)
-                    plt.title(f"Top correlations with {target}")
-                    plt.xlabel("Correlation")
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(plot_dir, f"{_safe_plot_name(str(target))}_top_correlations.png"), dpi=150)
-                    plt.close()
-                except Exception:
-                    try:
-                        plt.close('all')
-                    except Exception:
-                        pass
+        top_n = min(20, len(tmp))
+        if top_n > 0:
+            plt.figure(figsize=(10, max(5, 0.35 * top_n)))
+            tmp_plot = tmp.head(top_n).sort_values("correlation")
+            plt.barh(tmp_plot["variable"].astype(str), tmp_plot["correlation"].astype(float))
+            plt.axvline(0.0, linewidth=1.0)
+            plt.title(f"Top correlations with {target}")
+            plt.xlabel("Correlation")
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, f"{_safe_plot_name(target)}_top_correlations.png"), dpi=150)
+            plt.close()
 
     corr_long = pd.concat(rows, axis=0, ignore_index=True) if rows else pd.DataFrame(columns=["target_series", "variable", "correlation", "abs_correlation"])
     corr_long.to_csv(os.path.join(sheet_dir, "target_correlations_long.csv"), index=False, encoding="utf-8-sig")
     corr_long.to_excel(os.path.join(sheet_dir, "target_correlations_long.xlsx"), index=False)
     return corr_matrix, corr_long
+
 
 def save_seasonality_heatmaps_and_decomposition(
     df_clean: pd.DataFrame,
@@ -2717,11 +2030,17 @@ def save_seasonality_heatmaps_and_decomposition(
         if len(piv) > 0:
             piv.to_csv(os.path.join(sheet_dir, f"{_safe_plot_name(col)}_heatmap_data.csv"), encoding="utf-8-sig")
 
-            _safe_save_pivot_heatmap(
-                piv,
-                f"{col} - Heatmap ({row_label} x {col_label})",
-                os.path.join(plot_dir, heatmap_name)
-            )
+            plt.figure(figsize=(max(8, 0.5 * max(1, len(piv.columns))), max(5, 0.4 * max(1, len(piv.index)))))
+            plt.imshow(piv.values, aspect="auto", cmap="YlOrRd")
+            plt.colorbar()
+            plt.xticks(range(len(piv.columns)), piv.columns)
+            plt.yticks(range(len(piv.index)), piv.index)
+            plt.title(f"{col} - Heatmap ({row_label} x {col_label})")
+            plt.xlabel(col_label)
+            plt.ylabel(row_label)
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, heatmap_name), dpi=150)
+            plt.close()
 
             heatmap_rows.append({
                 "series": col,
@@ -4176,13 +3495,10 @@ class DemandForecastPreprocessor:
 
     def preprocess_sheet(self, file_path: str, sheet_name: str, output_dir: str) -> Dict[str, pd.DataFrame]:
         print(f"\n[INFO] Preprocessing started -> Sheet: {sheet_name}")
-        progress_log("Önişleme", "Sheet okuma başlatıldı.", extra={"sheet": sheet_name, "file_path": file_path})
 
         df_raw_original = pd.read_excel(file_path, sheet_name=sheet_name)
         original_columns = df_raw_original.columns.tolist()
-        progress_log("Önişleme", "Ham sheet okundu.", level="SUCCESS", extra={"sheet": sheet_name, "rows": int(len(df_raw_original)), "columns": int(len(original_columns))})
 
-        progress_log("Önişleme", "Tarih kolonu ve hedef seriler tespit ediliyor.", extra={"sheet": sheet_name})
         date_col = detect_date_column(df_raw_original, self.config)
         df_raw_original[date_col] = parse_datetime_series(df_raw_original[date_col])
         df_raw_original = df_raw_original[df_raw_original[date_col].notna()].copy()
@@ -4194,9 +3510,7 @@ class DemandForecastPreprocessor:
 
         freq = infer_frequency_from_dates(pd.DatetimeIndex(df_raw_original[date_col].sort_values()))
         freq_alias = get_expected_freq_alias(freq)
-        progress_log("Önişleme", "Temel seri yapısı çıkarıldı.", level="SUCCESS", extra={"date_col": date_col, "target_count": len(target_cols), "freq_alias": freq_alias})
 
-        progress_log("Önişleme", "Tarih hizalama ve düzenli zaman ekseni oluşturuluyor.", extra={"freq_alias": freq_alias})
         df_raw_aligned, datetime_alignment_audit = align_dates_to_frequency(df_raw_original.copy(), date_col, freq_alias)
         df_raw_aggregated = aggregate_duplicates(df_raw_aligned, date_col, target_cols)
 
@@ -4213,9 +3527,7 @@ class DemandForecastPreprocessor:
             date_col=date_col,
             freq_alias=freq_alias
         )
-        progress_log("Önişleme", "Düzenli zaman ekseni ve datetime denetimi tamamlandı.", level="SUCCESS", extra={"regular_rows": int(len(df_regular)), "start": str(df_regular[date_col].min()) if len(df_regular) else None, "end": str(df_regular[date_col].max()) if len(df_regular) else None})
 
-        progress_log("Önişleme", "Seri profilleri, yapısal olaylar ve anomali adayları hesaplanıyor.")
         # Series profiles
         series_profile_report = create_series_profile_report(df_regular, target_cols, freq_alias, self.config)
         series_profiles = {
@@ -4295,7 +3607,6 @@ class DemandForecastPreprocessor:
             incomplete_period_flags=incomplete_period_flags,
             config=self.config
         )
-        progress_log("Önişleme", "Anomali yönetişimi tamamlandı.", level="SUCCESS", extra={"anomaly_rows": int(len(anomaly_governance)), "structural_events": int(pd.Series(structural_event_flags).fillna(False).sum()), "incomplete_period_flags": int(pd.Series(incomplete_period_flags).fillna(False).sum())})
 
 
 
@@ -4403,13 +3714,11 @@ class DemandForecastPreprocessor:
                 imputer = KNNImputer(n_neighbors=3)
                 df_clean[target_cols] = imputer.fit_transform(target_block)
 
-        progress_log("Önişleme", "Temiz veri, imputasyon ve feature engineering adımları yürütülüyor.", extra={"target_count": len(target_cols)})
         # Features
         season_length = self.config.seasonal_period_map.get(freq_alias, 1)
         df_feat = add_calendar_features(df_clean, date_col, freq_alias)
         df_feat = add_lag_features(df_feat, target_cols, freq_alias, season_length)
         df_feat = add_series_quality_features(df_feat, target_cols, anomaly_governance, date_col)
-        progress_log("Önişleme", "Feature engineering tamamlandı.", level="SUCCESS", extra={"feature_rows": int(len(df_feat)), "feature_columns": int(len(df_feat.columns))})
 
         model_input_transparency = create_model_input_transparency_export(
             df_regular=df_regular,
@@ -4885,7 +4194,6 @@ class DemandForecastPreprocessor:
             proxy_backtest_report_clean_truth if len(proxy_backtest_report_clean_truth) > 0 else pd.DataFrame()
         )
 
-        progress_log("Önişleme", "Kalite kontrolleri, backtest ve validasyon raporları oluşturuluyor.")
         validation_summary = create_validation_summary(
             quality_report=quality_report,
             missing_audit=missing_audit,
@@ -4904,7 +4212,6 @@ class DemandForecastPreprocessor:
             config=self.config
         )
 
-        progress_log("Önişleme", "Önişleme ve validasyon paketi tamamlandı.", level="SUCCESS", extra={"sheet": sheet_name, "targets": len(target_cols), "validation_rows": int(len(validation_summary)) if isinstance(validation_summary, pd.DataFrame) else None})
         return {
             "validation_summary": validation_summary,
             "missing_audit": missing_audit,
@@ -5120,7 +4427,7 @@ def main():
         source_path = input_info["source_path"]
         excel_path = input_info["excel_path"]
 
-        xls = safe_excel_file(excel_path)
+        xls = pd.ExcelFile(excel_path)
         selected_sheets = choose_sheets(xls.sheet_names)
         output_dir = create_output_dir(source_path, config.output_dir_name)
 
@@ -5164,386 +4471,61 @@ def main():
 import importlib
 from itertools import product
 
-st = None
-
-go = None
-make_subplots = None
-HAS_PLOTLY = False
-
-SARIMAX = None
-adfuller = None
-kpss = None
-acf = None
-pacf = None
-plot_acf = None
-plot_pacf = None
-acorr_ljungbox = None
-HAS_FORECAST_STATSMODELS = False
-
-Prophet = None
-HAS_PROPHET = False
-
-XGBRegressor = None
-HAS_XGBOOST = False
+try:
+    import streamlit as st
+except Exception:
+    st = None
 
 try:
-    from sklearn.ensemble import HistGradientBoostingRegressor as SKHistGradientBoostingRegressor
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    HAS_PLOTLY = True
 except Exception:
-    SKHistGradientBoostingRegressor = None
-
-
-def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> None:
-    global st, go, make_subplots, HAS_PLOTLY
-    global SARIMAX, adfuller, kpss, acf, pacf, plot_acf, plot_pacf, acorr_ljungbox, HAS_FORECAST_STATSMODELS
-    global Prophet, HAS_PROPHET
-    global XGBRegressor, HAS_XGBOOST
-
-    if include_streamlit and st is None:
-        try:
-            import streamlit as _st
-            st = _st
-        except Exception:
-            st = None
-
-    if go is None or make_subplots is None:
-        try:
-            import plotly.graph_objects as _go
-            from plotly.subplots import make_subplots as _make_subplots
-            go = _go
-            make_subplots = _make_subplots
-            HAS_PLOTLY = True
-        except Exception:
-            go = None
-            make_subplots = None
-            HAS_PLOTLY = False
-
-    if SARIMAX is None:
-        try:
-            from statsmodels.tsa.statespace.sarimax import SARIMAX as _SARIMAX
-            from statsmodels.tsa.stattools import adfuller as _adfuller, kpss as _kpss, acf as _acf, pacf as _pacf
-            from statsmodels.graphics.tsaplots import plot_acf as _plot_acf, plot_pacf as _plot_pacf
-            from statsmodels.stats.diagnostic import acorr_ljungbox as _acorr_ljungbox
-            SARIMAX = _SARIMAX
-            adfuller = _adfuller
-            kpss = _kpss
-            acf = _acf
-            pacf = _pacf
-            plot_acf = _plot_acf
-            plot_pacf = _plot_pacf
-            acorr_ljungbox = _acorr_ljungbox
-            HAS_FORECAST_STATSMODELS = True
-        except Exception:
-            SARIMAX = None
-            adfuller = None
-            kpss = None
-            acf = None
-            pacf = None
-            plot_acf = None
-            plot_pacf = None
-            acorr_ljungbox = None
-            HAS_FORECAST_STATSMODELS = False
-
-    if Prophet is None:
-        try:
-            from prophet import Prophet as _Prophet
-            Prophet = _Prophet
-            HAS_PROPHET = True
-        except Exception:
-            Prophet = None
-            HAS_PROPHET = False
-
-    if XGBRegressor is None:
-        try:
-            from xgboost import XGBRegressor as _XGBRegressor
-            XGBRegressor = _XGBRegressor
-            HAS_XGBOOST = True
-        except Exception:
-            XGBRegressor = None
-            HAS_XGBOOST = False
-
-if XGBRegressor is None and SKHistGradientBoostingRegressor is not None:
-    XGBRegressor = SKHistGradientBoostingRegressor
+    HAS_PLOTLY = False
+    go = None
+    make_subplots = None
 
 try:
-    from sklearn.ensemble import ExtraTreesRegressor as SKExtraTreesRegressor
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    from statsmodels.tsa.stattools import adfuller, kpss, acf, pacf
+    from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+    from statsmodels.stats.diagnostic import acorr_ljungbox
+    HAS_FORECAST_STATSMODELS = True
 except Exception:
-    SKExtraTreesRegressor = None
-
+    SARIMAX = None
+    adfuller = None
+    kpss = None
+    acf = None
+    pacf = None
+    plot_acf = None
+    plot_pacf = None
+    acorr_ljungbox = None
+    HAS_FORECAST_STATSMODELS = False
 
 try:
-    import shap
-    HAS_SHAP = True
+    from prophet import Prophet
+    HAS_PROPHET = True
 except Exception:
-    shap = None
-    HAS_SHAP = False
+    Prophet = None
+    HAS_PROPHET = False
+
+try:
+    from xgboost import XGBRegressor
+    HAS_XGBOOST = True
+except Exception:
+    HAS_XGBOOST = False
+    try:
+        from sklearn.ensemble import HistGradientBoostingRegressor as XGBRegressor
+    except Exception:
+        XGBRegressor = None
 
 try:
     from sklearn.model_selection import ParameterGrid
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "1.0.0"
 
-
-
-@dataclass
-
-class ForecastRuntimeConfig:
-    interactive_fast_mode: bool = False
-    sarimax_max_candidates: int = 28
-    sarimax_maxiter_search: int = 80
-    sarimax_maxiter_final: int = 180
-    sarimax_search_with_exog_top_n: int = 10
-    sarimax_enable_walk_forward_refit: bool = True
-    sarimax_search_wall_seconds: float = 900.0
-    sarimax_max_exog_cols: int = 10
-    prophet_max_configs: int = 16
-    prophet_max_exog_cols: int = 10
-    prophet_allow_logistic_growth: bool = False
-    prophet_disable_holidays_for_short_series: bool = True
-    prophet_probe_backend: bool = True
-    prophet_backend_fail_to_surrogate: bool = True
-    xgb_enable_shap: bool = False
-    xgb_skip_direct_on_short_series: bool = False
-    xgb_max_feature_cols: int = 36
-    xgb_force_single_thread: bool = False
-    xgb_prefer_hist_gradient_on_short_series: bool = False
-    xgb_search_wall_seconds: float = 900.0
-    xgb_inner_train_max_rows: int = 240
-    search_accelerator_enabled: bool = True
-    search_accelerator_model_parallel: bool = True
-    search_accelerator_candidate_parallel: bool = True
-    search_accelerator_cache_enabled: bool = True
-    search_accelerator_result_cache_enabled: bool = True
-    search_accelerator_max_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
-    search_accelerator_candidate_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
-    xgb_param_grid: Tuple[Dict[str, Any], ...] = field(default_factory=lambda: (
-        {
-            "max_depth": 2,
-            "learning_rate": 0.03,
-            "n_estimators": 300,
-            "subsample": 0.90,
-            "colsample_bytree": 0.90,
-            "reg_alpha": 0.0,
-            "reg_lambda": 1.0,
-            "min_child_weight": 1
-        },
-        {
-            "max_depth": 3,
-            "learning_rate": 0.03,
-            "n_estimators": 400,
-            "subsample": 0.85,
-            "colsample_bytree": 0.85,
-            "reg_alpha": 0.0,
-            "reg_lambda": 1.5,
-            "min_child_weight": 1
-        },
-        {
-            "max_depth": 3,
-            "learning_rate": 0.05,
-            "n_estimators": 250,
-            "subsample": 0.90,
-            "colsample_bytree": 0.80,
-            "reg_alpha": 0.0,
-            "reg_lambda": 1.2,
-            "min_child_weight": 1
-        },
-        {
-            "max_depth": 4,
-            "learning_rate": 0.03,
-            "n_estimators": 350,
-            "subsample": 0.80,
-            "colsample_bytree": 0.80,
-            "reg_alpha": 0.0,
-            "reg_lambda": 2.0,
-            "min_child_weight": 2
-        },
-        {
-            "max_depth": 2,
-            "learning_rate": 0.08,
-            "n_estimators": 180,
-            "subsample": 1.00,
-            "colsample_bytree": 0.90,
-            "reg_alpha": 0.0,
-            "reg_lambda": 0.8,
-            "min_child_weight": 1
-        },
-        {
-            "max_depth": 3,
-            "learning_rate": 0.06,
-            "n_estimators": 220,
-            "subsample": 0.85,
-            "colsample_bytree": 0.90,
-            "reg_alpha": 0.1,
-            "reg_lambda": 1.8,
-            "min_child_weight": 2
-        }
-    ))
-
-FORECAST_RUNTIME_CONFIG = ForecastRuntimeConfig(
-    xgb_force_single_thread=True,
-    search_accelerator_max_workers=1,
-    search_accelerator_candidate_workers=1
-)
-_PROPhet_BACKEND_PROBE_CACHE = {"done": False, "ok": None, "message": "not_checked"}
-
-@dataclass
-class SearchAcceleratorConfig:
-    enabled: bool = True
-    cache_enabled: bool = True
-    result_cache_enabled: bool = True
-    model_parallelism: bool = True
-    candidate_parallelism: bool = True
-    max_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
-    candidate_workers: int = field(default_factory=lambda: max(2, min(4, os.cpu_count() or 2)))
-    artifact_cache_max_items: int = 256
-    result_cache_max_items: int = 128
-    failure_cache_max_items: int = 256
-
-
-class SearchAccelerator:
-    def __init__(self, config: SearchAcceleratorConfig):
-        self.config = config
-        self._artifact_cache: Dict[str, Any] = {}
-        self._result_cache: Dict[str, Any] = {}
-        self._failure_cache: Dict[str, str] = {}
-        self._lock = threading.Lock()
-
-    def _trim_cache(self, cache: Dict[str, Any], max_items: int) -> None:
-        while len(cache) > max_items:
-            try:
-                oldest_key = next(iter(cache))
-                cache.pop(oldest_key, None)
-            except Exception:
-                break
-
-    def get_artifact(self, key: str) -> Any:
-        with self._lock:
-            value = self._artifact_cache.get(key)
-        return copy.deepcopy(value) if value is not None else None
-
-    def put_artifact(self, key: str, value: Any) -> None:
-        if not self.config.cache_enabled:
-            return
-        with self._lock:
-            self._artifact_cache[key] = copy.deepcopy(value)
-            self._trim_cache(self._artifact_cache, self.config.artifact_cache_max_items)
-
-    def get_or_compute_artifact(self, key: str, builder):
-        cached = self.get_artifact(key)
-        if cached is not None:
-            return cached
-        value = builder()
-        self.put_artifact(key, value)
-        return copy.deepcopy(value)
-
-    def get_result(self, key: str) -> Any:
-        if not self.config.result_cache_enabled:
-            return None
-        with self._lock:
-            value = self._result_cache.get(key)
-        return copy.deepcopy(value) if value is not None else None
-
-    def put_result(self, key: str, value: Any) -> None:
-        if not self.config.result_cache_enabled:
-            return
-        with self._lock:
-            self._result_cache[key] = copy.deepcopy(value)
-            self._trim_cache(self._result_cache, self.config.result_cache_max_items)
-
-    def remember_failure(self, key: str, message: str) -> None:
-        with self._lock:
-            self._failure_cache[key] = str(message)
-            self._trim_cache(self._failure_cache, self.config.failure_cache_max_items)
-
-    def get_failure(self, key: str) -> Optional[str]:
-        with self._lock:
-            return self._failure_cache.get(key)
-
-    def parallel_map(self, fn, items: List[Any], max_workers: Optional[int] = None) -> List[Any]:
-        if not items:
-            return []
-        if not self.config.enabled or not self.config.candidate_parallelism or len(items) <= 1:
-            return [fn(item) for item in items]
-        workers = max(1, min(int(max_workers or self.config.candidate_workers), len(items)))
-        if workers <= 1:
-            return [fn(item) for item in items]
-        results: List[Any] = []
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="search-acc") as ex:
-            futs = [ex.submit(fn, item) for item in items]
-            for fut in as_completed(futs):
-                results.append(fut.result())
-        return results
-
-    def run_parallel_tasks(self, tasks: Dict[str, Any], max_workers: Optional[int] = None) -> Dict[str, Any]:
-        if not tasks:
-            return {}
-        names = list(tasks.keys())
-        if not self.config.enabled or not self.config.model_parallelism or len(names) <= 1:
-            return {name: tasks[name]() for name in names}
-        workers = max(1, min(int(max_workers or self.config.max_workers), len(names)))
-        if workers <= 1:
-            return {name: tasks[name]() for name in names}
-        out: Dict[str, Any] = {}
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="model-acc") as ex:
-            future_map = {ex.submit(tasks[name]): name for name in names}
-            for fut in as_completed(future_map):
-                name = future_map[fut]
-                out[name] = fut.result()
-        return out
-
-
-def _fingerprint_dataframe(df: Optional[pd.DataFrame]) -> str:
-    if df is None:
-        return "none"
-    tmp = df.copy()
-    for c in tmp.columns:
-        if pd.api.types.is_datetime64_any_dtype(tmp[c]):
-            tmp[c] = pd.to_datetime(tmp[c], errors="coerce").astype(str)
-        elif pd.api.types.is_numeric_dtype(tmp[c]):
-            tmp[c] = pd.to_numeric(tmp[c], errors="coerce").round(8)
-        else:
-            tmp[c] = tmp[c].astype(str)
-    try:
-        hv = pd.util.hash_pandas_object(tmp, index=True).values.tobytes()
-        return hashlib.sha1(hv).hexdigest()[:20]
-    except Exception:
-        return hashlib.sha1(tmp.to_csv(index=True).encode("utf-8", errors="ignore")).hexdigest()[:20]
-
-
-def _fingerprint_profile(profile: Dict[str, Any]) -> str:
-    try:
-        return hashlib.sha1(stable_json_dumps(profile).encode("utf-8")).hexdigest()[:20]
-    except Exception:
-        return hashlib.sha1(str(profile).encode("utf-8", errors="ignore")).hexdigest()[:20]
-
-
-def build_search_signature(namespace: str, freq_alias: str, train_df: Optional[pd.DataFrame], test_df: Optional[pd.DataFrame], profile: Optional[Dict[str, Any]] = None, exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None, extra: Optional[Dict[str, Any]] = None) -> str:
-    payload = {
-        "namespace": namespace,
-        "app_version": APP_VERSION,
-        "freq_alias": str(freq_alias),
-        "train": _fingerprint_dataframe(train_df),
-        "test": _fingerprint_dataframe(test_df),
-        "exog_train": _fingerprint_dataframe(exog_train),
-        "exog_test": _fingerprint_dataframe(exog_test),
-        "profile": _fingerprint_profile(profile or {}),
-        "extra": extra or {}
-    }
-    return hashlib.sha1(stable_json_dumps(payload).encode("utf-8")).hexdigest()
-
-
-SEARCH_ACCELERATOR = SearchAccelerator(
-    SearchAcceleratorConfig(
-        enabled=FORECAST_RUNTIME_CONFIG.search_accelerator_enabled,
-        cache_enabled=FORECAST_RUNTIME_CONFIG.search_accelerator_cache_enabled,
-        result_cache_enabled=FORECAST_RUNTIME_CONFIG.search_accelerator_result_cache_enabled,
-        model_parallelism=FORECAST_RUNTIME_CONFIG.search_accelerator_model_parallel,
-        candidate_parallelism=FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_parallel,
-        max_workers=FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers,
-        candidate_workers=FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers,
-    )
-)
 
 def infer_season_length_from_freq(freq_alias: str) -> int:
     return {"M": 12, "W": 52, "D": 7, "H": 24}.get(str(freq_alias).upper(), 1)
@@ -5607,44 +4589,6 @@ def detect_ml_feature_columns(df_features: pd.DataFrame, target_col: str, date_c
     return sorted(set(cols))
 
 
-
-def detect_safe_ml_exog_columns(df_features: pd.DataFrame, target_col: str, date_col: str) -> List[str]:
-    """
-    Production-safe external features for ML models.
-    Only keep calendar / explicitly plan-known / future-known variables.
-    Unknown contemporaneous signals from other products are excluded because
-    they are not guaranteed to be available at planning time.
-    """
-    safe_cols: List[str] = []
-    future_known_keywords = [
-        "month", "quarter", "year", "weekofyear", "dayofweek", "dayofmonth",
-        "month_sin", "month_cos", "quarter_sin", "quarter_cos",
-        "is_month_start", "is_month_end", "is_quarter_start", "is_quarter_end",
-        "is_year_start", "is_year_end", "holiday", "ramadan", "bayram"
-    ]
-    explicit_plan_keywords = [
-        "plan_", "planned_", "budget_", "target_", "promo_plan", "campaign_plan",
-        "price_plan", "forecast_", "schedule_"
-    ]
-    banned_keywords = [
-        "exclude_from_training", "review_required", "structural_event_flag", "incomplete_period_flag",
-        "anomaly_flag", "scaled", "log1p", "target_h", "future", "lead", "shift(-",
-        "lag_", "roll_", "ewm_", "diff_", "seasonal_lag", "prediction", "actual"
-    ]
-    for c in df_features.columns:
-        if c == date_col or c == target_col:
-            continue
-        lc = str(c).lower()
-        if c.startswith(f"{target_col}_"):
-            continue
-        if any(b in lc for b in banned_keywords):
-            continue
-        if not pd.api.types.is_numeric_dtype(df_features[c]):
-            continue
-        is_future_known = any(k == lc or k in lc for k in future_known_keywords) or any(k in lc for k in explicit_plan_keywords)
-        if is_future_known:
-            safe_cols.append(c)
-    return sorted(set(safe_cols))
 def make_series_analysis_frame(export_payload: Dict[str, pd.DataFrame], target_col: str) -> pd.DataFrame:
     df_clean = export_payload["clean_model_input"].copy()
     df_feat = export_payload["features"].copy()
@@ -5690,1706 +4634,11 @@ def recommend_model_priority(profile: Dict[str, Any]) -> str:
     if label == "volatile":
         return "XGBoost + Prophet"
     if label == "intermittent":
-        return "Intermittent + ARIMA + XGBoost"
+        return "XGBoost (dikkatli feature engineering)"
     if label == "stable_fast_mover":
         return "SARIMA + XGBoost"
     return "SARIMA + Prophet + XGBoost"
 
-
-
-try:
-    from scipy.special import inv_boxcox
-    from scipy.stats import boxcox
-    HAS_SCIPY = True
-except Exception:
-    inv_boxcox = None
-    boxcox = None
-    HAS_SCIPY = False
-
-def infer_season_length_from_freq(freq_alias: str) -> int:
-    return {"M": 12, "W": 52, "D": 7, "H": 24}.get(str(freq_alias).upper(), 1)
-
-def infer_abc_class(profile: Dict[str, Any]) -> str:
-    mean_ = safe_float(profile.get("mean", np.nan))
-    if pd.isna(mean_):
-        return "C"
-    if mean_ >= 250:
-        return "A"
-    if mean_ >= 100:
-        return "B"
-    return "C"
-
-def infer_xyz_class(profile: Dict[str, Any]) -> str:
-    cv = safe_float(profile.get("cv", np.nan))
-    if pd.isna(cv):
-        return "Z"
-    if cv <= 0.25:
-        return "X"
-    if cv <= 0.45:
-        return "Y"
-    return "Z"
-
-def infer_advanced_segment(profile: Dict[str, Any]) -> Dict[str, str]:
-    abc = infer_abc_class(profile)
-    xyz = infer_xyz_class(profile)
-    intermittency = safe_float(profile.get("intermittency_ratio", np.nan))
-    seasonality = safe_float(profile.get("seasonality_strength", np.nan))
-    trend_strength = safe_float(profile.get("trend_strength", np.nan))
-    cv = safe_float(profile.get("cv", np.nan))
-
-    if pd.notna(intermittency) and intermittency >= 0.35:
-        family = "intermittent"
-    elif pd.notna(seasonality) and seasonality >= 0.45:
-        family = "seasonal"
-    elif pd.notna(cv) and cv >= 0.45:
-        family = "volatile"
-    elif pd.notna(trend_strength) and trend_strength >= 0.45:
-        family = "trend_dominant"
-    elif xyz == "X":
-        family = "stable"
-    else:
-        family = "standard"
-
-    return {
-        "abc": abc,
-        "xyz": xyz,
-        "abc_xyz": f"{abc}{xyz}",
-        "family": family,
-        "label": f"{abc}{xyz}_{family}"
-    }
-
-def recommend_candidate_models(profile: Dict[str, Any]) -> List[str]:
-    seg = infer_advanced_segment(profile)
-    family = seg["family"]
-    abcxyz = seg["abc_xyz"]
-    if family == "seasonal":
-        return ["SARIMA/SARIMAX", "ARIMA", "Prophet", "Ensemble"]
-    if family == "intermittent":
-        return ["Intermittent", "ARIMA", "XGBoost", "Ensemble"]
-    if family == "volatile":
-        return ["XGBoost", "Prophet", "SARIMA/SARIMAX", "Ensemble"]
-    if abcxyz in ["AX", "BX"]:
-        return ["SARIMA/SARIMAX", "ARIMA", "XGBoost", "Ensemble"]
-    return ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "Ensemble"]
-
-def choose_target_transform(y: pd.Series) -> Dict[str, Any]:
-    s = pd.to_numeric(y, errors="coerce").dropna().astype(float)
-    if len(s) < 8:
-        return {"name": "none", "lambda": None, "shift": 0.0}
-    skew = safe_float(s.skew())
-    min_val = safe_float(s.min())
-    cv = safe_float(coefficient_of_variation(s))
-    if min_val >= 0 and ((pd.notna(skew) and skew >= 1.0) or (pd.notna(cv) and cv >= 0.50)):
-        if HAS_SCIPY and np.all(s > 0):
-            return {"name": "boxcox", "lambda": None, "shift": 0.0}
-        return {"name": "log1p", "lambda": None, "shift": 0.0}
-    return {"name": "none", "lambda": None, "shift": 0.0}
-
-def apply_target_transform(y: pd.Series, transform_cfg: Dict[str, Any]) -> Tuple[pd.Series, Dict[str, Any]]:
-    s = pd.to_numeric(y, errors="coerce").astype(float).copy()
-    name = transform_cfg.get("name", "none")
-    if name == "log1p":
-        return np.log1p(np.maximum(s, 0.0)), transform_cfg
-    if name == "boxcox" and HAS_SCIPY:
-        s2 = s.copy()
-        shift = 0.0
-        if safe_float(s2.min()) <= 0:
-            shift = abs(safe_float(s2.min())) + 1e-6
-            s2 = s2 + shift
-        transformed, lam = boxcox(s2.values)
-        cfg = dict(transform_cfg)
-        cfg["lambda"] = lam
-        cfg["shift"] = shift
-        return pd.Series(transformed, index=s.index), cfg
-    return s, transform_cfg
-
-def inverse_target_transform(arr: np.ndarray, transform_cfg: Dict[str, Any]) -> np.ndarray:
-    x = np.asarray(arr, dtype=float)
-    name = transform_cfg.get("name", "none")
-    if name == "log1p":
-        return np.maximum(np.expm1(x), 0.0)
-    if name == "boxcox" and HAS_SCIPY:
-        lam = transform_cfg.get("lambda", None)
-        shift = float(transform_cfg.get("shift", 0.0) or 0.0)
-        inv = inv_boxcox(x, lam)
-        inv = inv - shift
-        return np.maximum(inv, 0.0)
-    return np.maximum(x, 0.0)
-
-def make_inner_train_val_split(train_df: pd.DataFrame, val_ratio: float = 0.2, min_val: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    n = len(train_df)
-    val_len = max(min_val, int(np.ceil(n * val_ratio)))
-    val_len = min(val_len, max(2, n // 3))
-    return train_df.iloc[:-val_len].copy().reset_index(drop=True), train_df.iloc[-val_len:].copy().reset_index(drop=True)
-
-
-def walk_forward_refit_sarimax(
-    history_y: pd.Series,
-    future_y: pd.Series,
-    order: Tuple[int, int, int],
-    seasonal_order: Tuple[int, int, int, int],
-    exog_hist: Optional[pd.DataFrame] = None,
-    exog_future: Optional[pd.DataFrame] = None,
-    maxiter: int = 20
-) -> np.ndarray:
-    preds = []
-    hist = pd.to_numeric(history_y, errors="coerce").astype(float).copy()
-    future_y = pd.to_numeric(future_y, errors="coerce").astype(float).copy()
-    for i in range(len(future_y)):
-        exog_train_i = exog_hist if exog_hist is None else exog_hist.iloc[:len(hist)]
-        exog_step = None if exog_future is None else exog_future.iloc[[i]]
-        res = fit_sarimax_model(
-            hist,
-            exog_train_i,
-            order=order,
-            seasonal_order=seasonal_order,
-            trend="c",
-            maxiter=maxiter
-        )
-        fc = res.get_forecast(steps=1, exog=exog_step).predicted_mean.iloc[0]
-        preds.append(max(float(fc), 0.0))
-        hist = pd.concat([hist, pd.Series([future_y.iloc[i]])], ignore_index=True)
-    return np.asarray(preds, dtype=float)
-
-def make_prophet_features(train_df: pd.DataFrame, test_df: pd.DataFrame, exog_train: Optional[pd.DataFrame], exog_test: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    tr = train_df[["ds", "y"]].copy()
-    te = test_df[["ds", "y"]].copy()
-    used = []
-    if exog_train is not None and exog_test is not None and len(exog_train.columns) > 0:
-        for c in exog_train.columns:
-            tr[c] = pd.to_numeric(exog_train[c], errors="coerce").values
-            te[c] = pd.to_numeric(exog_test[c], errors="coerce").values
-            used.append(c)
-    return tr, te, used
-
-
-
-def _safe_prophet_regressor_name(name: str) -> str:
-    safe = re.sub(r"[^0-9A-Za-z_]+", "_", str(name)).strip("_")
-    if not safe:
-        safe = "regressor"
-    if not safe[0].isalpha():
-        safe = f"reg_{safe}"
-    return safe[:60]
-
-
-def _prepare_prophet_design_matrices(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    exog_train: Optional[pd.DataFrame],
-    exog_test: Optional[pd.DataFrame]
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str], Dict[str, str]]:
-    tr = train_df[["ds", "y"]].copy().reset_index(drop=True)
-    te = test_df[["ds", "y"]].copy().reset_index(drop=True)
-    tr["ds"] = pd.to_datetime(tr["ds"])
-    te["ds"] = pd.to_datetime(te["ds"])
-    used_cols: List[str] = []
-    dropped_cols: List[str] = []
-    rename_map: Dict[str, str] = {}
-
-    if exog_train is None or exog_test is None or len(exog_train.columns) == 0:
-        return tr, te, used_cols, dropped_cols, rename_map
-
-    xtr = exog_train.copy().reset_index(drop=True)
-    xte = exog_test.copy().reset_index(drop=True)
-    common_cols = [c for c in xtr.columns if c in xte.columns]
-    used_safe_names = set()
-
-    for c in common_cols:
-        s_tr = pd.to_numeric(xtr[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        s_te = pd.to_numeric(xte[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if s_tr.notna().sum() < max(5, len(s_tr) // 5):
-            dropped_cols.append(c)
-            continue
-        if s_te.notna().sum() == 0:
-            dropped_cols.append(c)
-            continue
-        if s_tr.dropna().nunique() <= 1:
-            dropped_cols.append(c)
-            continue
-        safe_name = _safe_prophet_regressor_name(c)
-        while safe_name in used_safe_names or safe_name in ["ds", "y", "cap", "floor"]:
-            safe_name = f"{safe_name}_x"
-        used_safe_names.add(safe_name)
-        fill_val = safe_float(s_tr.median())
-        if pd.isna(fill_val):
-            fill_val = 0.0
-        tr[safe_name] = s_tr.fillna(fill_val).fillna(0.0).astype(float).values
-        te[safe_name] = s_te.fillna(fill_val).fillna(0.0).astype(float).values
-        used_cols.append(safe_name)
-        rename_map[str(c)] = safe_name
-
-    return tr, te, used_cols, dropped_cols, rename_map
-
-
-def _build_prophet_holidays_df(train_df: pd.DataFrame, test_df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    try:
-        import holidays as holidays_pkg
-    except Exception:
-        return None
-    years = sorted(set(pd.to_datetime(pd.concat([train_df["ds"], test_df["ds"]], axis=0)).dt.year.dropna().astype(int).tolist()))
-    if not years:
-        return None
-    try:
-        tr_holidays = holidays_pkg.country_holidays("TR", years=years)
-    except Exception:
-        return None
-    rows = []
-    for d, name in tr_holidays.items():
-        rows.append({"ds": pd.Timestamp(d), "holiday": str(name)})
-    if not rows:
-        return None
-    return pd.DataFrame(rows).drop_duplicates(subset=["ds", "holiday"]).sort_values(["ds", "holiday"]).reset_index(drop=True)
-
-
-def _fit_predict_prophet_once(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    freq_alias: str,
-    cfg: Dict[str, Any],
-    exog_cols: List[str],
-    use_holidays: bool = False,
-    add_custom_seasonality: bool = True,
-    transform_cfg: Optional[Dict[str, Any]] = None
-) -> Tuple[Any, pd.DataFrame, np.ndarray]:
-    if not HAS_PROPHET or Prophet is None:
-        raise ImportError("prophet package unavailable")
-
-    tr = train_df.copy().reset_index(drop=True)
-    te = test_df.copy().reset_index(drop=True)
-    tr["ds"] = pd.to_datetime(tr["ds"])
-    te["ds"] = pd.to_datetime(te["ds"])
-
-    transform_cfg = dict(transform_cfg or {"name": "none", "lambda": None, "shift": 0.0})
-    y_raw = pd.to_numeric(tr["y"], errors="coerce").astype(float).fillna(0.0)
-    y_transformed, applied_cfg = apply_target_transform(y_raw, transform_cfg)
-    tr["y"] = pd.to_numeric(y_transformed, errors="coerce").astype(float).fillna(0.0)
-
-    yearly = bool(str(freq_alias).upper() in ["M", "W", "D"])
-    weekly = bool(str(freq_alias).upper() in ["D", "H"])
-    daily = bool(str(freq_alias).upper() == "H")
-    seasonality_mode = str(cfg.get("seasonality_mode", "additive"))
-    seasonality_prior_scale = float(cfg.get("seasonality_prior_scale", 5.0))
-
-    holidays_df = _build_prophet_holidays_df(tr, te) if use_holidays else None
-    constructor_kwargs = {
-        "seasonality_mode": seasonality_mode,
-        "changepoint_prior_scale": float(cfg.get("changepoint_prior_scale", 0.05)),
-        "seasonality_prior_scale": seasonality_prior_scale,
-        "changepoint_range": float(cfg.get("changepoint_range", 0.9)),
-        "n_changepoints": int(cfg.get("n_changepoints", 12)),
-        "growth": "linear",
-        "yearly_seasonality": yearly,
-        "weekly_seasonality": weekly,
-        "daily_seasonality": daily,
-        "uncertainty_samples": 0
-    }
-    if holidays_df is not None and len(holidays_df) > 0:
-        constructor_kwargs["holidays"] = holidays_df
-
-    model = Prophet(**constructor_kwargs)
-
-    if add_custom_seasonality:
-        if str(freq_alias).upper() == "M":
-            model.add_seasonality(name="quarterly", period=365.25 / 4.0, fourier_order=3, prior_scale=seasonality_prior_scale)
-        elif str(freq_alias).upper() == "W":
-            model.add_seasonality(name="monthly_proxy", period=30.5, fourier_order=4, prior_scale=seasonality_prior_scale)
-            model.add_seasonality(name="year_end", period=365.25, fourier_order=6, prior_scale=seasonality_prior_scale)
-        elif str(freq_alias).upper() == "D":
-            model.add_seasonality(name="monthly_proxy", period=30.5, fourier_order=5, prior_scale=seasonality_prior_scale)
-            model.add_seasonality(name="year_end", period=365.25, fourier_order=8, prior_scale=seasonality_prior_scale)
-
-    for c in exog_cols:
-        if c in tr.columns and c in te.columns:
-            model.add_regressor(c, standardize=True)
-
-    fit_cols = ["ds", "y"] + [c for c in exog_cols if c in tr.columns]
-    fit_df = tr[fit_cols].copy().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    future_df = te[["ds"] + [c for c in exog_cols if c in te.columns]].copy().replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    model.fit(fit_df)
-    fc = model.predict(future_df)
-    yhat = pd.to_numeric(fc["yhat"], errors="coerce").astype(float).fillna(0.0).values
-    pred = inverse_target_transform(yhat, applied_cfg)
-    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    fc = fc.copy().reset_index(drop=True)
-    fc["yhat"] = pred
-    return model, fc, pred
-
-
-def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[pd.DataFrame], freq_alias: str) -> Tuple[pd.DataFrame, List[str]]:
-    df = full_df[["ds", "y"]].copy().reset_index(drop=True)
-    season_len = infer_season_length_from_freq(freq_alias)
-    lag_set = [1, 2, 3, 6, 12]
-    if freq_alias == "W":
-        lag_set = [1, 2, 4, 8, 13, 26, 39, 52]
-    elif freq_alias == "D":
-        lag_set = [1, 2, 3, 7, 14, 21, 28, 56]
-    elif freq_alias == "M":
-        lag_set = [1, 2, 3, 6, 12, 18, 24]
-    elif freq_alias == "H":
-        lag_set = [1, 2, 3, 6, 12, 24, 48, 72]
-
-    for lag in sorted(set(lag_set)):
-        df[f"lag_{lag}"] = df["y"].shift(lag)
-    if season_len > 1:
-        df[f"seasonal_lag_{season_len}"] = df["y"].shift(season_len)
-        df[f"diff_{season_len}"] = df["y"].diff(season_len)
-
-    df["diff_1"] = df["y"].diff(1)
-
-    shifted = df["y"].shift(1)
-    for w in sorted(set([3, 6, 12, max(2, season_len)])):
-        df[f"roll_mean_{w}"] = shifted.rolling(w, min_periods=1).mean()
-        df[f"roll_std_{w}"] = shifted.rolling(w, min_periods=1).std()
-        df[f"roll_min_{w}"] = shifted.rolling(w, min_periods=1).min()
-        df[f"roll_max_{w}"] = shifted.rolling(w, min_periods=1).max()
-        df[f"roll_median_{w}"] = shifted.rolling(w, min_periods=1).median()
-        df[f"ewm_mean_{w}"] = shifted.ewm(span=max(2, w), adjust=False).mean()
-    if freq_alias == "W":
-        for w in [4, 8, 13, 26, 52]:
-            s = shifted.rolling(w, min_periods=max(2, min(4, w))).mean()
-            df[f"recent_mean_gap_{w}"] = shifted - s
-            df[f"recent_z_{w}"] = (shifted - s) / (shifted.rolling(w, min_periods=max(2, min(4, w))).std().replace(0, np.nan))
-            df[f"trend_slope_{w}"] = shifted.diff().rolling(w, min_periods=max(2, min(4, w))).mean()
-
-    ds = pd.to_datetime(df["ds"])
-    df["year"] = ds.dt.year
-    df["quarter"] = ds.dt.quarter
-    df["month"] = ds.dt.month
-    iso_week = ds.dt.isocalendar().week.astype(int)
-    df["weekofyear"] = iso_week
-    df["dayofweek"] = ds.dt.dayofweek
-    df["dayofmonth"] = ds.dt.day
-    df["is_month_start"] = ds.dt.is_month_start.astype(int)
-    df["is_month_end"] = ds.dt.is_month_end.astype(int)
-
-    month_num = ds.dt.month.fillna(1).astype(int)
-    df["month_sin"] = np.sin(2 * np.pi * month_num / 12.0)
-    df["month_cos"] = np.cos(2 * np.pi * month_num / 12.0)
-    if freq_alias in ["W", "D"]:
-        week_num = iso_week.clip(lower=1)
-        df["week_sin"] = np.sin(2 * np.pi * week_num / 52.0)
-        df["week_cos"] = np.cos(2 * np.pi * week_num / 52.0)
-    if freq_alias in ["D", "H"]:
-        dow = ds.dt.dayofweek.astype(int)
-        df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
-        df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
-
-    # Türkiye tatil ve özel dönem yakınlığı özellikleri
-    try:
-        years = sorted(set(ds.dt.year.dropna().astype(int).tolist()))
-        holiday_dates = []
-        if years:
-            import holidays as _holidays
-            tr_holidays = _holidays.country_holidays("TR", years=years)
-            holiday_dates = sorted(pd.to_datetime(list(tr_holidays.keys())))
-        if holiday_dates:
-            holiday_arr = np.array([pd.Timestamp(x).to_datetime64() for x in holiday_dates], dtype='datetime64[ns]')
-            current_arr = ds.values.astype('datetime64[ns]')
-            prev_gap = []
-            next_gap = []
-            for cur in current_arr:
-                diffs = (holiday_arr - cur).astype('timedelta64[D]').astype(int)
-                pos = diffs[diffs >= 0]
-                neg = (-diffs[diffs <= 0])
-                next_gap.append(int(pos.min()) if len(pos) else 999)
-                prev_gap.append(int(neg.min()) if len(neg) else 999)
-            df["tatil_yakınlık_sonraki"] = pd.Series(next_gap).clip(upper=60)
-            df["tatil_yakınlık_onceki"] = pd.Series(prev_gap).clip(upper=60)
-            df["tatil_yakınlık_min"] = np.minimum(df["tatil_yakınlık_sonraki"], df["tatil_yakınlık_onceki"])
-            df["tatil_yakın_flag_7"] = (df["tatil_yakınlık_min"] <= 7).astype(int)
-            df["tatil_yakın_flag_14"] = (df["tatil_yakınlık_min"] <= 14).astype(int)
-        else:
-            for c in ["tatil_yakınlık_sonraki", "tatil_yakınlık_onceki", "tatil_yakınlık_min", "tatil_yakın_flag_7", "tatil_yakın_flag_14"]:
-                df[c] = 0
-    except Exception:
-        for c in ["tatil_yakınlık_sonraki", "tatil_yakınlık_onceki", "tatil_yakınlık_min", "tatil_yakın_flag_7", "tatil_yakın_flag_14"]:
-            df[c] = 0
-
-    # Takvimsel özel olay yakınlığı (yılbaşı / ramazan-kurban etkisine yaklaşık vekil pencereler)
-    try:
-        month_day = ds.dt.strftime('%m-%d')
-        yilbasi = (month_day >= '12-20') | (month_day <= '01-10')
-        okul_acilis = (ds.dt.month == 9).astype(int)
-        yilsonu = (ds.dt.month == 12).astype(int)
-        df["ozel_olay_yılbaşı_penceresi"] = yilbasi.astype(int)
-        df["ozel_olay_okul_açılışı"] = okul_acilis
-        df["ozel_olay_yılsonu"] = yilsonu
-        df["ozel_olay_toplam_flag"] = (df[["ozel_olay_yılbaşı_penceresi", "ozel_olay_okul_açılışı", "ozel_olay_yılsonu"]].sum(axis=1) > 0).astype(int)
-    except Exception:
-        for c in ["ozel_olay_yılbaşı_penceresi", "ozel_olay_okul_açılışı", "ozel_olay_yılsonu", "ozel_olay_toplam_flag"]:
-            df[c] = 0
-
-    if existing_exog is not None and len(existing_exog.columns) > 0:
-        exog = existing_exog.copy().reset_index(drop=True)
-        for c in exog.columns:
-            df[f"exog__{c}"] = pd.to_numeric(exog[c], errors="coerce")
-
-    feature_cols = [c for c in df.columns if c not in ["ds", "y"]]
-    return df, feature_cols
-
-def build_actual_vs_pred_df(test_df: pd.DataFrame, pred: np.ndarray, model_name: str) -> pd.DataFrame:
-    out = test_df[["ds", "y"]].copy()
-    out["prediction"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    out["model"] = model_name
-    out["abs_error"] = np.abs(out["y"] - out["prediction"])
-    out["ape"] = np.where(np.abs(out["y"]) > 1e-8, np.abs(out["y"] - out["prediction"]) / np.abs(out["y"]) * 100.0, np.nan)
-    return out
-
-TURKCE_KOLON_HARITASI = {
-    "model": "Model",
-    "prediction": "Tahmin",
-    "abs_error": "Mutlak Hata",
-    "ape": "Mutlak Yüzde Hata",
-    "ds": "Tarih",
-    "y": "Gerçek",
-    "WAPE": "WAPE",
-    "sMAPE": "sMAPE",
-    "RMSE": "RMSE",
-    "MAE": "MAE",
-    "MAPE": "MAPE",
-    "MASE": "MASE",
-    "Bias": "Sapma",
-    "BiasPct": "SapmaYüzde",
-    "bias_pct": "SapmaYüzde",
-    "under_forecast_rate": "EksikTahminOranı",
-    "over_forecast_rate": "FazlaTahminOranı",
-    "UnderForecastRate": "EksikTahminOranı",
-    "OverForecastRate": "FazlaTahminOranı",
-    "eligibility_score": "UygunlukSkoru",
-    "status": "Durum",
-    "reasons": "Gerekçeler",
-    "feature_availability_risk": "ÖzellikErişimRiski",
-    "validation_wape": "DoğrulamaWAPE",
-    "rolling_wape": "RollingWAPE",
-    "peak_event_score": "TepeOlaySkoru",
-    "peak_precision": "TepeKesinlik",
-    "peak_recall": "TepeDuyarlılık",
-    "peak_f1": "TepeF1",
-    "actual_peak_count": "GerçekTepeSayısı",
-    "pred_peak_count": "TahminTepeSayısı",
-    "service_level_target": "HedefServisSeviyesi",
-    "achieved_cycle_service": "GerçekleşenServisSeviyesi",
-    "service_gap": "ServisAçığı",
-    "quantile_10": "AltBant_10",
-    "quantile_20": "AltBant_20",
-    "quantile_80": "ÜstBant_80",
-    "quantile_90": "ÜstBant_90",
-    "coverage_80": "Kapsama_80",
-    "coverage_90": "Kapsama_90",
-    "coverage_95": "Kapsama_95",
-    "interval_width_80": "BantGenişliği_80",
-    "interval_width_90": "BantGenişliği_90",
-    "interval_width_95": "BantGenişliği_95",
-    "production_model": "ÜretimModeli",
-    "production_status": "ÜretimDurumu",
-    "drift_ratio_vs_recent": "YakınDönemDriftOranı",
-    "max_feature_risk": "MaksÖzellikRiski",
-    "fallback_rate": "FallbackOranı",
-    "target_service": "HedefServis",
-    "achieved_service": "GerçekleşenServis",
-    "deployment_recommendation": "DağıtımÖnerisi",
-    "alert": "Alarm",
-    "detail": "Detay",
-    "severity": "Şiddet",
-    "weight": "Ağırlık",
-    "raw_weight": "HamAğırlık",
-    "val_WAPE": "DoğrulamaWAPE",
-    "val_sMAPE": "DoğrulamasMAPE",
-    "ro_WAPE": "RollingWAPE",
-    "ro_MAE": "RollingMAE",
-    "strategy": "Strateji",
-    "backend_name": "ArkaUç",
-    "used_feature_count": "KullanılanÖzellikSayısı",
-    "fallback_used": "FallbackKullanıldı",
-    "fallback_method": "FallbackYöntemi",
-    "champion": "Şampiyon",
-    "challenger": "MeydanOkuyan",
-    "karar_kademesi": "KararKademesi",
-}
-
-TURKCE_DEGER_HARITASI = {
-    "eligible": "uygun",
-    "challenger_only": "yalnız_meydan_okuyan",
-    "reject": "reddet",
-    "guarded_fallback": "korumalı_fallback",
-    "guarded_use_only": "yalnız_korumalı_kullanım",
-    "eligible_for_guarded_production": "korumalı_üretime_uygun",
-    "champion_challenger_parallel_run": "şampiyon_meydan_okuyan_paralel_çalıştır",
-    "shadow_mode_required": "gölge_mod_zorunlu",
-    "high": "yüksek",
-    "medium": "orta",
-    "bias_alert": "sapma_alarmı",
-    "under_forecast_alert": "eksik_tahmin_alarmı",
-    "peak_capture_alert": "tepe_yakalama_alarmı",
-    "forecast_drift_alert": "tahmin_drift_alarmı",
-    "feature_contract_alert": "özellik_sözleşmesi_alarmı",
-    "service_level_alert": "servis_seviyesi_alarmı",
-    "fallback_rate_alert": "fallback_oranı_alarmı",
-}
-
-
-def _turkcelestir_df_kolonlari(df: pd.DataFrame) -> pd.DataFrame:
-    """Kolon adlarını Türkçeleştirir ve çeviri sonrası oluşan tekrarları güvenli biçimde birleştirir."""
-    out = df.copy()
-    translated_cols = [TURKCE_KOLON_HARITASI.get(str(c), str(c)) for c in out.columns]
-    out.columns = translated_cols
-
-    if len(set(translated_cols)) == len(translated_cols):
-        return out
-
-    birlesik_seriler = {}
-    kolon_sirasi = []
-    for idx, ad in enumerate(translated_cols):
-        col_data = out.iloc[:, idx]
-        if ad not in birlesik_seriler:
-            birlesik_seriler[ad] = col_data.copy()
-            kolon_sirasi.append(ad)
-        else:
-            mevcut = birlesik_seriler[ad]
-            try:
-                birlesik_seriler[ad] = pd.concat([mevcut, col_data], axis=1).bfill(axis=1).iloc[:, 0]
-            except Exception:
-                birlesik_seriler[ad] = mevcut.where(mevcut.notna(), col_data)
-
-    sonuc = pd.DataFrame({ad: birlesik_seriler[ad] for ad in kolon_sirasi})
-    return sonuc
-
-
-def style_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Sayıları biçimlendirir, durum alanlarını Türkçeleştirir ve veri çerçevesini gösterime hazırlar."""
-    out = df.copy()
-    for c in out.columns:
-        s = out[c]
-        if pd.api.types.is_datetime64_any_dtype(s) or pd.api.types.is_timedelta64_dtype(s):
-            continue
-        if pd.api.types.is_bool_dtype(s):
-            continue
-        if pd.api.types.is_numeric_dtype(s):
-            out[c] = pd.to_numeric(s, errors="coerce").round(4)
-            continue
-
-        def _safe_fmt(x):
-            if pd.isna(x):
-                return np.nan
-            if isinstance(x, (pd.Timestamp, pd.Timedelta, np.datetime64)):
-                return x
-            if isinstance(x, (list, tuple, dict, set)):
-                return json.dumps(list(x) if isinstance(x, set) else x, ensure_ascii=False)
-            if isinstance(x, str):
-                xv = TURKCE_DEGER_HARITASI.get(x.strip(), x)
-                try:
-                    stripped = xv.strip()
-                    if stripped == "":
-                        return xv
-                    return round(float(stripped), 4)
-                except Exception:
-                    return xv
-            try:
-                return round(float(x), 4)
-            except Exception:
-                return TURKCE_DEGER_HARITASI.get(str(x), x)
-
-        out[c] = s.map(_safe_fmt)
-    return _turkcelestir_df_kolonlari(out)
-
-def dataframe_to_download_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-def _safe_artifact_name(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]+', "_", str(name)).strip()
-
-def _df_or_empty(obj: Any) -> pd.DataFrame:
-    return obj if isinstance(obj, pd.DataFrame) else pd.DataFrame()
-
-def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    prod_pack = outputs.get("production_governance", {}) or {}
-    live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
-
-    error_df = pd.DataFrame([
-        {"model": model, "message": message}
-        for model, message in (outputs.get("model_errors", {}) or {}).items()
-    ])
-    profile = (outputs.get("metadata") or {}).get("profile", {}) or {}
-    profile_snapshot = pd.DataFrame([{
-        "segment": (outputs.get("metadata") or {}).get("segment"),
-        "abc_xyz": (outputs.get("metadata") or {}).get("abc_xyz"),
-        "priority": (outputs.get("metadata") or {}).get("priority"),
-        "target_col": (outputs.get("metadata") or {}).get("target_col"),
-        "freq_alias": (outputs.get("metadata") or {}).get("freq_alias"),
-        "horizon": (outputs.get("metadata") or {}).get("horizon"),
-        "cv": profile.get("cv"),
-        "trend_strength": profile.get("trend_strength"),
-        "seasonality_strength": profile.get("seasonality_strength"),
-        "intermittency_ratio": profile.get("intermittency_ratio"),
-        "volume_level": profile.get("volume_level"),
-        "volatility_regime": profile.get("volatility_regime"),
-    }])
-
-    named = {
-        "Seri profili özet metrikleri": style_metric_dataframe(profile_snapshot),
-        "Model karşılaştırma tablosu": style_metric_dataframe(_df_or_empty(outputs.get("metrics_df"))),
-        "Çalışma süresi - performans özeti": style_metric_dataframe(_df_or_empty(outputs.get("stage_timing_table"))),
-        "Model hata özeti": style_metric_dataframe(error_df),
-        "Fallback özeti": style_metric_dataframe(_df_or_empty(outputs.get("fallback_summary"))),
-        "Otomatik model uygunluk kapısı": style_metric_dataframe(_df_or_empty(prod_pack.get("model_eligibility_gate"))),
-        "Karar kademelerine göre model liderleri": style_metric_dataframe(_df_or_empty(build_model_liderleri(outputs))),
-        "SARIMA-SARIMAX - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("SARIMA/SARIMAX"))),
-        "SARIMA-SARIMAX - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("sarima") or {}).get("search_table"))),
-        "Prophet görünürlüğü (gerçek fit mi, fallback mi)": style_metric_dataframe(_df_or_empty(outputs.get("prophet_gorunurluk_ozeti"))),
-        "Prophet - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("Prophet"))),
-        "Prophet - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("prophet") or {}).get("search_table"))),
-        "XGBoost - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("XGBoost"))),
-        "XGBoost - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("search_table"))),
-        "XGBoost - Strateji karşılaştırması": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("strategy_comparison"))),
-        "XGBoost - Özellik önemleri": _df_or_empty((outputs.get("xgboost") or {}).get("feature_importance")),
-        "Karar hiyerarşisi özeti": style_metric_dataframe(_df_or_empty(outputs.get("karar_hiyerarsisi"))),
-        "Holdout sıralaması": style_metric_dataframe(_df_or_empty((outputs.get("champion_challenger") or {}).get("ranking"))),
-        "Ansambl ağırlıkları (peak-aware + bias-aware)": style_metric_dataframe(_df_or_empty(outputs.get("ensemble_weights"))),
-        "Ansambl gerçek ve tahmin": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("Ensemble"))),
-        "Gerçek vs tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("all_predictions_long"))),
-        "Rolling-origin geri test (tam katman)": style_metric_dataframe(_df_or_empty(outputs.get("rolling_origin_backtest"))),
-        "Doğrulama temelli model kalitesi": style_metric_dataframe(_df_or_empty(outputs.get("validation_metrics_df"))),
-        "Karar hiyerarşisi": style_metric_dataframe(_df_or_empty(outputs.get("karar_hiyerarsisi"))),
-        "Merkezî canlı izleme özeti": style_metric_dataframe(_df_or_empty(live_pack.get("summary"))),
-        "Model sağlık tablosu (bias, kapsama, fallback, servis seviyesi)": style_metric_dataframe(_df_or_empty(live_pack.get("model_health_table"))),
-        "Üretim alarmları": style_metric_dataframe(_df_or_empty(live_pack.get("alerts"))),
-        "Üretim sıralaması (holdout, doğrulama ve rolling-origin birlikte)": style_metric_dataframe(_df_or_empty(prod_pack.get("production_ranking"))),
-        "Tahmin katkı değeri (baseline'a göre)": style_metric_dataframe(_df_or_empty(prod_pack.get("forecast_value_add"))),
-        "Bias dashboard": style_metric_dataframe(_df_or_empty(prod_pack.get("bias_dashboard"))),
-        "Tepe olay yakalama skoru": style_metric_dataframe(_df_or_empty(prod_pack.get("peak_event_dashboard"))),
-        "Üretim özellik erişilebilirlik denetimi": style_metric_dataframe(_df_or_empty(prod_pack.get("feature_availability_audit"))),
-        "Üretim modeli için tahmin aralığı - quantile forecast": style_metric_dataframe(_df_or_empty(prod_pack.get("production_interval_table"))),
-        "Servis seviyesi - stok etkisi simülasyonu": style_metric_dataframe(_df_or_empty(prod_pack.get("production_service_table"))),
-        "Benzersiz rapor kataloğu (yinelenen içerik temizliği)": style_metric_dataframe(_df_or_empty(outputs.get("benzersiz_rapor_katalogu"))),
-        "Kalite raporu": _df_or_empty(export_payload.get("quality_report")),
-        "Seri profil raporu": _df_or_empty(export_payload.get("series_profile_report")),
-        "Anomali yönetişimi": _df_or_empty(export_payload.get("anomaly_governance")),
-        "Review queue": _df_or_empty(export_payload.get("review_queue")),
-        "Proxy backtest raporu": _df_or_empty(export_payload.get("proxy_backtest_report")),
-        "Raw vs Clean backtest karşılaştırması": _df_or_empty(export_payload.get("raw_vs_clean_backtest_report")),
-    }
-
-    cleaned: Dict[str, pd.DataFrame] = {}
-    for report_name, df in named.items():
-        if isinstance(df, pd.DataFrame):
-            cleaned[report_name] = df.copy()
-    return cleaned
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, pd.DataFrame):
-        return value.to_dict(orient="records")
-    if isinstance(value, pd.Series):
-        return value.to_list()
-    if isinstance(value, (pd.Timestamp, np.datetime64)):
-        return str(value)
-    if isinstance(value, np.ndarray):
-        return np.asarray(value).tolist()
-    if isinstance(value, (np.integer, )):
-        return int(value)
-    if isinstance(value, (np.floating, )):
-        return None if pd.isna(value) else float(value)
-    if isinstance(value, (bool, int, float, str)) or value is None:
-        return value
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-    return str(value)
-
-
-def _json_bytes(obj: Any) -> bytes:
-    return json.dumps(_json_safe(obj), ensure_ascii=False, indent=2).encode("utf-8")
-
-
-def _text_bytes(lines: List[str]) -> bytes:
-    return ("\n".join([str(x) for x in lines if str(x).strip() != ""]) + "\n").encode("utf-8")
-
-
-def _tab9_suggestions(outputs: Dict[str, Any], profile: Dict[str, Any]) -> List[str]:
-    suggestions: List[str] = []
-    if float(profile.get("seasonality_strength", 0) or 0) >= 0.35:
-        suggestions.append("Seri sezonsal; auto seasonal (P,D,Q,m), Prophet custom seasonality ve ensemble kritik.")
-    if float(profile.get("cv", 0) or 0) >= 0.45:
-        suggestions.append("Oynaklık yüksek; log/Box-Cox dönüşümü, XGBoost rolling istatistikleri ve challenger modeli zorunlu izlenmeli.")
-    if float(profile.get("intermittency_ratio", 0) or 0) >= 0.25:
-        suggestions.append("Intermittent yapı var; stok-out ayrımı ve model çıktılarını iş kuralı ile doğrulamak gerekir.")
-    if outputs.get("sarima", {}).get("residual_white_noise_ok") is False:
-        suggestions.append("SARIMA residual white-noise testi zayıf; challenger olarak Prophet veya XGBoost önceliklendirilmeli.")
-    if outputs.get("best_model") == "Ensemble":
-        suggestions.append("Bu seride tek bir champion yerine ensemble daha iyi; operasyonel kullanımda champion-challenger izleme önerilir.")
-    if not suggestions:
-        suggestions.append("Seri dengeli; champion-challenger ve ensemble izlemesi yeterli görünüyor.")
-    return suggestions
-
-
-def _notes_df(section: str, lines: List[str]) -> pd.DataFrame:
-    return pd.DataFrame([{"section": section, "text": line} for line in lines]) if lines else pd.DataFrame(columns=["section", "text"])
-
-
-def _series_notes_tables(outputs: Dict[str, Any], export_payload: Optional[Dict[str, pd.DataFrame]] = None) -> Dict[str, pd.DataFrame]:
-    profile = ((outputs.get("metadata") or {}).get("profile") or {})
-    meta = outputs.get("metadata", {}) or {}
-    metrics_df = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    readiness = assess_production_readiness(
-        export_payload or {},
-        metrics_df if isinstance(metrics_df, pd.DataFrame) else pd.DataFrame(),
-        str(meta.get("target_col", "")),
-        outputs=outputs if isinstance(outputs, dict) else None,
-    ) if isinstance(outputs, dict) else {"notes": []}
-    cc = outputs.get("champion_challenger", {}) or {}
-    prod_pack = outputs.get("production_governance", {}) or {}
-    lines_prod = [
-        f"Üretim önerisi: {prod_pack.get('production_model', outputs.get('best_model'))}",
-        f"Üretim durumu: {prod_pack.get('production_status', 'eligible')}",
-        f"Şampiyon model: {cc.get('champion', '-')}",
-        f"Meydan okuyan: {cc.get('challenger', '-')}",
-    ]
-    runtime_guardrails = (outputs.get("metadata") or {}).get("runtime_guardrails", []) or []
-    return {
-        "Üretim kullanımı değerlendirmesi notları": _notes_df("production_readiness", list(readiness.get("notes", []))),
-        "Akıllı değerlendirmeler": _notes_df("smart_evaluations", _tab9_suggestions(outputs, profile)),
-        "Üretim önerisi ve champion özeti": _notes_df("production_summary", lines_prod),
-        "Runtime guardrails": _notes_df("runtime_guardrails", list(runtime_guardrails)),
-    }
-
-
-def _series_json_artifacts(outputs: Dict[str, Any]) -> Dict[str, Any]:
-    metadata = outputs.get("metadata", {}) or {}
-    sarima = outputs.get("sarima", {}) or {}
-    prophet = outputs.get("prophet", {}) or {}
-    xgboost = outputs.get("xgboost", {}) or {}
-    cc = outputs.get("champion_challenger", {}) or {}
-    prod_pack = outputs.get("production_governance", {}) or {}
-    return {
-        "metadata": {
-            "target_col": metadata.get("target_col"),
-            "freq_alias": metadata.get("freq_alias"),
-            "horizon": metadata.get("horizon"),
-            "segment": metadata.get("segment"),
-            "abc_xyz": metadata.get("abc_xyz"),
-            "priority": metadata.get("priority"),
-            "candidate_models": metadata.get("candidate_models"),
-            "stat_exog_cols": metadata.get("stat_exog_cols"),
-            "prophet_exog_cols": metadata.get("prophet_exog_cols"),
-            "ml_feature_cols": metadata.get("ml_feature_cols"),
-            "runtime_guardrails": metadata.get("runtime_guardrails"),
-            "train_n": metadata.get("train_n"),
-            "test_n": metadata.get("test_n"),
-            "profile": metadata.get("profile"),
-        },
-        "sarima_summary": {
-            "order": sarima.get("order"),
-            "seasonal_order": sarima.get("seasonal_order"),
-            "trend": sarima.get("trend"),
-            "AIC": sarima.get("aic"),
-            "BIC": sarima.get("bic"),
-            "Ljung_Box_pvalue": sarima.get("ljung_box_pvalue"),
-            "d": sarima.get("d"),
-            "D": sarima.get("D"),
-            "transform": sarima.get("transform"),
-            "white_noise_ok": sarima.get("residual_white_noise_ok"),
-            "fallback_used": sarima.get("fallback_used"),
-            "fallback_method": sarima.get("fallback_method"),
-        },
-        "prophet_config": prophet.get("config", {}),
-        "prophet_component_validation": prophet.get("component_validation", {}),
-        "xgboost_summary": {
-            "selected_strategy": xgboost.get("strategy"),
-            "shap_status": xgboost.get("shap_status"),
-            "fallback_used": xgboost.get("fallback_used"),
-            "fallback_method": xgboost.get("fallback_method"),
-        },
-        "champion_challenger_summary": {
-            "champion": cc.get("champion"),
-            "challenger": cc.get("challenger"),
-            "best_model": outputs.get("best_model"),
-            "production_model": prod_pack.get("production_model", outputs.get("best_model")),
-            "production_status": prod_pack.get("production_status", "eligible"),
-        },
-        "model_errors": outputs.get("model_errors", {}),
-        "model_visual_style_map": outputs.get("model_gorsel_stil_haritasi", {}),
-    }
-
-
-def _plotly_html_bytes(fig: Any) -> Optional[bytes]:
-    if fig is None:
-        return None
-    try:
-        return fig.to_html(full_html=True, include_plotlyjs="cdn").encode("utf-8")
-    except Exception:
-        return None
-
-
-def _forecast_plotly_html_bytes(train_df: pd.DataFrame, test_df: pd.DataFrame, pred_map: Dict[str, np.ndarray], title: str, style_map: Optional[Dict[str, Any]] = None) -> Optional[bytes]:
-    try:
-        fig = plot_forecast_results(train_df, test_df, pred_map, title, model_style_map=style_map or {})
-        return _plotly_html_bytes(fig)
-    except Exception:
-        return None
-
-
-def _unique_sheet_name(name: str, used: set) -> str:
-    base = safe_excel_sheet_name(name) or "Sheet"
-    candidate = base
-    i = 1
-    while candidate in used:
-        suffix = f"_{i}"
-        candidate = safe_excel_sheet_name(base[: max(1, 31 - len(suffix))] + suffix)
-        i += 1
-    used.add(candidate)
-    return candidate
-
-
-def _build_excel_bytes(table_map: Dict[str, pd.DataFrame], notes_map: Optional[Dict[str, pd.DataFrame]] = None, json_map: Optional[Dict[str, Any]] = None) -> Optional[bytes]:
-    try:
-        mem = io.BytesIO()
-        used = set()
-        with pd.ExcelWriter(mem, engine="openpyxl") as writer:
-            for sheet_name, df in table_map.items():
-                out_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
-                out_df.to_excel(writer, sheet_name=_unique_sheet_name(sheet_name, used), index=False)
-            for sheet_name, df in (notes_map or {}).items():
-                out_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=["section", "text"])
-                out_df.to_excel(writer, sheet_name=_unique_sheet_name(sheet_name, used), index=False)
-            for sheet_name, payload in (json_map or {}).items():
-                json_df = pd.DataFrame({"json": json.dumps(_json_safe(payload), ensure_ascii=False, indent=2).splitlines()})
-                json_df.to_excel(writer, sheet_name=_unique_sheet_name(sheet_name, used), index=False)
-        mem.seek(0)
-        return mem.getvalue()
-    except Exception:
-        return None
-
-
-def _forecast_png_bytes(train_df: pd.DataFrame, test_df: pd.DataFrame, pred_map: Dict[str, np.ndarray], title: str) -> bytes:
-    fig, ax = plt.subplots(figsize=(13, 5))
-    ax.plot(train_df["ds"], train_df["y"], label="Train", linewidth=2)
-    ax.plot(test_df["ds"], test_df["y"], label="Gerçek", linewidth=2, marker="o")
-    for model_name, pred in pred_map.items():
-        arr = np.asarray(pred, dtype=float)
-        if len(arr) == len(test_df):
-            ax.plot(test_df["ds"], arr, label=model_name, linewidth=2, marker="o")
-    ax.set_title(title)
-    ax.set_xlabel("Tarih")
-    ax.set_ylabel("Talep")
-    ax.legend()
-    ax.grid(alpha=0.25)
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def _acf_pacf_png_bytes(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int) -> Optional[bytes]:
-    try:
-        df_series = make_series_analysis_frame(export_payload, target_col)
-        train_df_preview, _ = train_test_split_series(df_series, horizon)
-        fig = build_acf_pacf_figure(train_df_preview, target_col)
-        if fig is None:
-            return None
-        buf = io.BytesIO()
-        fig.tight_layout()
-        fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-        plt.close(fig)
-        buf.seek(0)
-        return buf.getvalue()
-    except Exception:
-        return None
-
-
-def _single_table_excel_bytes(sheet_name: str, df: pd.DataFrame) -> Optional[bytes]:
-    try:
-        return _build_excel_bytes({sheet_name: df if isinstance(df, pd.DataFrame) else pd.DataFrame()})
-    except Exception:
-        return None
-
-
-def _write_batch_zip_content(
-    zf: zipfile.ZipFile,
-    export_payload: Dict[str, pd.DataFrame],
-    batch_result: Dict[str, Any],
-    selected_sheet: str,
-    horizon: int,
-    include_self_script: bool = True,
-    include_requirements: bool = True,
-) -> None:
-    progress_log("ZIP Paketleme", "ZIP içeriği yazılmaya başlandı.", extra={"sheet": selected_sheet, "series": len((batch_result.get('batch_outputs') or {}))})
-    sheet_root = _safe_artifact_name(selected_sheet) or "batch_forecasting_outputs"
-
-    common_tables = {
-        "Kalite raporu": export_payload.get("quality_report", pd.DataFrame()),
-        "Seri profil raporu": export_payload.get("series_profile_report", pd.DataFrame()),
-        "Anomali yönetişimi": export_payload.get("anomaly_governance", pd.DataFrame()),
-        "Review queue": export_payload.get("review_queue", pd.DataFrame()),
-        "Proxy backtest raporu": export_payload.get("proxy_backtest_report", pd.DataFrame()),
-        "Raw vs Clean backtest karşılaştırması": export_payload.get("raw_vs_clean_backtest_report", pd.DataFrame()),
-    }
-
-    for name, df in common_tables.items():
-        if isinstance(df, pd.DataFrame):
-            xlsx_bytes = _single_table_excel_bytes(name, df)
-            if xlsx_bytes is not None:
-                zf.writestr(f"{sheet_root}/common/{_safe_artifact_name(name)}.xlsx", xlsx_bytes)
-
-    batch_summary_xlsx = _single_table_excel_bytes("Batch forecasting özeti", batch_result.get("best_summary", pd.DataFrame()))
-    if batch_summary_xlsx is not None:
-        zf.writestr(f"{sheet_root}/batch/Batch forecasting özeti.xlsx", batch_summary_xlsx)
-
-    champion_xlsx = _single_table_excel_bytes("Champion - Challenger tablosu", batch_result.get("champion_table", pd.DataFrame()))
-    if champion_xlsx is not None:
-        zf.writestr(f"{sheet_root}/batch/Champion - Challenger tablosu.xlsx", champion_xlsx)
-
-    business_pack = _build_batch_business_output_pack(
-        batch_result.get("best_summary", pd.DataFrame()),
-        batch_result.get("champion_table", pd.DataFrame()),
-        batch_result.get("series_status", pd.DataFrame()),
-        horizon=int(horizon),
-    )
-    for table_name, table_df in (business_pack.get("tables") or {}).items():
-        xlsx_bytes = _single_table_excel_bytes(table_name, table_df)
-        if xlsx_bytes is not None:
-            zf.writestr(f"{sheet_root}/batch/{_safe_artifact_name(table_name)}.xlsx", xlsx_bytes)
-    for fig_name, fig_bytes in (business_pack.get("figures") or {}).items():
-        if fig_bytes is not None:
-            zf.writestr(f"{sheet_root}/batch/figures/{_safe_artifact_name(fig_name)}", fig_bytes)
-
-    batch_xlsx = _build_excel_bytes({
-        "Batch forecasting özeti": batch_result.get("best_summary", pd.DataFrame()),
-        "Champion - Challenger": batch_result.get("champion_table", pd.DataFrame()),
-        "Seri çalışma durumu": batch_result.get("series_status", pd.DataFrame()),
-        **(business_pack.get("tables") or {}),
-        **{f"Common - {k}": v for k, v in common_tables.items() if isinstance(v, pd.DataFrame)},
-    })
-    if batch_xlsx is not None:
-        zf.writestr(f"{sheet_root}/batch/Batch forecasting master raporu.xlsx", batch_xlsx)
-
-    manifest = {
-        "selected_sheet": selected_sheet,
-        "targets": list(batch_result.get("batch_outputs", {}).keys()),
-        "horizon": int(horizon),
-        "artifact_schema": "batch_forecast_zip_v3_hybrid_local_streamlit_excel_only",
-        "app_version": APP_VERSION,
-        "table_format": "xlsx",
-        "figure_formats": ["png", "html"],
-    }
-    zf.writestr(f"{sheet_root}/manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-
-    if include_self_script:
-        try:
-            script_path = Path(__file__)
-            if script_path.exists():
-                zf.writestr(f"{sheet_root}/{script_path.name}", script_path.read_bytes())
-        except Exception:
-            pass
-
-    if include_requirements:
-        try:
-            requirements_path = Path(__file__).with_name("requirements.txt")
-            if requirements_path.exists():
-                zf.writestr(f"{sheet_root}/requirements.txt", requirements_path.read_bytes())
-        except Exception:
-            pass
-
-    for target, outputs in (batch_result.get("batch_outputs") or {}).items():
-        progress_log("ZIP Paketleme", "Seri klasörü ve rapor dosyaları yazılıyor.", target=target)
-        target_root = f"{sheet_root}/{_safe_artifact_name(target)}"
-        style_map = outputs.get("model_gorsel_stil_haritasi", {}) or {}
-        raw_named_tables = outputs.get("named_output_tables", {}) or {}
-        named_tables = {
-            "Yönetici özeti": _build_series_executive_summary_table(outputs),
-            "Operasyonel aksiyon planı": _build_series_operational_action_table(outputs),
-            **raw_named_tables,
-        }
-        note_tables = _series_notes_tables(outputs, export_payload=export_payload)
-        json_artifacts = _series_json_artifacts(outputs)
-
-        for report_name, df in named_tables.items():
-            if isinstance(df, pd.DataFrame):
-                xlsx_bytes = _single_table_excel_bytes(report_name, df)
-                if xlsx_bytes is not None:
-                    zf.writestr(f"{target_root}/tables/{_safe_artifact_name(report_name)}.xlsx", xlsx_bytes)
-
-        for note_name, note_df in note_tables.items():
-            xlsx_bytes = _single_table_excel_bytes(note_name, note_df)
-            if xlsx_bytes is not None:
-                zf.writestr(f"{target_root}/notes/{_safe_artifact_name(note_name)}.xlsx", xlsx_bytes)
-            zf.writestr(f"{target_root}/notes/{_safe_artifact_name(note_name)}.txt", _text_bytes(note_df.get("text", pd.Series(dtype=object)).astype(str).tolist()))
-
-        for json_name, payload in json_artifacts.items():
-            zf.writestr(f"{target_root}/json/{_safe_artifact_name(json_name)}.json", _json_bytes(payload))
-
-        acf_bytes = _acf_pacf_png_bytes(export_payload, target, horizon)
-        if acf_bytes is not None:
-            zf.writestr(f"{target_root}/figures/{_safe_artifact_name(target)} - ACF ve PACF.png", acf_bytes)
-
-        plot_specs = {
-            "Gerçek vs Tahmin": outputs.get("predictions", {}),
-            "SARIMA-SARIMAX": {"SARIMA/SARIMAX": (outputs.get("predictions", {}) or {}).get("SARIMA/SARIMAX")},
-            "Prophet": {"Prophet": (outputs.get("predictions", {}) or {}).get("Prophet")},
-            "XGBoost": {"XGBoost": (outputs.get("predictions", {}) or {}).get("XGBoost")},
-            "Ensemble": {"Ensemble": (outputs.get("predictions", {}) or {}).get("Ensemble")},
-        }
-        for plot_name, pred_map in plot_specs.items():
-            clean_pred_map = {k: v for k, v in (pred_map or {}).items() if v is not None}
-            if not clean_pred_map:
-                continue
-            title = f"{target} - {plot_name}"
-            zf.writestr(f"{target_root}/figures/{_safe_artifact_name(title)}.png", _forecast_png_bytes(outputs["train"], outputs["test"], clean_pred_map, title))
-            html_bytes = _forecast_plotly_html_bytes(outputs["train"], outputs["test"], clean_pred_map, title, style_map)
-            if html_bytes is not None:
-                zf.writestr(f"{target_root}/figures/{_safe_artifact_name(title)}.html", html_bytes)
-
-        series_xlsx = _build_excel_bytes(named_tables, notes_map=note_tables, json_map=json_artifacts)
-        if series_xlsx is not None:
-            zf.writestr(f"{target_root}/{_safe_artifact_name(target)} - detay raporu.xlsx", series_xlsx)
-        progress_log("ZIP Paketleme", "Seri için ZIP çıktı dosyaları tamamlandı.", level="SUCCESS", target=target)
-
-
-def build_batch_zip_bytes(export_payload: Dict[str, pd.DataFrame], batch_result: Dict[str, Any], selected_sheet: str, horizon: int) -> bytes:
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        _write_batch_zip_content(zf, export_payload, batch_result, selected_sheet, horizon)
-    mem.seek(0)
-    return mem.getvalue()
-
-
-def write_batch_zip_file(export_payload: Dict[str, pd.DataFrame], batch_result: Dict[str, Any], selected_sheet: str, horizon: int, output_zip_path: str) -> str:
-    output_zip_path = str(output_zip_path)
-    os.makedirs(os.path.dirname(output_zip_path) or ".", exist_ok=True)
-    with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        _write_batch_zip_content(zf, export_payload, batch_result, selected_sheet, horizon)
-    return output_zip_path
-
-
-
-
-def _write_binary_file(path: str, payload: bytes) -> str:
-    path = str(path)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(payload)
-    return path
-
-
-def _write_text_file(path: str, lines: List[str]) -> str:
-    path = str(path)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join([str(x) for x in lines]))
-    return path
-
-
-def _write_json_file(path: str, payload: Any) -> str:
-    path = str(path)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2)
-    return path
-
-
-def _write_single_table_excel_file(path: str, sheet_name: str, df: pd.DataFrame) -> Optional[str]:
-    xlsx_bytes = _single_table_excel_bytes(sheet_name, df if isinstance(df, pd.DataFrame) else pd.DataFrame())
-    if xlsx_bytes is None:
-        return None
-    return _write_binary_file(path, xlsx_bytes)
-
-
-def _write_excel_report_file(path: str, table_map: Dict[str, pd.DataFrame], notes_map: Optional[Dict[str, pd.DataFrame]] = None, json_map: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    xlsx_bytes = _build_excel_bytes(table_map, notes_map=notes_map, json_map=json_map)
-    if xlsx_bytes is None:
-        return None
-    return _write_binary_file(path, xlsx_bytes)
-
-
-def _copy_optional_file_into_dir(source_path: Path, target_path: str) -> None:
-    try:
-        if source_path.exists():
-            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
-            shutil.copy2(str(source_path), str(target_path))
-    except Exception:
-        pass
-
-
-def initialize_incremental_batch_output_root(
-    output_dir: str,
-    selected_sheet: str,
-    horizon: int,
-    mode_slug: str,
-    timestamp: Optional[str] = None,
-) -> Dict[str, str]:
-    timestamp = timestamp or time.strftime("%Y%m%d_%H%M%S")
-    run_base = f"{_safe_artifact_name(selected_sheet)}_{mode_slug}_forecasting_outputs_h{int(horizon)}_{timestamp}"
-    run_root = os.path.join(os.path.abspath(output_dir), run_base)
-    batch_root = os.path.join(run_root, _safe_artifact_name(selected_sheet) or "batch_forecasting_outputs")
-    os.makedirs(batch_root, exist_ok=True)
-    return {
-        "timestamp": timestamp,
-        "run_base": run_base,
-        "run_root": run_root,
-        "batch_root": batch_root,
-        "sheet_root_name": os.path.basename(batch_root),
-    }
-
-
-def write_incremental_batch_common_outputs(
-    export_payload: Dict[str, pd.DataFrame],
-    batch_root: str,
-    selected_sheet: str,
-    horizon: int,
-    include_self_script: bool = True,
-    include_requirements: bool = True,
-) -> None:
-    progress_log("Disk Çıktısı", "Ortak batch klasör yapısı ve ortak raporlar oluşturuluyor.", extra={"batch_root": batch_root})
-    common_dir = os.path.join(batch_root, "common")
-    batch_dir = os.path.join(batch_root, "batch")
-    os.makedirs(common_dir, exist_ok=True)
-    os.makedirs(batch_dir, exist_ok=True)
-
-    common_tables = {
-        "Kalite raporu": export_payload.get("quality_report", pd.DataFrame()),
-        "Seri profil raporu": export_payload.get("series_profile_report", pd.DataFrame()),
-        "Anomali yönetişimi": export_payload.get("anomaly_governance", pd.DataFrame()),
-        "Review queue": export_payload.get("review_queue", pd.DataFrame()),
-        "Proxy backtest raporu": export_payload.get("proxy_backtest_report", pd.DataFrame()),
-        "Raw vs Clean backtest karşılaştırması": export_payload.get("raw_vs_clean_backtest_report", pd.DataFrame()),
-    }
-    for name, df in common_tables.items():
-        if isinstance(df, pd.DataFrame):
-            _write_single_table_excel_file(os.path.join(common_dir, f"{_safe_artifact_name(name)}.xlsx"), name, df)
-
-    manifest = {
-        "selected_sheet": selected_sheet,
-        "horizon": int(horizon),
-        "artifact_schema": "batch_forecast_incremental_disk_v1",
-        "app_version": APP_VERSION,
-        "table_format": "xlsx",
-        "figure_formats": ["png", "html"],
-        "write_policy": "series_outputs_are_persisted_immediately_after_each_series_finishes",
-    }
-    _write_json_file(os.path.join(batch_root, "manifest.json"), manifest)
-
-    if include_self_script:
-        _copy_optional_file_into_dir(Path(__file__), os.path.join(batch_root, Path(__file__).name))
-    if include_requirements:
-        _copy_optional_file_into_dir(Path(__file__).with_name("requirements.txt"), os.path.join(batch_root, "requirements.txt"))
-
-
-def write_incremental_batch_status_outputs(
-    batch_root: str,
-    best_summary_df: pd.DataFrame,
-    champion_df: pd.DataFrame,
-    series_status_df: pd.DataFrame,
-) -> None:
-    batch_dir = os.path.join(batch_root, "batch")
-    figures_dir = os.path.join(batch_dir, "figures")
-    os.makedirs(batch_dir, exist_ok=True)
-    os.makedirs(figures_dir, exist_ok=True)
-    _write_single_table_excel_file(os.path.join(batch_dir, "Batch forecasting özeti.xlsx"), "Batch forecasting özeti", best_summary_df)
-    _write_single_table_excel_file(os.path.join(batch_dir, "Champion - Challenger tablosu.xlsx"), "Champion - Challenger", champion_df)
-    _write_single_table_excel_file(os.path.join(batch_dir, "Seri çalışma durumu.xlsx"), "Seri çalışma durumu", series_status_df)
-
-    business_pack = _build_batch_business_output_pack(best_summary_df, champion_df, series_status_df)
-    for table_name, table_df in (business_pack.get("tables") or {}).items():
-        _write_single_table_excel_file(os.path.join(batch_dir, f"{_safe_artifact_name(table_name)}.xlsx"), table_name, table_df)
-    for fig_name, fig_bytes in (business_pack.get("figures") or {}).items():
-        if fig_bytes is not None:
-            _write_binary_file(os.path.join(figures_dir, fig_name), fig_bytes)
-
-    _write_excel_report_file(
-        os.path.join(batch_dir, "Batch forecasting master raporu.xlsx"),
-        {
-            "Batch forecasting özeti": best_summary_df,
-            "Champion - Challenger": champion_df,
-            "Seri çalışma durumu": series_status_df,
-            **(business_pack.get("tables") or {}),
-        }
-    )
-
-
-
-def _safe_bool_col(df: pd.DataFrame, col: str) -> pd.Series:
-    if not isinstance(df, pd.DataFrame) or col not in df.columns:
-        return pd.Series(dtype=bool)
-    s = df[col]
-    if s.dtype == bool:
-        return s.fillna(False)
-    return s.astype(str).str.strip().str.lower().isin(["1", "true", "yes", "evet"])
-
-
-def _safe_num_series(df: pd.DataFrame, col: str) -> pd.Series:
-    if not isinstance(df, pd.DataFrame) or col not in df.columns:
-        return pd.Series(dtype=float)
-    return pd.to_numeric(df[col], errors="coerce")
-
-
-def _safe_text_col(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
-    if not isinstance(df, pd.DataFrame):
-        return pd.Series(dtype=object)
-    if col not in df.columns:
-        return pd.Series([default] * len(df), index=df.index, dtype=object)
-    return df[col].fillna(default).astype(str)
-
-
-def _merge_batch_business_frames(best_summary_df: pd.DataFrame, champion_df: pd.DataFrame, series_status_df: pd.DataFrame) -> pd.DataFrame:
-    bs = best_summary_df.copy() if isinstance(best_summary_df, pd.DataFrame) else pd.DataFrame()
-    ch = champion_df.copy() if isinstance(champion_df, pd.DataFrame) else pd.DataFrame()
-    st = series_status_df.copy() if isinstance(series_status_df, pd.DataFrame) else pd.DataFrame()
-
-    if len(bs) == 0:
-        base_cols = [
-            "target_col", "best_model", "champion", "challenger", "segment", "abc_xyz", "WAPE", "sMAPE", "RMSE", "MAE", "MASE",
-            "production_model", "production_status", "prophet_fallback_used", "xgboost_fallback_used", "sarima_fallback_used", "any_fallback_used",
-            "status", "output_dir", "release_decision", "planning_priority", "recommended_action", "exception_reason", "run_health"
-        ]
-        return pd.DataFrame(columns=base_cols)
-
-    if "best_model" not in bs.columns and "model" in bs.columns:
-        bs["best_model"] = bs["model"]
-    if "production_model" not in bs.columns:
-        bs["production_model"] = bs.get("best_model")
-    if "production_status" not in bs.columns:
-        bs["production_status"] = "eligible"
-
-    ch_small = pd.DataFrame(columns=["target_col", "champion", "challenger"])
-    if len(ch):
-        keep_cols = [c for c in ["target_col", "champion", "challenger"] if c in ch.columns]
-        ch_small = ch[keep_cols].drop_duplicates(subset=["target_col"], keep="last") if "target_col" in keep_cols else ch_small
-
-    st_small = pd.DataFrame(columns=["target_col", "status", "output_dir", "started_at", "completed_at", "error"])
-    if len(st):
-        keep_cols = [c for c in ["target_col", "status", "output_dir", "started_at", "completed_at", "error"] if c in st.columns]
-        st_small = st[keep_cols].drop_duplicates(subset=["target_col"], keep="last") if "target_col" in keep_cols else st_small
-
-    merged = bs.copy()
-    if len(ch_small):
-        merged = merged.merge(ch_small, on="target_col", how="left", suffixes=("", "_cc"))
-        if "champion_cc" in merged.columns:
-            merged["champion"] = merged.get("champion").fillna(merged["champion_cc"])
-            merged = merged.drop(columns=["champion_cc"], errors="ignore")
-        if "challenger_cc" in merged.columns:
-            merged["challenger"] = merged.get("challenger").fillna(merged["challenger_cc"])
-            merged = merged.drop(columns=["challenger_cc"], errors="ignore")
-    if len(st_small):
-        merged = merged.merge(st_small, on="target_col", how="left", suffixes=("", "_run"))
-        if "status_run" in merged.columns:
-            merged["status"] = merged.get("status").fillna(merged["status_run"])
-            merged = merged.drop(columns=["status_run"], errors="ignore")
-
-    for col in ["WAPE", "sMAPE", "RMSE", "MAE", "MASE", "alert_count", "production_eligibility_score"]:
-        if col in merged.columns:
-            merged[col] = pd.to_numeric(merged[col], errors="coerce")
-
-    for col in ["prophet_fallback_used", "xgboost_fallback_used", "sarima_fallback_used"]:
-        if col not in merged.columns:
-            merged[col] = False
-        merged[col] = merged[col].astype(str).str.strip().str.lower().isin(["1", "true", "yes", "evet"])
-    merged["any_fallback_used"] = merged[["prophet_fallback_used", "xgboost_fallback_used", "sarima_fallback_used"]].any(axis=1)
-
-    status_series = _safe_text_col(merged, "status", "SUCCESS")
-    error_series = _safe_text_col(merged, "error", "Beklenmeyen çalışma hatası")
-    production_status_series = _safe_text_col(merged, "production_status", "eligible").str.lower()
-    wape_series = pd.to_numeric(merged["WAPE"], errors="coerce") if "WAPE" in merged.columns else pd.Series(np.nan, index=merged.index)
-    smape_series = pd.to_numeric(merged["sMAPE"], errors="coerce") if "sMAPE" in merged.columns else pd.Series(np.nan, index=merged.index)
-
-    status_upper = status_series.astype(str).str.upper()
-    success_like = status_upper.isin(["SUCCESS", "WARNING"])
-
-    merged["run_health"] = "stabil"
-    merged.loc[~success_like, "run_health"] = "hata_var"
-    merged.loc[(status_upper == "WARNING") & success_like, "run_health"] = "uyari_ile_tamamlandi"
-    merged.loc[(status_upper == "SUCCESS") & merged["any_fallback_used"], "run_health"] = "fallback_ile_tamamlandi"
-
-    merged["exception_reason"] = ""
-    merged.loc[~success_like, "exception_reason"] = error_series
-    merged.loc[(status_upper == "WARNING") & (merged["exception_reason"] == "") & error_series.astype(str).str.strip().ne(""), "exception_reason"] = error_series
-    merged.loc[(merged["exception_reason"] == "") & (wape_series >= 20), "exception_reason"] = "Yüksek WAPE"
-    merged.loc[(merged["exception_reason"] == "") & (smape_series >= 15), "exception_reason"] = "Yüksek sMAPE"
-    merged.loc[(merged["exception_reason"] == "") & merged["any_fallback_used"], "exception_reason"] = "Fallback ile tamamlandı"
-    merged.loc[(merged["exception_reason"] == "") & production_status_series.isin(["reject", "challenger_only"]), "exception_reason"] = "Üretim kapısı kısıtlı"
-
-    merged["release_decision"] = "READY"
-    merged.loc[~success_like, "release_decision"] = "BLOCKED"
-    merged.loc[(merged["release_decision"] == "READY") & production_status_series.isin(["reject"]), "release_decision"] = "REVIEW"
-    merged.loc[(merged["release_decision"] == "READY") & production_status_series.isin(["challenger_only"]), "release_decision"] = "CAUTION"
-    merged.loc[(merged["release_decision"] == "READY") & ((wape_series >= 20) | (smape_series >= 15)), "release_decision"] = "REVIEW"
-    merged.loc[(merged["release_decision"] == "READY") & merged["any_fallback_used"], "release_decision"] = "CAUTION"
-
-    merged["planning_priority"] = "Normal"
-    merged.loc[merged["release_decision"].isin(["BLOCKED", "REVIEW"]), "planning_priority"] = "Kritik"
-    merged.loc[(merged["planning_priority"] == "Normal") & merged["release_decision"].isin(["CAUTION"]), "planning_priority"] = "Yüksek"
-
-    merged["recommended_action"] = "Tahmin üretime/rapora alınabilir; standart planlamacı kontrolü yeterli."
-    merged.loc[merged["release_decision"] == "BLOCKED", "recommended_action"] = "Seriyi yeniden çalıştırın; veri, model backend ve bağımlılık hatalarını inceleyin."
-    merged.loc[merged["release_decision"] == "REVIEW", "recommended_action"] = "Planlamacı ve analitik ekip manuel gözden geçirme yapsın; yayın öncesi challenger ve iş bilgisi ile doğrulansın."
-    merged.loc[(merged["release_decision"] == "CAUTION") & merged["any_fallback_used"], "recommended_action"] = "Fallback ile tamamlandı; yayınlanabilir ancak model bileşenleri ve drift riski kontrol edilmelidir."
-
-    wanted = [
-        "target_col", "best_model", "champion", "challenger", "segment", "abc_xyz", "WAPE", "sMAPE", "RMSE", "MAE", "MASE",
-        "production_model", "production_status", "production_eligibility_score", "prophet_fallback_used", "xgboost_fallback_used", "sarima_fallback_used", "any_fallback_used",
-        "alert_count", "status", "started_at", "completed_at", "output_dir", "release_decision", "planning_priority", "recommended_action", "exception_reason", "run_health"
-    ]
-    existing = [c for c in wanted if c in merged.columns]
-    extra_cols = [c for c in merged.columns if c not in existing]
-    return merged[existing + extra_cols].copy()
-
-
-def _build_batch_kpi_table(portfolio_df: pd.DataFrame, horizon: Optional[int] = None) -> pd.DataFrame:
-    df = portfolio_df.copy() if isinstance(portfolio_df, pd.DataFrame) else pd.DataFrame()
-    total = int(len(df))
-    success = int(df.get("status", pd.Series(dtype=object)).astype(str).str.upper().isin(["SUCCESS", "WARNING"]).sum()) if total else 0
-    blocked = int((df.get("release_decision", pd.Series(dtype=object)) == "BLOCKED").sum()) if total else 0
-    review = int((df.get("release_decision", pd.Series(dtype=object)) == "REVIEW").sum()) if total else 0
-    caution = int((df.get("release_decision", pd.Series(dtype=object)) == "CAUTION").sum()) if total else 0
-    fallback = int(_safe_bool_col(df, "any_fallback_used").sum()) if total else 0
-    champion_count = int(df.get("champion", pd.Series(dtype=object)).dropna().nunique()) if total and "champion" in df.columns else 0
-    wape = _safe_num_series(df, "WAPE")
-    smape = _safe_num_series(df, "sMAPE")
-    rows = [
-        {"metric": "Toplam seri", "value": total},
-        {"metric": "Başarıyla tamamlanan seri", "value": success},
-        {"metric": "Bloke seri", "value": blocked},
-        {"metric": "İnceleme gereken seri", "value": review},
-        {"metric": "Dikkat ile yayınlanacak seri", "value": caution},
-        {"metric": "Fallback kullanılan seri", "value": fallback},
-        {"metric": "Benzersiz champion sayısı", "value": champion_count},
-        {"metric": "Medyan WAPE", "value": safe_float(wape.median()) if len(wape) else np.nan},
-        {"metric": "Ortalama WAPE", "value": safe_float(wape.mean()) if len(wape) else np.nan},
-        {"metric": "Medyan sMAPE", "value": safe_float(smape.median()) if len(smape) else np.nan},
-        {"metric": "Ortalama sMAPE", "value": safe_float(smape.mean()) if len(smape) else np.nan},
-    ]
-    if horizon is not None:
-        rows.append({"metric": "Test ufku", "value": int(horizon)})
-    return pd.DataFrame(rows)
-
-
-def _build_batch_segment_performance_table(portfolio_df: pd.DataFrame) -> pd.DataFrame:
-    df = portfolio_df.copy() if isinstance(portfolio_df, pd.DataFrame) else pd.DataFrame()
-    if len(df) == 0 or "segment" not in df.columns:
-        return pd.DataFrame(columns=["segment", "series_count", "median_WAPE", "mean_WAPE", "median_sMAPE", "ready_count", "review_count"])
-    tmp = df.copy()
-    tmp["WAPE"] = pd.to_numeric(tmp.get("WAPE"), errors="coerce")
-    tmp["sMAPE"] = pd.to_numeric(tmp.get("sMAPE"), errors="coerce")
-    out = tmp.groupby("segment", dropna=False).agg(
-        series_count=("target_col", "count"),
-        median_WAPE=("WAPE", "median"),
-        mean_WAPE=("WAPE", "mean"),
-        median_sMAPE=("sMAPE", "median"),
-    ).reset_index()
-    decision_counts = tmp.pivot_table(index="segment", columns="release_decision", values="target_col", aggfunc="count", fill_value=0).reset_index()
-    out = out.merge(decision_counts, on="segment", how="left")
-    out = out.rename(columns={"READY": "ready_count", "REVIEW": "review_count", "CAUTION": "caution_count", "BLOCKED": "blocked_count"})
-    return out
-
-
-def _build_batch_exception_table(portfolio_df: pd.DataFrame) -> pd.DataFrame:
-    df = portfolio_df.copy() if isinstance(portfolio_df, pd.DataFrame) else pd.DataFrame()
-    if len(df) == 0:
-        return pd.DataFrame(columns=["target_col", "release_decision", "planning_priority", "exception_reason", "recommended_action", "WAPE", "sMAPE", "status", "output_dir"])
-    exc = df[(df.get("release_decision").isin(["BLOCKED", "REVIEW", "CAUTION"])) | (df.get("exception_reason", "") != "")].copy()
-    if len(exc) == 0:
-        return pd.DataFrame(columns=["target_col", "release_decision", "planning_priority", "exception_reason", "recommended_action", "WAPE", "sMAPE", "status", "output_dir"])
-    cols = [c for c in ["target_col", "release_decision", "planning_priority", "exception_reason", "recommended_action", "WAPE", "sMAPE", "status", "output_dir", "champion", "production_model", "production_status"] if c in exc.columns]
-    sort_cols = [c for c in ["planning_priority", "release_decision", "WAPE", "sMAPE"] if c in exc.columns]
-    asc_map = {"planning_priority": True, "release_decision": True, "WAPE": False, "sMAPE": False}
-    return exc[cols].sort_values(sort_cols, ascending=[asc_map[c] for c in sort_cols]) if sort_cols else exc[cols]
-
-
-def _build_batch_planner_action_table(portfolio_df: pd.DataFrame, horizon: Optional[int] = None) -> pd.DataFrame:
-    df = portfolio_df.copy() if isinstance(portfolio_df, pd.DataFrame) else pd.DataFrame()
-    if len(df) == 0:
-        return pd.DataFrame(columns=["target_col", "planning_priority", "release_decision", "owner", "due_window", "recommended_action", "champion", "output_dir"])
-    out = df.copy()
-    out["owner"] = np.where(out.get("planning_priority", "Normal").isin(["Kritik", "Yüksek"]), "Demand Planner + Analytics Lead", "Demand Planner")
-    out["due_window"] = np.where(out.get("planning_priority", "Normal") == "Kritik", "Aynı gün", np.where(out.get("planning_priority", "Normal") == "Yüksek", "24 saat", "Standart çevrim"))
-    if horizon is not None:
-        out["forecast_horizon"] = int(horizon)
-    cols = [c for c in ["target_col", "planning_priority", "release_decision", "owner", "due_window", "recommended_action", "champion", "production_model", "WAPE", "sMAPE", "output_dir", "forecast_horizon"] if c in out.columns]
-    sort_cols = [c for c in ["planning_priority", "release_decision", "WAPE"] if c in out.columns]
-    asc = [True, True, False][:len(sort_cols)]
-    return out[cols].sort_values(sort_cols, ascending=asc)
-
-
-def _build_batch_release_register_table(portfolio_df: pd.DataFrame, horizon: Optional[int] = None) -> pd.DataFrame:
-    df = portfolio_df.copy() if isinstance(portfolio_df, pd.DataFrame) else pd.DataFrame()
-    if len(df) == 0:
-        return pd.DataFrame(columns=["target_col", "release_decision", "best_model", "champion", "production_model", "production_status", "WAPE", "sMAPE", "output_dir"])
-    out = df.copy()
-    if horizon is not None:
-        out["forecast_horizon"] = int(horizon)
-    out["release_package_ready"] = np.where(out.get("status", "SUCCESS").astype(str).str.upper() == "SUCCESS", "evet", "hayır")
-    cols = [c for c in ["target_col", "forecast_horizon", "release_decision", "release_package_ready", "best_model", "champion", "challenger", "production_model", "production_status", "WAPE", "sMAPE", "output_dir", "completed_at"] if c in out.columns]
-    sort_cols = [c for c in ["release_decision", "WAPE"] if c in cols]
-    return out[cols].sort_values(sort_cols, ascending=[True for _ in sort_cols]) if sort_cols else out[cols]
-
-
-def _build_batch_model_governance_table(portfolio_df: pd.DataFrame) -> pd.DataFrame:
-    df = portfolio_df.copy() if isinstance(portfolio_df, pd.DataFrame) else pd.DataFrame()
-    if len(df) == 0:
-        return pd.DataFrame(columns=["target_col", "best_model", "champion", "production_model", "production_status", "prophet_fallback_used", "xgboost_fallback_used", "sarima_fallback_used", "run_health"])
-    cols = [c for c in ["target_col", "best_model", "champion", "challenger", "production_model", "production_status", "production_eligibility_score", "prophet_fallback_used", "xgboost_fallback_used", "sarima_fallback_used", "any_fallback_used", "alert_count", "run_health"] if c in df.columns]
-    sort_cols = [c for c in ["production_status", "production_eligibility_score"] if c in cols]
-    asc_map = {"production_status": True, "production_eligibility_score": False}
-    return df[cols].sort_values(sort_cols, ascending=[asc_map[c] for c in sort_cols]) if sort_cols else df[cols]
-
-
-def _build_batch_champion_mix_table(portfolio_df: pd.DataFrame) -> pd.DataFrame:
-    df = portfolio_df.copy() if isinstance(portfolio_df, pd.DataFrame) else pd.DataFrame()
-    if len(df) == 0 or "champion" not in df.columns:
-        return pd.DataFrame(columns=["champion", "series_count"])
-    counts = df["champion"].fillna("Bilinmiyor").astype(str).value_counts(dropna=False).reset_index()
-    counts.columns = ["champion", "series_count"]
-    return counts
-
-
-def _batch_metric_bar_png_bytes(df: pd.DataFrame, label_col: str, value_col: str, title: str, top_n: int = 15) -> Optional[bytes]:
-    if not isinstance(df, pd.DataFrame) or len(df) == 0 or label_col not in df.columns or value_col not in df.columns:
-        return None
-    tmp = df[[label_col, value_col]].copy()
-    tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
-    tmp = tmp.dropna().sort_values(value_col, ascending=False).head(max(1, int(top_n)))
-    if len(tmp) == 0:
-        return None
-    fig, ax = plt.subplots(figsize=(12, max(4, 0.45 * len(tmp) + 1.5)))
-    ax.barh(tmp[label_col].astype(str), tmp[value_col].astype(float))
-    ax.set_title(title)
-    ax.set_xlabel(value_col)
-    ax.invert_yaxis()
-    ax.grid(alpha=0.25, axis="x")
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def _build_batch_business_output_pack(best_summary_df: pd.DataFrame, champion_df: pd.DataFrame, series_status_df: pd.DataFrame, horizon: Optional[int] = None) -> Dict[str, Any]:
-    portfolio_df = _merge_batch_business_frames(best_summary_df, champion_df, series_status_df)
-    tables = {
-        "Portföy yöneticisi özeti": _build_batch_kpi_table(portfolio_df, horizon=horizon),
-        "Tahmin yayın kayıt defteri": _build_batch_release_register_table(portfolio_df, horizon=horizon),
-        "Planlamacı aksiyon listesi": _build_batch_planner_action_table(portfolio_df, horizon=horizon),
-        "İstisna kayıtları": _build_batch_exception_table(portfolio_df),
-        "Model yönetişim özeti": _build_batch_model_governance_table(portfolio_df),
-        "Şampiyon dağılımı": _build_batch_champion_mix_table(portfolio_df),
-        "Segment bazlı performans": _build_batch_segment_performance_table(portfolio_df),
-        "Portföy performans görünümü": portfolio_df,
-    }
-    figures = {
-        "Portföy - WAPE sıralaması.png": _batch_metric_bar_png_bytes(portfolio_df, "target_col", "WAPE", "Portföy - WAPE sıralaması", top_n=min(20, len(portfolio_df) if len(portfolio_df) else 20)),
-        "Portföy - sMAPE sıralaması.png": _batch_metric_bar_png_bytes(portfolio_df, "target_col", "sMAPE", "Portföy - sMAPE sıralaması", top_n=min(20, len(portfolio_df) if len(portfolio_df) else 20)),
-        "Portföy - şampiyon dağılımı.png": _batch_metric_bar_png_bytes(_build_batch_champion_mix_table(portfolio_df), "champion", "series_count", "Portföy - şampiyon dağılımı", top_n=20),
-    }
-    return {"portfolio_df": portfolio_df, "tables": tables, "figures": figures}
-
-
-def _build_series_executive_summary_table(outputs: Dict[str, Any]) -> pd.DataFrame:
-    meta = outputs.get("metadata", {}) or {}
-    prod_pack = outputs.get("production_governance", {}) or {}
-    prophet = outputs.get("prophet", {}) or {}
-    xgb = outputs.get("xgboost", {}) or {}
-    sarima = outputs.get("sarima", {}) or {}
-    cc = outputs.get("champion_challenger", {}) or {}
-    metrics_df = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    best_row = metrics_df.iloc[0].to_dict() if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) else {}
-    readiness = assess_production_readiness({}, metrics_df if isinstance(metrics_df, pd.DataFrame) else pd.DataFrame(), meta.get("target_col", ""), outputs=outputs)
-    return pd.DataFrame([{
-        "target_col": meta.get("target_col"),
-        "best_model": outputs.get("best_model", best_row.get("model")),
-        "champion": cc.get("champion"),
-        "challenger": cc.get("challenger"),
-        "production_model": prod_pack.get("production_model", outputs.get("best_model", best_row.get("model"))),
-        "production_status": prod_pack.get("production_status", "eligible"),
-        "segment": meta.get("segment"),
-        "abc_xyz": meta.get("abc_xyz"),
-        "horizon": meta.get("horizon"),
-        "WAPE": best_row.get("WAPE"),
-        "sMAPE": best_row.get("sMAPE"),
-        "RMSE": best_row.get("RMSE"),
-        "prophet_fallback_used": bool(prophet.get("fallback_used", False)),
-        "xgboost_fallback_used": bool(xgb.get("fallback_used", False)),
-        "sarima_fallback_used": bool(sarima.get("fallback_used", False)),
-        "release_note": " | ".join(list(readiness.get("notes", []))[:2]),
-    }])
-
-
-def _build_series_operational_action_table(outputs: Dict[str, Any]) -> pd.DataFrame:
-    summary_df = _build_series_executive_summary_table(outputs)
-    row = summary_df.iloc[0].to_dict() if len(summary_df) else {}
-    actions = []
-    release_note = str(row.get("release_note", "")).strip()
-    if row.get("prophet_fallback_used"):
-        actions.append({"action_area": "Prophet", "priority": "Yüksek", "action": "Gerçek Prophet backend/fitting yolunu kontrol edin.", "reason": "Seri surrogate Prophet ile tamamlandı."})
-    if row.get("xgboost_fallback_used"):
-        actions.append({"action_area": "XGBoost", "priority": "Orta", "action": "Feature set ve validation stabilitesini gözden geçirin.", "reason": "Fallback veya emniyetli yol kullanıldı."})
-    if pd.notna(row.get("WAPE")) and float(row.get("WAPE") or 0) >= 20:
-        actions.append({"action_area": "Tahmin kalitesi", "priority": "Kritik", "action": "Manuel override / iş bilgisi doğrulaması yapın.", "reason": f"WAPE={safe_float(row.get('WAPE')):.2f}"})
-    if not actions:
-        actions.append({"action_area": "Yayın", "priority": "Normal", "action": "Tahmin paketi standart planlama kontrolü ile yayınlanabilir.", "reason": release_note or "Kritik risk sinyali bulunmadı."})
-    return pd.DataFrame(actions)
-
-
-def write_incremental_series_outputs(
-    export_payload: Dict[str, pd.DataFrame],
-    outputs: Dict[str, Any],
-    target: str,
-    batch_root: str,
-    horizon: int,
-) -> str:
-    target_root = os.path.join(batch_root, _safe_artifact_name(target))
-    tables_dir = os.path.join(target_root, "tables")
-    notes_dir = os.path.join(target_root, "notes")
-    json_dir = os.path.join(target_root, "json")
-    figures_dir = os.path.join(target_root, "figures")
-    for d in [target_root, tables_dir, notes_dir, json_dir, figures_dir]:
-        os.makedirs(d, exist_ok=True)
-
-    progress_log("Disk Çıktısı", "Seri tamamlandı; disk yazımı başlatıldı.", target=target, extra={"target_root": target_root})
-    style_map = outputs.get("model_gorsel_stil_haritasi", {}) or {}
-    raw_named_tables = outputs.get("named_output_tables", {}) or {}
-    named_tables = {
-        "Yönetici özeti": _build_series_executive_summary_table(outputs),
-        "Operasyonel aksiyon planı": _build_series_operational_action_table(outputs),
-        **raw_named_tables,
-    }
-    note_tables = _series_notes_tables(outputs)
-    json_artifacts = _series_json_artifacts(outputs)
-
-    for report_name, df in named_tables.items():
-        if isinstance(df, pd.DataFrame):
-            _write_single_table_excel_file(os.path.join(tables_dir, f"{_safe_artifact_name(report_name)}.xlsx"), report_name, df)
-
-    for note_name, note_df in note_tables.items():
-        _write_single_table_excel_file(os.path.join(notes_dir, f"{_safe_artifact_name(note_name)}.xlsx"), note_name, note_df)
-        note_lines = note_df.get("text", pd.Series(dtype=object)).astype(str).tolist() if isinstance(note_df, pd.DataFrame) else []
-        _write_text_file(os.path.join(notes_dir, f"{_safe_artifact_name(note_name)}.txt"), note_lines)
-
-    for json_name, payload in json_artifacts.items():
-        _write_json_file(os.path.join(json_dir, f"{_safe_artifact_name(json_name)}.json"), payload)
-
-    acf_bytes = _acf_pacf_png_bytes(export_payload, target, horizon)
-    if acf_bytes is not None:
-        _write_binary_file(os.path.join(figures_dir, f"{_safe_artifact_name(target)} - ACF ve PACF.png"), acf_bytes)
-
-    plot_specs = {
-        "Gerçek vs Tahmin": outputs.get("predictions", {}),
-        "SARIMA-SARIMAX": {"SARIMA/SARIMAX": (outputs.get("predictions", {}) or {}).get("SARIMA/SARIMAX")},
-        "Prophet": {"Prophet": (outputs.get("predictions", {}) or {}).get("Prophet")},
-        "XGBoost": {"XGBoost": (outputs.get("predictions", {}) or {}).get("XGBoost")},
-        "Ensemble": {"Ensemble": (outputs.get("predictions", {}) or {}).get("Ensemble")},
-    }
-    for plot_name, pred_map in plot_specs.items():
-        clean_pred_map = {k: v for k, v in (pred_map or {}).items() if v is not None}
-        if not clean_pred_map:
-            continue
-        title = f"{target} - {plot_name}"
-        _write_binary_file(os.path.join(figures_dir, f"{_safe_artifact_name(title)}.png"), _forecast_png_bytes(outputs["train"], outputs["test"], clean_pred_map, title))
-        html_bytes = _forecast_plotly_html_bytes(outputs["train"], outputs["test"], clean_pred_map, title, style_map)
-        if html_bytes is not None:
-            _write_binary_file(os.path.join(figures_dir, f"{_safe_artifact_name(title)}.html"), html_bytes)
-
-    _write_excel_report_file(
-        os.path.join(target_root, f"{_safe_artifact_name(target)} - detay raporu.xlsx"),
-        named_tables,
-        notes_map=note_tables,
-        json_map=json_artifacts,
-    )
-    progress_log("Disk Çıktısı", "Seri için tüm tablo/grafik dosyaları diske yazıldı.", level="SUCCESS", target=target, extra={"target_root": target_root})
-    return target_root
-
-
-def create_zip_from_directory(source_dir: str, output_zip_path: str) -> str:
-    source_dir = os.path.abspath(source_dir)
-    output_zip_path = os.path.abspath(output_zip_path)
-    os.makedirs(os.path.dirname(output_zip_path) or ".", exist_ok=True)
-    root_parent = os.path.dirname(source_dir)
-    with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for current_root, _, files in os.walk(source_dir):
-            for filename in files:
-                abs_path = os.path.join(current_root, filename)
-                arcname = os.path.relpath(abs_path, root_parent)
-                zf.write(abs_path, arcname)
-    return output_zip_path
-
-
-def build_batch_summary_excel_bytes(batch_result: Dict[str, Any]) -> Optional[bytes]:
-    return _build_excel_bytes({
-        "Batch forecasting özeti": batch_result.get("best_summary", pd.DataFrame()),
-        "Champion - Challenger": batch_result.get("champion_table", pd.DataFrame()),
-    })
-
-
-def build_acf_pacf_figure(train_df: pd.DataFrame, target_col: str):
-    if not HAS_FORECAST_STATSMODELS:
-        return None
-    y = pd.to_numeric(train_df["y"], errors="coerce").dropna().astype(float)
-    if len(y) < 8:
-        return None
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    plot_acf(y, ax=axes[0], lags=min(24, max(3, len(y)//2 - 1)))
-    plot_pacf(y, ax=axes[1], lags=min(24, max(3, len(y)//2 - 1)), method="ywm")
-    axes[0].set_title(f"{target_col} - ACF")
-    axes[1].set_title(f"{target_col} - PACF")
-    plt.tight_layout()
-    return fig
-
-def build_model_visual_style_map(outputs: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
-    outputs = outputs or {}
-    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs, dict) else {}
-    prod_model = prod_pack.get("production_model")
-    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    prophet_info = outputs.get("prophet", {}) if isinstance(outputs, dict) else {}
-    style_map: Dict[str, Dict[str, Any]] = {}
-    if isinstance(gate_df, pd.DataFrame) and len(gate_df):
-        for _, row in gate_df.iterrows():
-            model_name = str(row.get("model"))
-            status = str(row.get("status", "eligible"))
-            opacity = 1.0
-            width = 2.5
-            dash = "solid"
-            if status == "challenger_only":
-                opacity = 0.72
-                width = 2.0
-            elif status == "reject":
-                opacity = 0.35
-                width = 1.4
-                dash = "dot"
-            if model_name == prod_model:
-                opacity = 1.0
-                width = 4.0
-                dash = "solid"
-            style_map[model_name] = {"opacity": opacity, "width": width, "dash": dash}
-    if prophet_info and bool(prophet_info.get("fallback_used", False)):
-        style_map.setdefault("Prophet", {})
-        style_map["Prophet"].update({"opacity": 0.28, "width": 1.2, "dash": "dot"})
-    return style_map
-
-def plot_forecast_results(train_df: pd.DataFrame, test_df: pd.DataFrame, predictions: Dict[str, np.ndarray], title: str, model_style_map: Optional[Dict[str, Dict[str, Any]]] = None):
-    model_style_map = model_style_map or {}
-    if HAS_PLOTLY:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=train_df["ds"], y=train_df["y"], mode="lines+markers", name="Eğitim", line=dict(width=2.4), opacity=0.95))
-        fig.add_trace(go.Scatter(x=test_df["ds"], y=test_df["y"], mode="lines+markers", name="Gerçek", line=dict(width=3.0), opacity=1.0))
-        for name, pred in predictions.items():
-            style = model_style_map.get(name, {})
-            fig.add_trace(go.Scatter(
-                x=test_df["ds"], y=pred, mode="lines+markers", name=name,
-                line=dict(width=float(style.get("width", 2.2)), dash=str(style.get("dash", "solid"))),
-                opacity=float(style.get("opacity", 0.9))
-            ))
-        fig.update_layout(title=title, xaxis_title="Tarih", yaxis_title="Talep", legend_title="Seriler", template="plotly_white")
-        return fig
-    return None
 
 def train_test_split_series(df_series: pd.DataFrame, horizon: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     usable = df_series.loc[df_series["is_usable"]].copy().reset_index(drop=True)
@@ -7437,1252 +4686,989 @@ def suggest_D_via_profile(profile: Dict[str, Any], season_length: int, n_obs: in
     return int(pd.notna(seasonality_strength) and seasonality_strength >= 0.35)
 
 
-
 def build_sarimax_grid(freq_alias: str, profile: Dict[str, Any], n_obs: int) -> List[Dict[str, Any]]:
+    d = suggest_d_via_stationarity(pd.Series([profile.get("mean", np.nan)])) if False else None
     season_length = infer_season_length_from_freq(freq_alias)
-    seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
-    seasonal_allowed = season_length > 1 and n_obs >= max(season_length * 2, 24)
-
-    short_series = n_obs <= 72
-    max_plain_order = 3 if short_series else 4
-    plain_orders = [
-        (p, q) for p, q in product(range(0, max_plain_order + 1), range(0, max_plain_order + 1))
-        if (p + q) <= (4 if short_series else 5)
-    ]
-
-    grid: List[Dict[str, Any]] = []
-    for p, q in plain_orders:
-        grid.append({"p": p, "q": q, "P": 0, "Q": 0, "m": 0})
-
-    if seasonal_allowed:
-        seasonal_orders = [(P, Q) for P, Q in product(range(0, 3), range(0, 3)) if (P + Q) <= 2]
-        for p, q in plain_orders:
-            for P, Q in seasonal_orders:
-                if short_series and (p + q + P + Q) > 4:
-                    continue
-                if pd.notna(seasonality_strength) and seasonality_strength < 0.20 and (P + Q) > 0:
-                    continue
+    # actual d computed during fit using train series
+    seasonal_allowed = season_length > 1 and n_obs >= season_length * 2
+    grid = []
+    for p, q in product(range(0, 3), range(0, 3)):
+        if seasonal_allowed:
+            for P, Q in product(range(0, 2), range(0, 2)):
                 grid.append({"p": p, "q": q, "P": P, "Q": Q, "m": season_length})
-
-    unique, seen = [], set()
-    for cfg in grid:
-        key = (cfg["p"], cfg["q"], cfg["P"], cfg["Q"], cfg["m"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(cfg)
-    return unique
-
-
-
-def prioritize_sarimax_candidates(
-    candidates: List[Dict[str, Any]],
-    profile: Dict[str, Any],
-    max_candidates: int
-) -> List[Dict[str, Any]]:
-    seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
-    volatility_regime = str(profile.get("volatility_regime", "unknown"))
-    volume_level_ = str(profile.get("volume_level", "unknown"))
-
-    unique = []
-    seen = set()
-    for cfg in candidates:
-        key = (cfg.get("p", 0), cfg.get("q", 0), cfg.get("P", 0), cfg.get("Q", 0), cfg.get("m", 0))
-        if key not in seen:
-            seen.add(key)
-            unique.append(cfg)
-
-    def _score(cfg: Dict[str, Any]) -> Tuple[float, float, float]:
-        p = int(cfg.get("p", 0))
-        q = int(cfg.get("q", 0))
-        P = int(cfg.get("P", 0))
-        Q = int(cfg.get("Q", 0))
-        m = int(cfg.get("m", 0))
-        complexity = p + q + P + Q + (0.30 if m > 1 else 0.0)
-        seasonal_pref = 0.0
-        if m > 1:
-            seasonal_pref -= 0.30 if pd.notna(seasonality_strength) and seasonality_strength >= 0.20 else -0.0
-            if pd.notna(seasonality_strength) and seasonality_strength < 0.20:
-                seasonal_pref += 0.80
         else:
-            if pd.notna(seasonality_strength) and seasonality_strength >= 0.45:
-                seasonal_pref += 0.25
-        stability_pref = 0.0
-        if volatility_regime in ["stable", "moderate"] and (p + q) > 3:
-            stability_pref += 0.30
-        if volume_level_ in ["very_low", "low"] and (P + Q) > 1:
-            stability_pref += 0.25
-        balance_pref = 0.10 * abs(p - q) + 0.10 * abs(P - Q)
-        return (complexity + seasonal_pref + stability_pref + balance_pref, complexity, balance_pref)
-
-    ranked = sorted(unique, key=_score)
-    keep_n = max(8, int(max_candidates))
-    prioritized = ranked[:keep_n]
-
-    seasonal_candidates = [cfg for cfg in ranked if int(cfg.get("m", 0)) > 1]
-    plain_candidates = [cfg for cfg in ranked if int(cfg.get("m", 0)) <= 1]
-    mixed_candidates = [cfg for cfg in ranked if (int(cfg.get("p", 0)) > 0 and int(cfg.get("q", 0)) > 0)]
-    ar_heavy = [cfg for cfg in ranked if int(cfg.get("p", 0)) > int(cfg.get("q", 0))]
-    ma_heavy = [cfg for cfg in ranked if int(cfg.get("q", 0)) > int(cfg.get("p", 0))]
-
-    for bucket in [seasonal_candidates, plain_candidates, mixed_candidates, ar_heavy, ma_heavy]:
-        if bucket:
-            cand = bucket[0]
-            key = (cand.get("p", 0), cand.get("q", 0), cand.get("P", 0), cand.get("Q", 0), cand.get("m", 0))
-            existing = {(c.get("p", 0), c.get("q", 0), c.get("P", 0), c.get("Q", 0), c.get("m", 0)) for c in prioritized}
-            if key not in existing:
-                prioritized.append(cand)
-
-    unique_prioritized = []
-    seen2 = set()
-    for cfg in prioritized:
-        key = (cfg.get("p", 0), cfg.get("q", 0), cfg.get("P", 0), cfg.get("Q", 0), cfg.get("m", 0))
-        if key not in seen2:
-            seen2.add(key)
-            unique_prioritized.append(cfg)
-    return unique_prioritized[:max(10, int(max_candidates))]
-
-
-def fit_sarimax_model(
-    y: pd.Series,
-    exog: Optional[pd.DataFrame],
-    order: Tuple[int, int, int],
-    seasonal_order: Tuple[int, int, int, int],
-    trend: str,
-    maxiter: int
-):
-    model = SARIMAX(
-        y,
-        exog=exog,
-        order=order,
-        seasonal_order=seasonal_order,
-        trend=trend,
-        enforce_stationarity=False,
-        enforce_invertibility=False
-    )
-    return model.fit(disp=False, maxiter=maxiter)
-
-
-def sanitize_exog_for_sarimax(exog_train: Optional[pd.DataFrame], exog_test: Optional[pd.DataFrame]) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], List[str]]:
-    dropped = []
-    if exog_train is None or exog_test is None:
-        return None, None, dropped
-    xtr = exog_train.copy().reset_index(drop=True)
-    xte = exog_test.copy().reset_index(drop=True)
-    common_cols = [c for c in xtr.columns if c in xte.columns]
-    if not common_cols:
-        return None, None, dropped
-    xtr = xtr[common_cols]
-    xte = xte[common_cols]
-    for c in common_cols:
-        xtr[c] = pd.to_numeric(xtr[c], errors='coerce')
-        xte[c] = pd.to_numeric(xte[c], errors='coerce')
-    xtr = xtr.replace([np.inf, -np.inf], np.nan)
-    xte = xte.replace([np.inf, -np.inf], np.nan)
-    keep_cols = []
-    for c in common_cols:
-        train_non_na = xtr[c].notna().sum()
-        test_non_na = xte[c].notna().sum()
-        nunique = xtr[c].dropna().nunique()
-        if train_non_na == 0 or test_non_na == 0 or nunique <= 1:
-            dropped.append(c)
-            continue
-        keep_cols.append(c)
-    if not keep_cols:
-        return None, None, dropped
-    xtr = xtr[keep_cols].copy()
-    xte = xte[keep_cols].copy()
-    fill_vals = xtr.median(numeric_only=True)
-    xtr = xtr.fillna(fill_vals).fillna(0.0)
-    xte = xte.fillna(fill_vals).fillna(0.0)
-    return xtr, xte, dropped
-
-
-def build_fallback_forecast(y_train: pd.Series, y_test: pd.Series, freq_alias: str, season_length: int) -> Tuple[np.ndarray, str]:
-    y_train = pd.to_numeric(y_train, errors='coerce').dropna().astype(float).reset_index(drop=True)
-    y_test = pd.to_numeric(y_test, errors='coerce').astype(float).reset_index(drop=True)
-    h = len(y_test)
-    if h <= 0:
-        return np.array([], dtype=float), 'empty'
-    methods = []
-    if season_length > 1 and len(y_train) >= season_length:
-        seasonal_vals = y_train.iloc[-season_length:].tolist()
-        pred = np.array([seasonal_vals[i % season_length] for i in range(h)], dtype=float)
-        methods.append(('seasonal_naive', pred))
-    if len(y_train) >= 2:
-        methods.append(('drift', drift_forecast(y_train, h)))
-    if len(y_train) >= 1:
-        methods.append(('last_value', np.repeat(float(y_train.iloc[-1]), h)))
-        methods.append(('mean', np.repeat(float(y_train.mean()), h)))
-    best_name = 'last_value'
-    best_pred = np.repeat(0.0, h)
-    best_score = np.inf
-    actual = y_test.values.astype(float)
-    for name, pred in methods:
-        pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
-        score = wape(actual, pred) + 0.35 * smape(actual, pred)
-        if score < best_score:
-            best_score = score
-            best_name = name
-            best_pred = pred
-    return best_pred, best_name
-
-
-
-
-def forecast_with_baseline_name(y_train: pd.Series, horizon: int, freq_alias: str, season_length: int, baseline_name: str) -> np.ndarray:
-    y_train = pd.to_numeric(y_train, errors="coerce").dropna().astype(float).reset_index(drop=True)
-    h = int(horizon)
-    if h <= 0:
-        return np.array([], dtype=float)
-    name = str(baseline_name or "last_value")
-    if name == "seasonal_naive" and season_length > 1 and len(y_train) >= season_length:
-        seasonal_vals = y_train.iloc[-season_length:].tolist()
-        pred = np.array([seasonal_vals[i % season_length] for i in range(h)], dtype=float)
-    elif name == "drift" and len(y_train) >= 2:
-        pred = drift_forecast(y_train, h)
-    elif name == "mean" and len(y_train) >= 1:
-        pred = np.repeat(float(y_train.mean()), h)
-    else:
-        pred = np.repeat(float(y_train.iloc[-1]) if len(y_train) else 0.0, h)
-    return np.maximum(np.asarray(pred, dtype=float), 0.0)
-
-
-def compute_validation_postprocess_candidates(y_true: np.ndarray, pred: np.ndarray, y_hist: pd.Series, season_length: int) -> Tuple[np.ndarray, Dict[str, Any]]:
-    y_true = np.asarray(y_true, dtype=float)
-    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    hist = pd.to_numeric(y_hist, errors="coerce").dropna().astype(float)
-    if len(pred) == 0:
-        return pred, {"name": "raw"}
-    anchor_window = max(3, min(len(hist), season_length if season_length > 1 else 6))
-    anchor_level = float(hist.iloc[-anchor_window:].median()) if len(hist) else 0.0
-    seasonal_anchor = forecast_with_baseline_name(hist, len(pred), "M", season_length, "seasonal_naive") if season_length > 1 and len(hist) >= season_length else np.repeat(anchor_level, len(pred))
-    candidates = [("raw", pred, {"name": "raw"})]
-    if np.nanmedian(pred) > 0:
-        ratio = float(np.nanmedian(y_true) / max(np.nanmedian(pred), 1e-6))
-        ratio = float(np.clip(ratio, 0.85, 1.20))
-        candidates.append(("ratio", np.maximum(pred * ratio, 0.0), {"name": "ratio", "ratio": ratio}))
-    bias = float(np.nanmedian(y_true - pred))
-    candidates.append(("bias", np.maximum(pred + bias, 0.0), {"name": "bias", "bias": bias}))
-    for w in [0.15, 0.25, 0.35]:
-        blend = np.maximum((1.0 - w) * pred + w * seasonal_anchor, 0.0)
-        candidates.append((f"anchor_{w}", blend, {"name": "anchor_blend", "weight": w, "anchor": seasonal_anchor.tolist()}))
-    best_pred = pred
-    best_cfg = {"name": "raw"}
-    best_score = np.inf
-    for _name, cand, cfg in candidates:
-        score = wape(y_true, cand) + 0.35 * smape(y_true, cand)
-        if score < best_score:
-            best_score = score
-            best_pred = cand
-            best_cfg = cfg
-    return np.maximum(best_pred, 0.0), best_cfg
-
-
-def apply_postprocess_cfg(pred: np.ndarray, cfg: Dict[str, Any], y_hist: pd.Series, season_length: int) -> np.ndarray:
-    arr = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    name = str((cfg or {}).get("name", "raw"))
-    if name == "ratio":
-        return np.maximum(arr * float(cfg.get("ratio", 1.0)), 0.0)
-    if name == "bias":
-        return np.maximum(arr + float(cfg.get("bias", 0.0)), 0.0)
-    if name == "anchor_blend":
-        anchor = np.asarray(cfg.get("anchor", []), dtype=float)
-        if len(anchor) != len(arr):
-            hist = pd.to_numeric(y_hist, errors="coerce").dropna().astype(float)
-            anchor = forecast_with_baseline_name(hist, len(arr), "M", season_length, "seasonal_naive") if season_length > 1 and len(hist) >= season_length else np.repeat(float(hist.tail(max(3, min(len(hist), season_length if season_length > 1 else 6))).median()) if len(hist) else 0.0, len(arr))
-        w = float(cfg.get("weight", 0.2))
-        return np.maximum((1.0 - w) * arr + w * anchor, 0.0)
-    return np.maximum(arr, 0.0)
-
-
-def croston_forecast(series: pd.Series, horizon: int, alpha: float = 0.1, variant: str = "croston") -> np.ndarray:
-    y = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float).values
-    if len(y) == 0:
-        return np.zeros(int(horizon), dtype=float)
-    demand = y[y > 0]
-    if len(demand) == 0:
-        return np.zeros(int(horizon), dtype=float)
-    z = float(demand[0])
-    p = float(np.argmax(y > 0) + 1)
-    q = 1
-    prob = 1.0 / max(p, 1.0)
-    for val in y[1:]:
-        q += 1
-        if val > 0:
-            z = z + alpha * (val - z)
-            p = p + alpha * (q - p)
-            prob = prob + alpha * (1.0 - prob)
-            q = 1
-        else:
-            if variant == "tsb":
-                prob = prob + alpha * (0.0 - prob)
-    base = z / max(p, 1e-6)
-    if variant == "sba":
-        base = (1.0 - alpha / 2.0) * base
-    if variant == "tsb":
-        base = prob * z
-    return np.maximum(np.repeat(float(base), int(horizon)), 0.0)
-
-
-def fit_best_intermittent(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any]) -> Dict[str, Any]:
-    y_train = pd.to_numeric(train_df["y"], errors="coerce").fillna(0.0).astype(float)
-    y_test = pd.to_numeric(test_df["y"], errors="coerce").fillna(0.0).astype(float)
-    tr_inner, val_inner = make_inner_train_val_split(train_df)
-    y_inner = pd.to_numeric(tr_inner["y"], errors="coerce").fillna(0.0).astype(float)
-    y_val = pd.to_numeric(val_inner["y"], errors="coerce").fillna(0.0).astype(float)
-    rows = []
-    best = None
-    best_score = np.inf
-    for variant in ["croston", "sba", "tsb"]:
-        for alpha in [0.05, 0.10, 0.20, 0.30]:
-            pred_val = croston_forecast(y_inner, len(y_val), alpha=alpha, variant=variant)
-            val_w = wape(y_val.values, pred_val)
-            val_s = smape(y_val.values, pred_val)
-            asym = compute_asymmetric_validation_penalty(y_val.values, pred_val, y_inner.values, severity=0.8)
-            comp = val_w + 0.35 * val_s + asym["penalty"]
-            rows.append({"variant": variant, "alpha": alpha, "val_wape": val_w, "val_smape": val_s, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "composite_score": comp})
-            if comp < best_score:
-                best_score = comp
-                best = {"variant": variant, "alpha": alpha}
-    if best is None:
-        pred, method = build_fallback_forecast(y_train, y_test, freq_alias, infer_season_length_from_freq(freq_alias))
-        return {"forecast": pred, "method": method, "alpha": None, "search_table": pd.DataFrame(rows), "fallback_used": True, "validation_wape": np.nan, "validation_smape": np.nan}
-    pred_test = croston_forecast(y_train, len(y_test), alpha=float(best["alpha"]), variant=str(best["variant"]))
-    ranked = pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True]).reset_index(drop=True)
-    return {"forecast": pred_test, "method": best["variant"], "alpha": float(best["alpha"]), "search_table": ranked, "fallback_used": False, "validation_wape": safe_float(ranked.loc[0, "val_wape"]), "validation_smape": safe_float(ranked.loc[0, "val_smape"])}
-
-
-def fit_best_arima(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any]) -> Dict[str, Any]:
-    if not HAS_FORECAST_STATSMODELS:
-        raise ImportError("statsmodels ARIMA bileşeni bulunamadı.")
-    y_train = pd.to_numeric(train_df["y"], errors="coerce").fillna(0.0).astype(float)
-    y_test = pd.to_numeric(test_df["y"], errors="coerce").fillna(0.0).astype(float)
-    d = suggest_d_via_stationarity(y_train)
-    tr_inner, val_inner = make_inner_train_val_split(train_df)
-    y_inner = pd.to_numeric(tr_inner["y"], errors="coerce").fillna(0.0).astype(float)
-    y_val = pd.to_numeric(val_inner["y"], errors="coerce").fillna(0.0).astype(float)
-    trend_strength = safe_float(profile.get("trend_strength", np.nan))
-    trend_candidates = ["c", "n"] + (["t"] if pd.notna(trend_strength) and trend_strength >= 0.25 else [])
-    transform_candidates = [choose_target_transform(y_train), {"name": "none", "lambda": None, "shift": 0.0}]
-    rows = []
-    best = None
-    best_score = np.inf
-    for p in range(0, 5):
-        for q in range(0, 5):
-            if p == 0 and q == 0:
-                continue
-            order = (p, d, q)
-            for trend in trend_candidates:
-                for tcfg in transform_candidates:
-                    try:
-                        y_fit, applied = apply_target_transform(y_inner, tcfg)
-                        res = fit_sarimax_model(y_fit, None, order=order, seasonal_order=(0, 0, 0, 0), trend=trend, maxiter=max(60, FORECAST_RUNTIME_CONFIG.sarimax_maxiter_search))
-                        pred_t = res.get_forecast(steps=len(y_val)).predicted_mean
-                        pred = inverse_target_transform(np.asarray(pred_t, dtype=float), applied)
-                        resid = pd.Series(res.resid).dropna()
-                        lb_p = acorr_ljungbox(resid, lags=[min(12, max(2, len(resid)//3))], return_df=True)["lb_pvalue"].iloc[0] if len(resid) >= 8 else np.nan
-                        bias_penalty = abs(float(np.nanmean(resid))) / max(float(np.nanmean(np.abs(y_inner))) or 1.0, 1.0)
-                        asym = compute_asymmetric_validation_penalty(y_val.values, pred, y_inner.values, severity=0.9)
-                        comp = wape(y_val.values, pred) + 0.35 * smape(y_val.values, pred) + (0.50 if pd.notna(lb_p) and lb_p < 0.05 else 0.0) + 0.50 * bias_penalty + asym["penalty"]
-                        rows.append({"transform": applied.get("name","none"), "order": str(order), "trend": trend, "aic": safe_float(getattr(res, "aic", np.nan)), "bic": safe_float(getattr(res, "bic", np.nan)), "ljung_box_pvalue": safe_float(lb_p), "val_wape": wape(y_val.values, pred), "val_smape": smape(y_val.values, pred), "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "composite_score": comp})
-                        if comp < best_score:
-                            best_score = comp
-                            best = {"order": order, "trend": trend, "transform_cfg": applied}
-                    except Exception as e:
-                        rows.append({"transform": tcfg.get("name","none"), "order": str(order), "trend": trend, "aic": np.nan, "bic": np.nan, "ljung_box_pvalue": np.nan, "val_wape": np.nan, "val_smape": np.nan, "composite_score": np.nan, "fit_error": str(e)[:180]})
-    ranked = pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True) if rows else pd.DataFrame()
-    if best is None:
-        pred, method = build_fallback_forecast(y_train, y_test, freq_alias, infer_season_length_from_freq(freq_alias))
-        return {"forecast": pred, "order": (0, d, 0), "trend": "c", "search_table": ranked, "fallback_used": True, "fallback_method": method, "validation_wape": np.nan, "validation_smape": np.nan}
-    y_train_t, applied = apply_target_transform(y_train, best["transform_cfg"])
-    res = fit_sarimax_model(y_train_t, None, order=best["order"], seasonal_order=(0, 0, 0, 0), trend=best["trend"], maxiter=max(120, FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final))
-    pred_t = res.get_forecast(steps=len(y_test)).predicted_mean
-    pred = inverse_target_transform(np.asarray(pred_t, dtype=float), applied)
-    resid = pd.Series(res.resid).dropna()
-    lb_p = acorr_ljungbox(resid, lags=[min(12, max(2, len(resid)//3))], return_df=True)["lb_pvalue"].iloc[0] if len(resid) >= 8 else np.nan
-    return {"forecast": np.maximum(pred, 0.0), "order": best["order"], "trend": best["trend"], "search_table": ranked, "fallback_used": False, "fallback_method": None, "ljung_box_pvalue": safe_float(lb_p), "validation_wape": safe_float(ranked.loc[0, "val_wape"]) if len(ranked) else np.nan, "validation_smape": safe_float(ranked.loc[0, "val_smape"]) if len(ranked) else np.nan}
-
-
-def extract_validation_metrics_from_result(model_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
-    val_w = safe_float(result.get("validation_wape", np.nan))
-    val_s = safe_float(result.get("validation_smape", np.nan))
-    if pd.isna(val_w):
-        stbl = result.get("search_table")
-        if isinstance(stbl, pd.DataFrame) and len(stbl) > 0 and "val_wape" in stbl.columns:
-            tmp = stbl.sort_values(["val_wape", "val_smape"], ascending=[True, True], na_position="last").reset_index(drop=True)
-            val_w = safe_float(tmp.loc[0, "val_wape"])
-            val_s = safe_float(tmp.loc[0, "val_smape"]) if "val_smape" in tmp.columns else np.nan
-    return {"model": model_name, "val_WAPE": val_w, "val_sMAPE": val_s}
-
-
-def run_rolling_origin_backtest_light(df_series: pd.DataFrame, outputs: Dict[str, Any], freq_alias: str, max_folds: int = 3, horizon: int = 3) -> pd.DataFrame:
-    ds = df_series[["ds", "y"]].copy().reset_index(drop=True)
-    h = max(1, int(horizon))
-    min_train = max(24, h * 4) if str(freq_alias).upper() == "M" else max(30, h * 4)
-    rows = []
-    if len(ds) < (min_train + h + 2):
-        return pd.DataFrame(columns=["fold", "model", "WAPE", "sMAPE", "MAE"])
-    fold_ends = []
-    end = len(ds) - h
-    while end >= min_train and len(fold_ends) < max_folds:
-        fold_ends.append(end)
-        end -= h
-    fold_ends = sorted(fold_ends)
-    for fold_no, train_end in enumerate(fold_ends, start=1):
-        tr = ds.iloc[:train_end].copy().reset_index(drop=True)
-        te = ds.iloc[train_end:train_end+h].copy().reset_index(drop=True)
-        actual = te["y"].values.astype(float)
-        model_preds = {}
-        if outputs.get("sarima") and outputs["sarima"].get("order") is not None:
-            try:
-                order = tuple(outputs["sarima"]["order"])
-                seas = tuple(outputs["sarima"]["seasonal_order"])
-                trend = outputs["sarima"].get("trend", "c")
-                res = fit_sarimax_model(pd.to_numeric(tr["y"], errors="coerce").astype(float), None, order=order, seasonal_order=seas, trend=trend, maxiter=max(60, min(FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final, 120)))
-                model_preds["SARIMA/SARIMAX"] = np.maximum(np.asarray(res.get_forecast(steps=len(te)).predicted_mean, dtype=float), 0.0)
-            except Exception:
-                pass
-        if outputs.get("arima") and outputs["arima"].get("order") is not None:
-            try:
-                order = tuple(outputs["arima"]["order"])
-                trend = outputs["arima"].get("trend", "c")
-                res = fit_sarimax_model(pd.to_numeric(tr["y"], errors="coerce").astype(float), None, order=order, seasonal_order=(0,0,0,0), trend=trend, maxiter=max(60, min(FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final, 120)))
-                model_preds["ARIMA"] = np.maximum(np.asarray(res.get_forecast(steps=len(te)).predicted_mean, dtype=float), 0.0)
-            except Exception:
-                pass
-        if outputs.get("intermittent") and outputs["intermittent"].get("method"):
-            try:
-                model_preds["Intermittent"] = croston_forecast(tr["y"], len(te), alpha=float(outputs["intermittent"].get("alpha", 0.1) or 0.1), variant=str(outputs["intermittent"].get("method", "sba")))
-            except Exception:
-                pass
-        for mname, pred in model_preds.items():
-            rows.append({"fold": fold_no, "model": mname, "WAPE": wape(actual, pred), "sMAPE": smape(actual, pred), "MAE": mae(actual, pred)})
-    return pd.DataFrame(rows)
-
-
-def _safe_abs_corr(a: pd.Series, b: pd.Series) -> float:
-    try:
-        aa = pd.to_numeric(a, errors="coerce").astype(float)
-        bb = pd.to_numeric(b, errors="coerce").astype(float)
-        mask = aa.notna() & bb.notna()
-        if int(mask.sum()) < 5:
-            return 0.0
-        corr = np.corrcoef(aa[mask], bb[mask])[0, 1]
-        return float(abs(corr)) if np.isfinite(corr) else 0.0
-    except Exception:
-        return 0.0
-
-
-def reduce_exog_feature_set(
-    exog_train: Optional[pd.DataFrame],
-    exog_test: Optional[pd.DataFrame],
-    y_train: pd.Series,
-    max_cols: int = 3,
-    corr_threshold: float = 0.985
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], List[str], List[str]]:
-    dropped: List[str] = []
-    selected: List[str] = []
-    if exog_train is None or exog_test is None:
-        return exog_train, exog_test, selected, dropped
-    xtr, xte, dropped0 = sanitize_exog_for_sarimax(exog_train, exog_test)
-    dropped.extend(dropped0)
-    if xtr is None or xte is None or len(xtr.columns) == 0:
-        return None, None, selected, dropped
-
-    y_ref = pd.to_numeric(y_train, errors="coerce").astype(float).reset_index(drop=True)
-    score_rows = []
-    for c in xtr.columns:
-        s = pd.to_numeric(xtr[c], errors="coerce").astype(float)
-        score_rows.append({
-            "col": c,
-            "abs_corr": _safe_abs_corr(s, y_ref),
-            "var": safe_float(np.nanvar(s.values))
-        })
-    score_df = pd.DataFrame(score_rows).sort_values(["abs_corr", "var", "col"], ascending=[False, False, True])
-
-    ranked_cols = score_df["col"].tolist()
-    filtered: List[str] = []
-    for c in ranked_cols:
-        if len(filtered) >= max_cols:
-            dropped.append(c)
-            continue
-        too_close = False
-        for kept in filtered:
-            corr = _safe_abs_corr(xtr[c], xtr[kept])
-            if corr >= corr_threshold:
-                too_close = True
-                dropped.append(c)
-                break
-        if not too_close:
-            filtered.append(c)
-
-    if not filtered:
-        return None, None, selected, dropped
-    selected = filtered
-    return xtr[selected].copy(), xte[selected].copy(), selected, dropped
-
-
-
-
-def reduce_ml_feature_set(
-    feature_train: Optional[pd.DataFrame],
-    feature_test: Optional[pd.DataFrame],
-    y_train: pd.Series,
-    max_cols: int = 14,
-    corr_threshold: float = 0.985
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], List[str], List[str]]:
-    dropped: List[str] = []
-    selected: List[str] = []
-    if feature_train is None or feature_test is None:
-        return feature_train, feature_test, selected, dropped
-    if len(feature_train.columns) == 0:
-        return feature_train, feature_test, selected, dropped
-    xtr = feature_train.copy().reset_index(drop=True)
-    xte = feature_test.copy().reset_index(drop=True)
-    keep_numeric = []
-    for c in xtr.columns:
-        s = pd.to_numeric(xtr[c], errors="coerce")
-        if s.notna().sum() < max(5, len(xtr) // 5):
-            dropped.append(c)
-            continue
-        if float(np.nanvar(s.values)) <= 1e-12:
-            dropped.append(c)
-            continue
-        keep_numeric.append(c)
-    if not keep_numeric:
-        return None, None, selected, dropped
-    xtr = xtr[keep_numeric].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    xte = xte[keep_numeric].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_ref = pd.to_numeric(y_train, errors="coerce").astype(float).reset_index(drop=True)
-    score_rows = []
-    for c in xtr.columns:
-        score_rows.append({
-            "col": c,
-            "abs_corr": _safe_abs_corr(xtr[c], y_ref),
-            "var": safe_float(np.nanvar(xtr[c].values))
-        })
-    score_df = pd.DataFrame(score_rows).sort_values(["abs_corr", "var", "col"], ascending=[False, False, True])
-    ranked = score_df["col"].tolist()
-    for c in ranked:
-        if len(selected) >= max_cols:
-            dropped.append(c)
-            continue
-        if any(_safe_abs_corr(xtr[c], xtr[k]) >= corr_threshold for k in selected):
-            dropped.append(c)
-            continue
-        selected.append(c)
-    if not selected:
-        return None, None, [], dropped
-    return xtr[selected].copy(), xte[selected].copy(), selected, dropped
-
-
-
-def build_fast_xgb_regressor(cfg: Dict[str, Any]):
-    params = dict(cfg)
-    prefer_hist_gradient = bool(params.pop("_prefer_hist_gradient", False))
-    if prefer_hist_gradient and SKHistGradientBoostingRegressor is not None and not HAS_XGBOOST:
-        mapped = {
-            "learning_rate": params.get("learning_rate", 0.06),
-            "max_depth": params.get("max_depth", 3),
-            "max_iter": params.get("n_estimators", 64),
-            "max_bins": 128,
-            "l2_regularization": params.get("reg_lambda", 1.0),
-            "min_samples_leaf": max(2, int(params.get("min_child_weight", 1) * 2)),
-            "early_stopping": True,
-            "random_state": 42
-        }
-        return SKHistGradientBoostingRegressor(**mapped)
-    if HAS_XGBOOST:
-        params.setdefault("objective", "reg:squarederror")
-        params.setdefault("random_state", 42)
-        params.setdefault("verbosity", 0)
-        params.setdefault("tree_method", "hist")
-        params.setdefault("max_bin", 128)
-        params.setdefault("eval_metric", "mae")
-        params.setdefault("n_jobs", 1 if FORECAST_RUNTIME_CONFIG.xgb_force_single_thread else max(1, os.cpu_count() or 1))
-        return XGBRegressor(**params)
-    if SKExtraTreesRegressor is not None:
-        return SKExtraTreesRegressor(
-            n_estimators=min(int(params.get("n_estimators", 128)), 256),
-            max_depth=min(int(params.get("max_depth", 4)), 6),
-            random_state=42,
-            n_jobs=1
-        )
-    if SKHistGradientBoostingRegressor is not None:
-        return SKHistGradientBoostingRegressor(
-            learning_rate=params.get("learning_rate", 0.06),
-            max_depth=params.get("max_depth", 3),
-            max_iter=params.get("n_estimators", 64),
-            random_state=42,
-            early_stopping=True
-        )
-    return XGBRegressor(random_state=42)
-
-
-
-def _prepare_xgb_cfg(cfg: Dict[str, Any], train_len: int, freq_alias: str) -> Dict[str, Any]:
-    out = dict(cfg)
-    short_monthly = str(freq_alias).upper() == "M" and train_len <= 96
-    if FORECAST_RUNTIME_CONFIG.xgb_prefer_hist_gradient_on_short_series and short_monthly:
-        out["_prefer_hist_gradient"] = True
-    if short_monthly:
-        out["n_estimators"] = min(int(out.get("n_estimators", 300)), 500)
-        out["max_depth"] = min(int(out.get("max_depth", 3)), 4)
-    return out
-
-
-
-def _select_core_ml_feature_columns(all_cols: List[str], freq_alias: str, train_len: int) -> List[str]:
-    cols = list(all_cols)
-    short_monthly = str(freq_alias).upper() == "M" and train_len <= 96
-    if not short_monthly:
-        return cols
-    preferred = [
-        "lag_1", "lag_2", "lag_3", "lag_6", "lag_12", "lag_18", "seasonal_lag_12",
-        "roll_mean_3", "roll_mean_6", "roll_mean_12",
-        "roll_std_3", "roll_std_6", "roll_std_12",
-        "roll_min_3", "roll_max_3", "roll_min_6", "roll_max_6",
-        "ewm_mean_3", "ewm_mean_6", "ewm_mean_12",
-        "diff_1", "diff_12",
-        "month_sin", "month_cos", "month", "quarter", "year"
-    ]
-    exog_cols = [c for c in cols if str(c).startswith("exog__")][:6]
-    ordered = [c for c in preferred if c in cols] + exog_cols
-    ordered += [c for c in cols if c not in ordered]
-    return ordered[:min(20, len(ordered))]
-
-def should_use_prophet_holidays(freq_alias: str, n_train: int) -> bool:
-    if not FORECAST_RUNTIME_CONFIG.prophet_disable_holidays_for_short_series:
-        return True
-    if str(freq_alias).upper() == "M" and n_train < 84:
-        return False
-    if str(freq_alias).upper() == "W" and n_train < 120:
-        return False
-    return True
-
-
-
-def probe_prophet_backend() -> Tuple[bool, str]:
-    if not HAS_PROPHET:
-        return False, "prophet_package_missing"
-    if not FORECAST_RUNTIME_CONFIG.prophet_probe_backend:
-        return True, "probe_disabled"
-    if _PROPhet_BACKEND_PROBE_CACHE["done"]:
-        return bool(_PROPhet_BACKEND_PROBE_CACHE["ok"]), str(_PROPhet_BACKEND_PROBE_CACHE["message"])
-    try:
-        mini = pd.DataFrame({
-            "ds": pd.date_range("2022-01-01", periods=8, freq="MS"),
-            "y": np.array([10.0, 11.0, 12.5, 12.0, 13.0, 14.0, 13.5, 14.5], dtype=float)
-        })
-        m = Prophet(yearly_seasonality=False, weekly_seasonality=False, daily_seasonality=False)
-        m.fit(mini)
-        future = pd.DataFrame({"ds": pd.date_range("2022-09-01", periods=1, freq="MS")})
-        _ = m.predict(future)
-        ok = True
-        msg = "mini_fit_ok"
-    except Exception as e:
-        ok = False
-        msg = str(e)
-    _PROPhet_BACKEND_PROBE_CACHE["done"] = True
-    _PROPhet_BACKEND_PROBE_CACHE["ok"] = bool(ok)
-    _PROPhet_BACKEND_PROBE_CACHE["message"] = str(msg)
-    return bool(ok), str(msg)
-
-def _build_prophet_style_surrogate_design(
-    base_df: pd.DataFrame,
-    exog_df: Optional[pd.DataFrame],
-    freq_alias: str
-) -> Tuple[pd.DataFrame, List[str]]:
-    df = base_df[["ds", "y"]].copy().reset_index(drop=True)
-    ds = pd.to_datetime(df["ds"])
-    df["t"] = np.arange(len(df), dtype=float)
-    df["t2"] = df["t"] ** 2
-    month = ds.dt.month.fillna(1).astype(int)
-    df["month_sin"] = np.sin(2 * np.pi * month / 12.0)
-    df["month_cos"] = np.cos(2 * np.pi * month / 12.0)
-    quarter = ds.dt.quarter.fillna(1).astype(int)
-    df["quarter_sin"] = np.sin(2 * np.pi * quarter / 4.0)
-    df["quarter_cos"] = np.cos(2 * np.pi * quarter / 4.0)
-    if str(freq_alias).upper() in ["W", "D"]:
-        week = ds.dt.isocalendar().week.astype(int).clip(lower=1)
-        df["week_sin"] = np.sin(2 * np.pi * week / 52.0)
-        df["week_cos"] = np.cos(2 * np.pi * week / 52.0)
-    if str(freq_alias).upper() in ["D", "H"]:
-        dow = ds.dt.dayofweek.astype(int)
-        df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
-        df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
-    if exog_df is not None and len(exog_df.columns) > 0:
-        ex = exog_df.copy().reset_index(drop=True)
-        for c in ex.columns:
-            safe_name = f"reg__{re.sub(r'[^0-9A-Za-z_]+', '_', str(c))}"
-            df[safe_name] = pd.to_numeric(ex[c], errors="coerce")
-    feature_cols = [c for c in df.columns if c not in ["ds", "y"]]
-    return df, feature_cols
-
-
-def fit_prophet_surrogate(
-    train_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    freq_alias: str,
-    exog_train: Optional[pd.DataFrame] = None,
-    exog_test: Optional[pd.DataFrame] = None,
-    reason: str = "prophet_backend_unavailable"
-) -> Dict[str, Any]:
-    y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
-    xtr, xte, used_cols, dropped_cols = reduce_exog_feature_set(
-        exog_train,
-        exog_test,
-        y_train,
-        max_cols=min(FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols, 3)
-    )
-    full_df = pd.concat([train_df[["ds", "y"]], test_df[["ds", "y"]]], axis=0, ignore_index=True)
-    full_exog = None
-    if xtr is not None and xte is not None:
-        full_exog = pd.concat([xtr.reset_index(drop=True), xte.reset_index(drop=True)], axis=0, ignore_index=True)
-    design, feature_cols = _build_prophet_style_surrogate_design(full_df, full_exog, freq_alias)
-    train_cut = len(train_df)
-    X_train = design.iloc[:train_cut][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_train_arr = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0).values
-    X_test = design.iloc[train_cut:train_cut + len(test_df)][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    tr_inner, val_inner = make_inner_train_val_split(train_df)
-    inner_cut = len(tr_inner)
-    inner_design = design.iloc[:len(train_df)].copy().reset_index(drop=True)
-    X_inner_tr = inner_design.iloc[:inner_cut][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_inner_tr = pd.to_numeric(tr_inner["y"], errors="coerce").astype(float).fillna(0.0).values
-    X_inner_val = inner_design.iloc[inner_cut:inner_cut + len(val_inner)][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_inner_val = pd.to_numeric(val_inner["y"], errors="coerce").astype(float).fillna(0.0).values
-
-    alpha_grid = [0.1, 1.0, 5.0, 10.0]
-    rows = []
-    best_alpha = 1.0
-    best_score = np.inf
-    for alpha in alpha_grid:
-        try:
-            if Ridge is not None:
-                mdl = Ridge(alpha=alpha, random_state=42)
-            else:
-                raise RuntimeError("ridge_unavailable")
-            mdl.fit(X_inner_tr.values, y_inner_tr)
-            pred_val = np.maximum(np.asarray(mdl.predict(X_inner_val.values), dtype=float), 0.0)
-            val_w = wape(y_inner_val, pred_val)
-            val_s = smape(y_inner_val, pred_val)
-            comp = float(val_w + 0.35 * val_s + 0.01 * alpha)
-            rows.append({"alpha": alpha, "val_wape": val_w, "val_smape": val_s, "composite_score": comp})
-            if comp < best_score:
-                best_score = comp
-                best_alpha = alpha
-        except Exception as e:
-            rows.append({"alpha": alpha, "val_wape": np.nan, "val_smape": np.nan, "composite_score": np.nan, "fit_error": str(e)[:200]})
-
-    if Ridge is not None:
-        final_model = Ridge(alpha=best_alpha, random_state=42)
-        final_model.fit(X_train.values, y_train_arr)
-        pred = np.maximum(np.asarray(final_model.predict(X_test.values), dtype=float), 0.0)
-    else:
-        pred, fb_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, infer_season_length_from_freq(freq_alias))
-        final_model = None
-        reason = f"{reason}|ridge_missing|{fb_name}"
-
-    fc = test_df[["ds", "y"]].copy().reset_index(drop=True)
-    fc["yhat"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    if len(fc):
-        fc["trend"] = np.linspace(float(y_train_arr[0]) if len(y_train_arr) else 0.0, float(y_train_arr[-1]) if len(y_train_arr) else 0.0, num=len(fc))
-        fc["yearly"] = fc["yhat"] - fc["trend"]
-    else:
-        fc["trend"] = []
-        fc["yearly"] = []
-    return {
-        "model": final_model,
-        "forecast_df": fc,
-        "forecast": np.maximum(np.asarray(fc["yhat"].values, dtype=float), 0.0),
-        "config": {"mode": "prophet_style_ridge", "alpha": best_alpha},
-        "selected_plan": {"plan_name": "prophet_surrogate", "reason": reason},
-        "component_validation": {
-            "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if len(fc) else np.nan,
-            "seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if len(fc) else np.nan,
-            "seasonality_present": True,
-            "used_exog_cols": list(xtr.columns) if xtr is not None else [],
-            "dropped_exog_cols": sorted(set(dropped_cols)),
-            "final_retry_used": True,
-            "rename_map": {},
-            "fit_error_samples": [str(reason)]
-        },
-        "used_exog_cols": list(xtr.columns) if xtr is not None else [],
-        "dropped_exog_cols": sorted(set(dropped_cols)),
-        "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
-        "fallback_used": True,
-        "fallback_method": "prophet_style_ridge",
-        "fit_mode": "vekil_prophet_fallback",
-        "fit_visibility_note": "Gerçek Prophet fit başarısız oldu; güvenli vekil Prophet (ridge tabanlı) kullanıldı.",
-        "error": str(reason)
-    }
-
-
-
-def build_runtime_guardrail_notes(freq_alias: str, n_train: int, horizon: int, stat_exog_cols: List[str], prophet_exog_cols: List[str]) -> List[str]:
-    notes: List[str] = []
-    if not FORECAST_RUNTIME_CONFIG.interactive_fast_mode:
-        notes.append("Doğruluk modu aktif: arama uzayı korunur; kısa serilerde yalnızca validation-temelli adaptif düzenlileştirme uygulanır.")
-    if str(freq_alias).upper() == "M" and n_train <= 72:
-        notes.append("Kısa aylık seri: bu bir kısıtlama değil, overfit önleyici adaptif güvenlik katmanıdır.")
-    if len(stat_exog_cols) > FORECAST_RUNTIME_CONFIG.sarimax_max_exog_cols:
-        notes.append(f"SARIMAX için exog adayları skorlanır; en sinyalli ilk {FORECAST_RUNTIME_CONFIG.sarimax_max_exog_cols} kolon kullanılır.")
-    if len(prophet_exog_cols) > FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols:
-        notes.append(f"Prophet için regressor adayları skorlanır; en sinyalli ilk {FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols} kolon kullanılır.")
-    notes.append(f"XGBoost tarafında leakage-safe feature seçimi yapılır; en fazla {FORECAST_RUNTIME_CONFIG.xgb_max_feature_cols} kolon validation-temelli olarak kullanılır.")
-    return notes
-
-
-def build_stage_timer_rows(stage_timings: Dict[str, float]) -> pd.DataFrame:
-    return pd.DataFrame([
-        {"stage": k, "seconds": round(float(v), 4)} for k, v in stage_timings.items()
-    ])
-
+            grid.append({"p": p, "q": q, "P": 0, "Q": 0, "m": 0})
+    return grid
 
 
 def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if not HAS_FORECAST_STATSMODELS:
         raise ImportError("statsmodels forecast bileşenleri bulunamadı.")
-
-    cache_key = build_search_signature(
-        "sarimax_exact_search",
-        freq_alias,
-        train_df,
-        test_df,
-        profile=profile,
-        exog_train=exog_train,
-        exog_test=exog_test,
-        extra={
-            "max_candidates": FORECAST_RUNTIME_CONFIG.sarimax_max_candidates,
-            "maxiter_search": FORECAST_RUNTIME_CONFIG.sarimax_maxiter_search,
-            "maxiter_final": FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final,
-            "walk_forward": FORECAST_RUNTIME_CONFIG.sarimax_enable_walk_forward_refit,
-        }
-    )
-    cached = SEARCH_ACCELERATOR.get_result(cache_key)
-    if cached is not None:
-        cached["search_accelerator_cache_hit"] = True
-        return cached
-
-    start_ts = time.perf_counter()
-    y_train_raw = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
-    y_test_raw = pd.to_numeric(test_df["y"], errors="coerce").astype(float).fillna(0.0)
+    y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float)
+    y_test = pd.to_numeric(test_df["y"], errors="coerce").astype(float)
+    d = suggest_d_via_stationarity(y_train)
+    D = suggest_D_via_profile(profile, infer_season_length_from_freq(freq_alias), len(y_train))
     season_length = infer_season_length_from_freq(freq_alias)
-    strong_seasonality = safe_float(profile.get("seasonality_strength", np.nan))
-    trend_strength = safe_float(profile.get("trend_strength", np.nan))
 
-    d = suggest_d_via_stationarity(y_train_raw)
-    D = suggest_D_via_profile(profile, season_length, len(y_train_raw))
-
-    exog_bundle_key = build_search_signature(
-        "sarimax_exog_bundle", freq_alias, train_df, test_df, profile=profile, exog_train=exog_train, exog_test=exog_test,
-        extra={"max_cols": FORECAST_RUNTIME_CONFIG.sarimax_max_exog_cols}
-    )
-    xtr, xte, used_exog_cols, dropped_exog = SEARCH_ACCELERATOR.get_or_compute_artifact(
-        exog_bundle_key,
-        lambda: reduce_exog_feature_set(exog_train, exog_test, y_train_raw, max_cols=FORECAST_RUNTIME_CONFIG.sarimax_max_exog_cols)
-    )
-
-    if pd.notna(strong_seasonality) and strong_seasonality < 0.15:
-        season_length = 1
-        D = 0
-
-    grid = build_sarimax_grid(freq_alias, profile, len(y_train_raw))
-    candidates = prioritize_sarimax_candidates(grid, profile, FORECAST_RUNTIME_CONFIG.sarimax_max_candidates)
-
-    transform_candidates = [choose_target_transform(y_train_raw), {"name": "none", "lambda": None, "shift": 0.0}]
-    if (y_train_raw > 0).all():
-        transform_candidates.append({"name": "log1p", "lambda": None, "shift": 0.0})
-    dedup_transforms = []
-    seen_transforms = set()
-    for cfg in transform_candidates:
-        key = (cfg.get("name"), safe_float(cfg.get("lambda")), safe_float(cfg.get("shift")))
-        if key not in seen_transforms:
-            seen_transforms.add(key)
-            dedup_transforms.append(cfg)
-
-    split_key = build_search_signature("sarimax_inner_split", freq_alias, train_df, test_df, profile=profile)
-    tr_inner_raw, val_inner_raw = SEARCH_ACCELERATOR.get_or_compute_artifact(split_key, lambda: make_inner_train_val_split(train_df))
-    y_inner = pd.to_numeric(tr_inner_raw["y"], errors="coerce").astype(float).fillna(0.0)
-    y_val = pd.to_numeric(val_inner_raw["y"], errors="coerce").astype(float).fillna(0.0)
-    if xtr is not None:
-        exog_inner_train = xtr.iloc[:len(tr_inner_raw)].copy().reset_index(drop=True)
-        exog_inner_val = xtr.iloc[len(tr_inner_raw):len(tr_inner_raw) + len(val_inner_raw)].copy().reset_index(drop=True)
-    else:
-        exog_inner_train = None
-        exog_inner_val = None
-
-    trend_candidates = ["c", "n"] + (["t"] if pd.notna(trend_strength) and trend_strength >= 0.25 else [])
-    search_budget = FORECAST_RUNTIME_CONFIG.sarimax_search_wall_seconds
-
-    jobs: List[Dict[str, Any]] = []
-    for cand_idx, cand in enumerate(candidates):
-        if (time.perf_counter() - start_ts) > search_budget and jobs:
-            break
-        p, q, P, Q, m = cand["p"], cand["q"], cand["P"], cand["Q"], cand["m"]
-        order = (p, d, q)
-        seasonal_order = (P, D if m > 1 else 0, Q, m if m > 1 else 0)
-        exog_modes = [False] if xtr is None else ([False, True] if cand_idx < FORECAST_RUNTIME_CONFIG.sarimax_search_with_exog_top_n else [False])
-        for transform_cfg in dedup_transforms:
-            for trend_spec in trend_candidates:
-                for use_exog in exog_modes:
-                    jobs.append({
-                        "order": order,
-                        "seasonal_order": seasonal_order,
-                        "transform_cfg": transform_cfg,
-                        "trend": trend_spec,
-                        "use_exog": bool(use_exog)
-                    })
-
-    def _evaluate_sarimax_job(job: Dict[str, Any]) -> Dict[str, Any]:
-        order = job["order"]
-        seasonal_order = job["seasonal_order"]
-        applied_cfg = job["transform_cfg"]
-        trend_spec = job["trend"]
-        use_exog = bool(job["use_exog"])
-        exog_fit = exog_inner_train if use_exog else None
-        exog_val = exog_inner_val if use_exog else None
-        try:
-            y_fit_inner, applied_cfg = apply_target_transform(y_inner, applied_cfg)
-            res = fit_sarimax_model(
-                y_fit_inner,
-                exog_fit,
-                order=order,
-                seasonal_order=seasonal_order,
-                trend=trend_spec,
-                maxiter=FORECAST_RUNTIME_CONFIG.sarimax_maxiter_search
-            )
-            pred_t = res.get_forecast(steps=len(y_val), exog=exog_val).predicted_mean
-            pred = inverse_target_transform(np.asarray(pred_t, dtype=float), applied_cfg)
-            pred = np.maximum(pred, 0.0)
-            val_wape = wape(y_val.values, pred)
-            val_smape = smape(y_val.values, pred)
-            aic = safe_float(getattr(res, "aic", np.nan))
-            bic = safe_float(getattr(res, "bic", np.nan))
-            complexity_penalty = 0.12 * sum([order[0], order[2], seasonal_order[0], seasonal_order[2]])
-            exog_penalty = 0.05 * (len(used_exog_cols) if use_exog else 0)
-            residual_penalty = 0.0
-            try:
-                resid = pd.Series(res.resid).dropna()
-                if len(resid) >= 8:
-                    lb_p = acorr_ljungbox(resid, lags=[min(12, max(2, len(resid) // 3))], return_df=True)["lb_pvalue"].iloc[0]
-                    resid_mean = safe_float(resid.mean())
-                    resid_scale = max(safe_float(np.abs(y_inner).mean()), 1.0)
-                    bias_penalty = min(abs(resid_mean) / resid_scale, 1.0)
-                    residual_penalty = (0.60 if pd.notna(lb_p) and lb_p < 0.05 else 0.0) + 0.50 * bias_penalty
-                else:
-                    lb_p = np.nan
-                    bias_penalty = 0.0
-            except Exception:
-                lb_p = np.nan
-                bias_penalty = 0.0
-            asym = compute_asymmetric_validation_penalty(y_val.values, pred, y_inner.values, severity=0.9)
-            composite = float(val_wape + 0.35 * val_smape + complexity_penalty + exog_penalty + residual_penalty + asym["penalty"])
-            row = {
-                "transform": applied_cfg.get("name", "none"),
-                "order": str(order),
-                "seasonal_order": str(seasonal_order),
-                "trend": trend_spec,
-                "exog_mode": "with_exog" if use_exog else "without_exog",
-                "aic": aic,
-                "bic": bic,
-                "ljung_box_pvalue": safe_float(lb_p),
-                "residual_bias_penalty": safe_float(bias_penalty),
-                "val_wape": val_wape,
-                "val_smape": val_smape,
-                "bias_pct": asym["bias_pct"],
-                "under_forecast_rate": asym["under_forecast_rate"],
-                "peak_event_score": asym["peak_event_score"],
-                "composite_score": composite
-            }
-            return {"row": row, "composite": composite, "best": {"order": order, "seasonal_order": seasonal_order, "trend": trend_spec, "transform_cfg": applied_cfg, "use_exog": bool(use_exog)}}
-        except Exception as e:
-            row = {
-                "transform": applied_cfg.get("name", "none"),
-                "order": str(order),
-                "seasonal_order": str(seasonal_order),
-                "trend": trend_spec,
-                "exog_mode": "with_exog" if use_exog else "without_exog",
-                "aic": np.nan,
-                "bic": np.nan,
-                "val_wape": np.nan,
-                "val_smape": np.nan,
-                "composite_score": np.nan,
-                "fit_error": str(e)[:200]
-            }
-            return {"row": row, "composite": np.inf, "best": None}
-
-    search_rows: List[Dict[str, Any]] = []
     best = None
     best_score = np.inf
-    results = SEARCH_ACCELERATOR.parallel_map(_evaluate_sarimax_job, jobs, max_workers=FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers)
-    for item in results:
-        search_rows.append(item["row"])
-        if item["best"] is not None and np.isfinite(item["composite"]) and item["composite"] < best_score:
-            best_score = item["composite"]
-            best = item["best"]
-
-    if best is None:
-        fallback_pred, fallback_name = build_fallback_forecast(y_train_raw, y_test_raw, freq_alias, infer_season_length_from_freq(freq_alias))
-        result = {
-            "model": None,
-            "forecast": fallback_pred,
-            "static_forecast": fallback_pred.copy(),
-            "order": (0, d, 0),
-            "seasonal_order": (0, D if season_length > 1 else 0, 0, season_length if season_length > 1 else 0),
-            "aic": np.nan,
-            "bic": np.nan,
-            "ljung_box_pvalue": np.nan,
-            "d": d,
-            "D": D,
-            "transform": "none",
-            "residual_mean": np.nan,
-            "residual_std": np.nan,
-            "residual_white_noise_ok": False,
-            "search_table": pd.DataFrame(search_rows),
-            "fallback_used": True,
-            "fallback_method": fallback_name,
-            "used_exog": False,
-            "used_exog_cols": [],
-            "trend": "c",
-            "dropped_exog_cols": dropped_exog,
-            "search_accelerator_cache_hit": False,
-        }
-        SEARCH_ACCELERATOR.put_result(cache_key, result)
-        return result
-
-    final_exog_train = xtr if best.get("use_exog") else None
-    final_exog_test = xte if best.get("use_exog") else None
-    y_train_t, applied_cfg = apply_target_transform(y_train_raw, best["transform_cfg"])
-
-    try:
-        final_res = fit_sarimax_model(
-            y_train_t,
-            final_exog_train,
-            order=best["order"],
-            seasonal_order=best["seasonal_order"],
-            trend=best.get("trend", "c"),
-            maxiter=FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final
-        )
-        pred_t = final_res.get_forecast(steps=len(y_test_raw), exog=final_exog_test).predicted_mean
-        pred_static = inverse_target_transform(np.asarray(pred_t, dtype=float), applied_cfg)
-        pred_static = np.maximum(pred_static, 0.0)
-        pred = pred_static.copy()
-        resid = pd.Series(final_res.resid).dropna()
+    tried = []
+    for cfg in build_sarimax_grid(freq_alias, profile, len(y_train)):
+        p, q, P, Q, m = cfg["p"], cfg["q"], cfg["P"], cfg["Q"], cfg["m"]
+        seasonal_order = (P, D if m > 1 else 0, Q, m if m > 1 else 0)
+        order = (p, d, q)
         try:
-            lb_p = acorr_ljungbox(resid, lags=[min(12, max(2, len(resid) // 3))], return_df=True)["lb_pvalue"].iloc[0]
+            model = SARIMAX(
+                y_train,
+                exog=exog_train,
+                order=order,
+                seasonal_order=seasonal_order,
+                trend="c",
+                enforce_stationarity=False,
+                enforce_invertibility=False
+            )
+            res = model.fit(disp=False)
+            pred = res.get_forecast(steps=len(y_test), exog=exog_test).predicted_mean
+            pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+            score = wape(y_test.values, pred)
+            tried.append({
+                "order": str(order),
+                "seasonal_order": str(seasonal_order),
+                "aic": safe_float(getattr(res, "aic", np.nan)),
+                "bic": safe_float(getattr(res, "bic", np.nan)),
+                "wape": score,
+                "smape": smape(y_test.values, pred)
+            })
+            if score < best_score:
+                resid = pd.Series(res.resid).dropna()
+                try:
+                    lb_p = acorr_ljungbox(resid, lags=[min(10, max(2, len(resid) // 3))], return_df=True)["lb_pvalue"].iloc[0]
+                except Exception:
+                    lb_p = np.nan
+                best_score = score
+                best = {
+                    "model": res,
+                    "forecast": pred,
+                    "order": order,
+                    "seasonal_order": seasonal_order,
+                    "aic": safe_float(getattr(res, "aic", np.nan)),
+                    "bic": safe_float(getattr(res, "bic", np.nan)),
+                    "ljung_box_pvalue": safe_float(lb_p),
+                    "d": d,
+                    "D": D,
+                    "search_table": pd.DataFrame(tried)
+                }
         except Exception:
-            lb_p = np.nan
+            continue
+    if best is None:
+        raise RuntimeError("Uygun SARIMA/SARIMAX modeli kurulamadı.")
+    return best
 
-        if FORECAST_RUNTIME_CONFIG.sarimax_enable_walk_forward_refit:
-            try:
-                pred_wf = walk_forward_refit_sarimax(
-                    history_y=y_train_raw,
-                    future_y=y_test_raw,
-                    order=best["order"],
-                    seasonal_order=best["seasonal_order"],
-                    exog_hist=final_exog_train,
-                    exog_future=final_exog_test,
-                    maxiter=max(20, min(FORECAST_RUNTIME_CONFIG.sarimax_maxiter_final, 40))
-                )
-                if wape(y_test_raw.values, pred_wf) <= wape(y_test_raw.values, pred_static):
-                    pred = np.maximum(np.asarray(pred_wf, dtype=float), 0.0)
-            except Exception:
-                pass
 
-        result = {
-            "model": final_res,
-            "forecast": pred,
-            "static_forecast": pred_static.copy(),
-            "order": best["order"],
-            "seasonal_order": best["seasonal_order"],
-            "aic": safe_float(getattr(final_res, "aic", np.nan)),
-            "bic": safe_float(getattr(final_res, "bic", np.nan)),
-            "ljung_box_pvalue": safe_float(lb_p),
-            "d": d,
-            "D": D,
-            "transform": applied_cfg.get("name", "none"),
-            "residual_mean": safe_float(resid.mean()),
-            "residual_std": safe_float(resid.std()),
-            "residual_white_noise_ok": bool(pd.notna(lb_p) and lb_p > 0.05),
-            "search_table": pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape", "aic"], ascending=[True, True, True], na_position="last").reset_index(drop=True),
-            "fallback_used": False,
-            "fallback_method": None,
-            "used_exog": bool(best.get("use_exog")),
-            "used_exog_cols": list(final_exog_train.columns) if final_exog_train is not None else [],
-            "trend": best.get("trend", "c"),
-            "dropped_exog_cols": dropped_exog,
-            "benchmark_override": False,
-            "search_accelerator_cache_hit": False,
-        }
-        SEARCH_ACCELERATOR.put_result(cache_key, result)
-        return result
-    except Exception:
-        fallback_pred, fallback_name = build_fallback_forecast(y_train_raw, y_test_raw, freq_alias, infer_season_length_from_freq(freq_alias))
-        result = {
-            "model": None,
-            "forecast": fallback_pred,
-            "static_forecast": fallback_pred.copy(),
-            "order": best["order"],
-            "seasonal_order": best["seasonal_order"],
-            "aic": np.nan,
-            "bic": np.nan,
-            "ljung_box_pvalue": np.nan,
-            "d": d,
-            "D": D,
-            "transform": applied_cfg.get("name", "none"),
-            "residual_mean": np.nan,
-            "residual_std": np.nan,
-            "residual_white_noise_ok": False,
-            "search_table": pd.DataFrame(search_rows),
-            "fallback_used": True,
-            "fallback_method": fallback_name,
-            "used_exog": bool(best.get("use_exog")),
-            "used_exog_cols": list(final_exog_train.columns) if final_exog_train is not None else [],
-            "trend": best.get("trend", "c"),
-            "dropped_exog_cols": dropped_exog,
-            "search_accelerator_cache_hit": False,
-        }
-        SEARCH_ACCELERATOR.put_result(cache_key, result)
-        return result
+def make_prophet_features(train_df: pd.DataFrame, test_df: pd.DataFrame, exog_train: Optional[pd.DataFrame], exog_test: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    tr = train_df[["ds", "y"]].copy()
+    te = test_df[["ds", "y"]].copy()
+    used = []
+    if exog_train is not None and exog_test is not None and len(exog_train.columns) > 0:
+        for c in exog_train.columns:
+            tr[c] = pd.to_numeric(exog_train[c], errors="coerce").values
+            te[c] = pd.to_numeric(exog_test[c], errors="coerce").values
+            used.append(c)
+    return tr, te, used
+
 
 def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
     if not HAS_PROPHET:
-        return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason="prophet_package_missing")
-    if str(freq_alias).upper() == "W":
-        seasonality_strength = safe_float((profile or {}).get("seasonality_strength", np.nan))
-        trend_strength = safe_float((profile or {}).get("trend_strength", np.nan))
-        if len(train_df) < 104 or (pd.notna(seasonality_strength) and seasonality_strength < 0.12 and pd.notna(trend_strength) and trend_strength < 0.08):
-            result = fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason="weekly_prophet_hard_disable")
-            result["fit_mode"] = "haftalıkta_prophet_kapatıldı"
-            result["fit_visibility_note"] = "Haftalık frekansta kısa/zayıf sinyalli seri için Prophet otomatik kapatıldı; güvenli vekil model kullanıldı."
-            return result
-    cache_key = build_search_signature("prophet_exact_search", freq_alias, train_df, test_df, profile=profile, exog_train=exog_train, exog_test=exog_test, extra={"max_configs": FORECAST_RUNTIME_CONFIG.prophet_max_configs})
-    cached = SEARCH_ACCELERATOR.get_result(cache_key)
-    if cached is not None:
-        cached["search_accelerator_cache_hit"] = True
-        return cached
-    backend_ok, backend_msg = probe_prophet_backend()
-    backend_probe_note = None if backend_ok else f"prophet_backend_probe_failed:{backend_msg}"
-    y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).fillna(0.0)
-    season_length = infer_season_length_from_freq(freq_alias)
-    prop_xtr, prop_xte, _used_exog_cols, dropped_exog = reduce_exog_feature_set(exog_train, exog_test, y_train, max_cols=FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols)
-    tr_full, te_full, exog_cols, prep_dropped, rename_map = _prepare_prophet_design_matrices(train_df, test_df, prop_xtr, prop_xte)
-    dropped_exog.extend(prep_dropped)
-    tr_inner_raw, val_inner_raw = make_inner_train_val_split(train_df)
-    inner_xtr = prop_xtr.iloc[:len(tr_inner_raw)].copy() if prop_xtr is not None else None
-    inner_xva = prop_xtr.iloc[len(tr_inner_raw):len(tr_inner_raw)+len(val_inner_raw)].copy() if prop_xtr is not None else None
-    tr, val, inner_exog_cols, inner_dropped, _ = _prepare_prophet_design_matrices(tr_inner_raw, val_inner_raw, inner_xtr, inner_xva)
-    dropped_exog.extend(inner_dropped)
+        raise ImportError("prophet paketi bulunamadı.")
+    tr, te, exog_cols = make_prophet_features(train_df, test_df, exog_train, exog_test)
     seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
-    strictly_positive = bool((y_train > 0).all())
-    mode_candidates = ["additive"] + (["multiplicative"] if strictly_positive and (pd.isna(seasonality_strength) or seasonality_strength >= 0.20) else [])
-    transform_candidates = [choose_target_transform(y_train), {"name": "none", "lambda": None, "shift": 0.0}]
-    cps_candidates = [0.005, 0.01, 0.03, 0.08, 0.15, 0.30]
-    sps_candidates = [0.1, 0.5, 1.0, 3.0, 8.0]
-    cp_range_candidates = [0.80, 0.90, 0.95]
-    ncp_candidates = [5, 8, 12, 20, 25] if len(train_df) >= 48 else [3, 5, 8, 12]
-    use_holidays = should_use_prophet_holidays(freq_alias, len(train_df))
-    plans = []
+    mode_candidates = ["multiplicative", "additive"] if pd.notna(seasonality_strength) and seasonality_strength >= 0.35 else ["additive", "multiplicative"]
+    configs = []
     for mode in mode_candidates:
-        for cps in cps_candidates:
-            for sps in sps_candidates:
-                for cp_range in cp_range_candidates:
-                    for ncp in ncp_candidates:
-                        cfg = {"seasonality_mode": mode, "changepoint_prior_scale": cps, "seasonality_prior_scale": sps, "changepoint_range": cp_range, "n_changepoints": ncp, "growth": "linear"}
-                        for tf in transform_candidates:
-                            plans.append({"cfg": cfg, "transform_cfg": tf, "use_exog": len(inner_exog_cols) > 0, "use_holidays": use_holidays, "add_custom_seasonality": True, "plan_name": "primary"})
-                            if len(inner_exog_cols) > 0:
-                                plans.append({"cfg": cfg, "transform_cfg": tf, "use_exog": False, "use_holidays": use_holidays, "add_custom_seasonality": True, "plan_name": "no_exog_retry"})
-    deduped_plans=[]; seen=set()
-    for plan in plans:
-        key=(plan["cfg"]["seasonality_mode"], float(plan["cfg"]["changepoint_prior_scale"]), float(plan["cfg"]["seasonality_prior_scale"]), float(plan["cfg"]["changepoint_range"]), int(plan["cfg"]["n_changepoints"]), plan["transform_cfg"].get("name","none"), bool(plan["use_exog"]), bool(plan["use_holidays"]))
-        if key not in seen:
-            seen.add(key); deduped_plans.append(plan)
-    deduped_plans = deduped_plans[:max(8, FORECAST_RUNTIME_CONFIG.prophet_max_configs * 4)]
-    rows=[]; fit_errors=[]; best=None; best_score=np.inf
-    if backend_probe_note:
-        fit_errors.append(backend_probe_note)
-    for plan in deduped_plans:
-        cfg=plan["cfg"]; cols_now=inner_exog_cols if plan["use_exog"] else []
+        for cps in [0.01, 0.05, 0.2]:
+            for sps in [1.0, 5.0, 10.0]:
+                configs.append({"seasonality_mode": mode, "changepoint_prior_scale": cps, "seasonality_prior_scale": sps})
+    configs = configs[:10]
+    best = None
+    best_score = np.inf
+    rows = []
+    for cfg in configs:
         try:
-            _, _, pred = _fit_predict_prophet_once(tr.copy(), val.copy(), freq_alias, cfg, cols_now, use_holidays=plan["use_holidays"], add_custom_seasonality=plan["add_custom_seasonality"], transform_cfg=plan["transform_cfg"])
-            baseline_pred, baseline_name = build_fallback_forecast(tr["y"], val["y"], freq_alias, season_length)
-            best_local_score=np.inf; best_alpha=1.0; best_post={"name":"raw"}; best_w=np.inf; best_s=np.inf
-            for alpha in [0.15,0.35,0.50,0.65,0.80,1.0]:
-                blend=np.maximum(alpha*np.asarray(pred,dtype=float)+(1-alpha)*np.asarray(baseline_pred,dtype=float),0.0)
-                corrected, post_cfg = compute_validation_postprocess_candidates(val["y"].values, blend, tr["y"], season_length)
-                val_w=wape(val["y"].values, corrected); val_s=smape(val["y"].values, corrected)
-                asym = compute_asymmetric_validation_penalty(val["y"].values, corrected, tr["y"].values, severity=1.0)
-                score=val_w+0.35*val_s+asym["penalty"]
-                if score < best_local_score:
-                    best_local_score=score; best_alpha=alpha; best_post=post_cfg; best_w=val_w; best_s=val_s
-            composite=best_local_score + 0.03*len(cols_now) + (0.03 if plan["transform_cfg"].get("name") != "none" else 0.0)
-            rows.append({**cfg,"transform":plan["transform_cfg"].get("name","none"),"plan_name":plan["plan_name"],"use_exog":bool(cols_now),"use_holidays":bool(plan["use_holidays"]),"custom_seasonality":bool(plan["add_custom_seasonality"]),"blend_alpha":best_alpha,"blend_baseline":baseline_name,"postprocess":best_post.get("name","raw"),"val_wape":best_w,"val_smape":best_s,"composite_score":composite})
-            if composite < best_score:
-                best_score=composite; best={"cfg":dict(cfg),"transform_cfg":dict(plan["transform_cfg"]),"use_exog":bool(cols_now),"use_holidays":bool(plan["use_holidays"]),"add_custom_seasonality":bool(plan["add_custom_seasonality"]),"blend_alpha":best_alpha,"blend_baseline":baseline_name,"postprocess_cfg":best_post,"validation_wape":best_w,"validation_smape":best_s}
-        except Exception as e:
-            fit_errors.append(str(e)); rows.append({**cfg,"transform":plan["transform_cfg"].get("name","none"),"plan_name":plan["plan_name"],"use_exog":bool(cols_now),"use_holidays":bool(plan["use_holidays"]),"custom_seasonality":bool(plan["add_custom_seasonality"]),"val_wape":np.nan,"val_smape":np.nan,"composite_score":np.nan,"fit_error":str(e)[:250]})
-    if best is None:
-        fallback_reason = backend_probe_note or "prophet_search_failed"
-        result = fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=fallback_reason)
-        result["search_accelerator_cache_hit"] = False
-        SEARCH_ACCELERATOR.put_result(cache_key, result)
-        return result
-    final_cols = exog_cols if best["use_exog"] else []
-    final_retry_used = False
-    final_retry_notes: List[str] = []
-    try:
-        m, fc, pred = _fit_predict_prophet_once(tr_full.copy(), te_full.copy(), freq_alias, best["cfg"], final_cols, use_holidays=best["use_holidays"], add_custom_seasonality=best["add_custom_seasonality"], transform_cfg=best["transform_cfg"])
-    except Exception as e_final:
-        final_retry_notes.append(f"primary_final:{e_final}")
-        retry_cfg = dict(best["cfg"])
-        retry_cfg["seasonality_mode"] = "additive"
-        retry_cfg["changepoint_prior_scale"] = min(float(retry_cfg.get("changepoint_prior_scale", 0.05)), 0.10)
-        retry_cfg["seasonality_prior_scale"] = min(float(retry_cfg.get("seasonality_prior_scale", 5.0)), 3.0)
-        retry_cfg["n_changepoints"] = min(int(retry_cfg.get("n_changepoints", 8)), max(3, min(8, len(tr_full) // 2)))
-        retry_transform = {"name": "none", "lambda": None, "shift": 0.0}
-        try:
-            m, fc, pred = _fit_predict_prophet_once(
-                tr_full.copy(),
-                te_full.copy(),
-                freq_alias,
-                retry_cfg,
-                [],
-                use_holidays=False,
-                add_custom_seasonality=False,
-                transform_cfg=retry_transform
+            m = Prophet(
+                yearly_seasonality=(freq_alias == "M"),
+                weekly_seasonality=(freq_alias == "D"),
+                daily_seasonality=(freq_alias == "H"),
+                seasonality_mode=cfg["seasonality_mode"],
+                changepoint_prior_scale=cfg["changepoint_prior_scale"],
+                seasonality_prior_scale=cfg["seasonality_prior_scale"]
             )
-            best["cfg"] = retry_cfg
-            best["use_exog"] = False
-            best["use_holidays"] = False
-            best["add_custom_seasonality"] = False
-            best["transform_cfg"] = retry_transform
-            final_cols = []
-            final_retry_used = True
-        except Exception as e_retry:
-            final_retry_notes.append(f"final_simplified_retry:{e_retry}")
-            fallback_reason = backend_probe_note or "prophet_final_failed"
-            result = fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=f"{fallback_reason}|{'|'.join(final_retry_notes)}")
-            result["search_accelerator_cache_hit"] = False
-            SEARCH_ACCELERATOR.put_result(cache_key, result)
-            return result
-    baseline_test_pred = forecast_with_baseline_name(train_df["y"], len(test_df), freq_alias, season_length, str(best.get("blend_baseline", "last_value")))
-    alpha=float(best.get("blend_alpha",1.0))
-    pred=np.maximum(alpha*np.asarray(pred,dtype=float)+(1-alpha)*np.asarray(baseline_test_pred,dtype=float),0.0)
-    pred=apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
-    if "yhat" in fc: fc["yhat"]=pred
-    fit_error_samples = (fit_errors + final_retry_notes)[:8]
-    comp_summary={"trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,"seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if "yearly" in fc else np.nan,"seasonality_present": bool("yearly" in fc or "weekly" in fc),"used_exog_cols": final_cols,"dropped_exog_cols": sorted(set(dropped_exog)),"final_retry_used": final_retry_used,"rename_map": rename_map,"fit_error_samples": fit_error_samples,"blend_alpha": alpha,"blend_baseline": best.get("blend_baseline"),"postprocess": best.get("postprocess_cfg", {}),"backend_probe_status": "ok" if backend_ok else "probe_failed_but_fit_retried"}
-    fit_visibility_note = "Gerçek Prophet modeli başarıyla kuruldu ve tahmin üretildi."
-    if final_retry_used:
-        fit_visibility_note = "Gerçek Prophet modeli basitleştirilmiş son deneme ile kuruldu; vekil modele düşmeden tahmin üretildi."
-    elif backend_probe_note:
-        fit_visibility_note = "Prophet backend ön kontrolü sorun verdi; buna rağmen gerçek Prophet fit başarıyla tamamlandı."
-    result={"model":m,"forecast_df":fc,"forecast":pred,"config":best["cfg"],"selected_plan":best,"component_validation":comp_summary,"used_exog_cols":final_cols,"dropped_exog_cols":sorted(set(dropped_exog)),"search_table":pd.DataFrame(rows).sort_values(["composite_score","val_wape"],ascending=[True,True],na_position="last").reset_index(drop=True),"search_accelerator_cache_hit":False,"validation_wape":safe_float(best.get("validation_wape",np.nan)),"validation_smape":safe_float(best.get("validation_smape",np.nan)),"fallback_used":False,"fallback_method":None,"fit_mode":"gercek_prophet_fit","fit_visibility_note":fit_visibility_note}
-    SEARCH_ACCELERATOR.put_result(cache_key, result)
-    return result
+            try:
+                m.add_country_holidays(country_name="Turkey")
+            except Exception:
+                pass
+            if freq_alias == "M":
+                m.add_seasonality(name="yearly_monthly_data", period=365.25, fourier_order=6)
+            for c in exog_cols:
+                m.add_regressor(c)
+            m.fit(tr)
+            future = te.drop(columns=["y"]).copy()
+            fc = m.predict(future)
+            pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
+            score = wape(te["y"].values, pred)
+            rows.append({**cfg, "wape": score, "smape": smape(te["y"].values, pred)})
+            if score < best_score:
+                best_score = score
+                best = {
+                    "model": m,
+                    "forecast_df": fc,
+                    "forecast": pred,
+                    "config": cfg,
+                    "search_table": pd.DataFrame(rows)
+                }
+        except Exception:
+            continue
+    if best is None:
+        raise RuntimeError("Prophet modeli kurulamadı.")
+    return best
+
+
+def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame) -> Dict[str, Any]:
+    if XGBRegressor is None:
+        raise ImportError("XGBoost veya sklearn gradient boosting bulunamadı.")
+    X_train = feature_train.copy()
+    X_test = feature_test.copy()
+    y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).values
+    y_test = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
+
+    X_train = X_train.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    X_test = X_test.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if HAS_XGBOOST:
+        grid = [
+            {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 300, "subsample": 0.9, "colsample_bytree": 0.9, "reg_alpha": 0.0, "reg_lambda": 1.0},
+            {"max_depth": 4, "learning_rate": 0.03, "n_estimators": 500, "subsample": 0.9, "colsample_bytree": 0.9, "reg_alpha": 0.0, "reg_lambda": 1.0},
+            {"max_depth": 5, "learning_rate": 0.03, "n_estimators": 600, "subsample": 0.8, "colsample_bytree": 0.8, "reg_alpha": 0.1, "reg_lambda": 1.2},
+        ]
+    else:
+        grid = [{"max_depth": 6, "learning_rate": 0.05, "n_estimators": 300}]
+
+    best = None
+    best_score = np.inf
+    rows = []
+    for cfg in grid:
+        try:
+            if HAS_XGBOOST:
+                model = XGBRegressor(
+                    objective="reg:squarederror",
+                    random_state=42,
+                    **cfg
+                )
+                model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+            else:
+                model = XGBRegressor(random_state=42)
+                model.fit(X_train, y_train)
+            pred = np.maximum(np.asarray(model.predict(X_test), dtype=float), 0.0)
+            score = wape(y_test, pred)
+            rows.append({**cfg, "wape": score, "smape": smape(y_test, pred)})
+            if score < best_score:
+                best_score = score
+                best = {"model": model, "forecast": pred, "search_table": pd.DataFrame(rows)}
+        except Exception:
+            continue
+    if best is None:
+        raise RuntimeError("XGBoost modeli kurulamadı.")
+    return best
+
+
+def build_model_metrics(model_name: str, y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
+    return {
+        "model": model_name,
+        "MAE": mae(y_true, y_pred),
+        "RMSE": rmse(y_true, y_pred),
+        "MAPE": safe_mape(y_true, y_pred),
+        "sMAPE": smape(y_true, y_pred),
+        "WAPE": wape(y_true, y_pred),
+        "MASE": mase(y_true, y_pred, y_train, seasonality=1),
+    }
+
+
+def build_actual_vs_pred_df(test_df: pd.DataFrame, pred: np.ndarray, model_name: str) -> pd.DataFrame:
+    out = test_df[["ds", "y"]].copy()
+    out["prediction"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    out["model"] = model_name
+    out["abs_error"] = np.abs(out["y"] - out["prediction"])
+    out["ape"] = np.where(np.abs(out["y"]) > 1e-8, np.abs(out["y"] - out["prediction"]) / np.abs(out["y"]) * 100.0, np.nan)
+    return out
+
+
+def build_acf_pacf_figure(train_df: pd.DataFrame, target_col: str):
+    if not HAS_FORECAST_STATSMODELS:
+        return None
+    y = pd.to_numeric(train_df["y"], errors="coerce").dropna().astype(float)
+    if len(y) < 8:
+        return None
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    plot_acf(y, ax=axes[0], lags=min(24, max(3, len(y)//2 - 1)))
+    plot_pacf(y, ax=axes[1], lags=min(24, max(3, len(y)//2 - 1)), method="ywm")
+    axes[0].set_title(f"{target_col} - ACF")
+    axes[1].set_title(f"{target_col} - PACF")
+    plt.tight_layout()
+    return fig
+
+
+def plot_forecast_results(train_df: pd.DataFrame, test_df: pd.DataFrame, predictions: Dict[str, np.ndarray], title: str):
+    if HAS_PLOTLY:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=train_df["ds"], y=train_df["y"], mode="lines+markers", name="Train"))
+        fig.add_trace(go.Scatter(x=test_df["ds"], y=test_df["y"], mode="lines+markers", name="Gerçek"))
+        for name, pred in predictions.items():
+            fig.add_trace(go.Scatter(x=test_df["ds"], y=pred, mode="lines+markers", name=name))
+        fig.update_layout(title=title, xaxis_title="Tarih", yaxis_title="Talep", legend_title="Seriler", template="plotly_white")
+        return fig
+    return None
+
+
+def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
+    manifest = export_payload["manifest"]
+    date_col = manifest.loc[manifest["key"] == "date_column", "value"].iloc[0]
+    freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
+    df_series = make_series_analysis_frame(export_payload, target_col)
+    train_df, test_df = train_test_split_series(df_series, horizon=horizon)
+    df_features = export_payload["features"].copy()
+    df_features[date_col] = pd.to_datetime(df_features[date_col])
+    df_features = df_features.sort_values(date_col).reset_index(drop=True)
+
+    usable_dates = pd.concat([train_df[["ds"]], test_df[["ds"]]], axis=0)["ds"]
+    feature_subset = df_features[df_features[date_col].isin(usable_dates)].copy().sort_values(date_col).reset_index(drop=True)
+    train_feat = feature_subset.iloc[:len(train_df)].copy().reset_index(drop=True)
+    test_feat = feature_subset.iloc[len(train_df):len(train_df)+len(test_df)].copy().reset_index(drop=True)
+
+    profile = get_profile_row(export_payload, target_col)
+    stat_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_stat_models else []
+    prophet_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_prophet else []
+    ml_feature_cols = detect_ml_feature_columns(df_features, target_col, date_col)
+
+    stat_exog_train = train_feat[stat_exog_cols] if stat_exog_cols else None
+    stat_exog_test = test_feat[stat_exog_cols] if stat_exog_cols else None
+    prophet_exog_train = train_feat[prophet_exog_cols] if prophet_exog_cols else None
+    prophet_exog_test = test_feat[prophet_exog_cols] if prophet_exog_cols else None
+    ml_train_X = train_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=train_feat.index)
+    ml_test_X = test_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=test_feat.index)
+
+    outputs = {
+        "metadata": {
+            "target_col": target_col,
+            "freq_alias": freq_alias,
+            "horizon": horizon,
+            "profile": profile,
+            "segment": series_segment_label(profile),
+            "priority": recommend_model_priority(profile),
+            "stat_exog_cols": stat_exog_cols,
+            "prophet_exog_cols": prophet_exog_cols,
+            "ml_feature_cols": ml_feature_cols,
+        },
+        "train": train_df,
+        "test": test_df,
+        "metrics": [],
+        "predictions": {},
+        "tables": {}
+    }
+
+    sarima_res = fit_best_sarimax(train_df, test_df, freq_alias, profile, stat_exog_train, stat_exog_test)
+    outputs["sarima"] = sarima_res
+    outputs["predictions"]["SARIMA/SARIMAX"] = sarima_res["forecast"]
+    outputs["metrics"].append(build_model_metrics("SARIMA/SARIMAX", train_df["y"].values, test_df["y"].values, sarima_res["forecast"]))
+    outputs["tables"]["SARIMA/SARIMAX"] = build_actual_vs_pred_df(test_df, sarima_res["forecast"], "SARIMA/SARIMAX")
+
+    if HAS_PROPHET:
+        prophet_res = fit_best_prophet(train_df, test_df, freq_alias, profile, prophet_exog_train, prophet_exog_test)
+        outputs["prophet"] = prophet_res
+        outputs["predictions"]["Prophet"] = prophet_res["forecast"]
+        outputs["metrics"].append(build_model_metrics("Prophet", train_df["y"].values, test_df["y"].values, prophet_res["forecast"]))
+        outputs["tables"]["Prophet"] = build_actual_vs_pred_df(test_df, prophet_res["forecast"], "Prophet")
+    else:
+        outputs["prophet_error"] = "prophet paketi yüklü değil. 'pip install prophet' gerekli olabilir."
+
+    xgb_res = fit_xgboost_forecast(train_df, test_df, ml_train_X, ml_test_X)
+    outputs["xgboost"] = xgb_res
+    outputs["predictions"]["XGBoost"] = xgb_res["forecast"]
+    outputs["metrics"].append(build_model_metrics("XGBoost", train_df["y"].values, test_df["y"].values, xgb_res["forecast"]))
+    outputs["tables"]["XGBoost"] = build_actual_vs_pred_df(test_df, xgb_res["forecast"], "XGBoost")
+
+    metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
+    outputs["metrics_df"] = metrics_df
+    outputs["best_model"] = metrics_df.iloc[0]["model"] if len(metrics_df) else None
+    outputs["all_predictions_long"] = pd.concat(list(outputs["tables"].values()), axis=0, ignore_index=True) if outputs["tables"] else pd.DataFrame()
+    return outputs
+
+
+def style_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = [c for c in df.columns if c != "model"]
+    out = df.copy()
+    for c in numeric_cols:
+        out[c] = out[c].map(lambda x: round(float(x), 4) if pd.notna(x) else np.nan)
+    return out
+
+
+def dataframe_to_download_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def save_uploaded_file(uploaded_file) -> str:
+    tmp_dir = tempfile.mkdtemp(prefix="streamlit_forecast_app_")
+    path = os.path.join(tmp_dir, uploaded_file.name)
+    with open(path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return path
+
+
+def build_preprocessor_config_for_streamlit() -> PreprocessConfig:
+    return PreprocessConfig(
+        output_dir_name="forecast_preprocessing_outputs_streamlit",
+        protect_last_n_periods=1,
+        recent_periods_review_only=3,
+        backtest_horizon=3,
+        save_excel=True,
+        save_csv=True,
+        save_metadata_json=True,
+        save_quality_report=True,
+    )
+
+
+def run_preprocessing_for_sheet(file_path: str, sheet_name: str, output_base_dir: str) -> Dict[str, pd.DataFrame]:
+    preprocessor = DemandForecastPreprocessor(config=build_preprocessor_config_for_streamlit())
+    return preprocessor.preprocess_sheet(file_path=file_path, sheet_name=sheet_name, output_dir=output_base_dir)
+
+
+def render_streamlit_app():
+    st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
+    st.title("Talep Tahminleme Studio")
+    st.caption("Mevcut veri önişleme akışını koruyan, Streamlit üzerinde çalışan profesyonel tahminleme katmanı")
+
+    with st.sidebar:
+        st.subheader("Girdi")
+        uploaded_excel = st.file_uploader("Excel dosyası yükle", type=["xlsx", "xls"])
+        st.markdown("Bu uygulama mevcut production-grade veri önişleme mantığını kullanır ve üstüne SARIMA/SARIMAX, Prophet, XGBoost karşılaştırması ekler.")
+
+    if uploaded_excel is None:
+        st.info("Başlamak için Excel dosyanı yükle.")
+        return
+
+    excel_path = save_uploaded_file(uploaded_excel)
+    xls = pd.ExcelFile(excel_path)
+    selected_sheet = st.sidebar.selectbox("Sheet seç", xls.sheet_names)
+
+    output_base_dir = os.path.join(os.path.dirname(excel_path), "streamlit_outputs")
+    os.makedirs(output_base_dir, exist_ok=True)
+
+    cache_key = f"{uploaded_excel.name}::{selected_sheet}"
+    if "preprocess_cache" not in st.session_state:
+        st.session_state["preprocess_cache"] = {}
+
+    if st.sidebar.button("Önişleme + Tahminleme için hazırla", type="primary") or cache_key not in st.session_state["preprocess_cache"]:
+        with st.spinner("Veri önişleme ve yönetişim çalışıyor..."):
+            export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
+            st.session_state["preprocess_cache"][cache_key] = export_payload
+    export_payload = st.session_state["preprocess_cache"][cache_key]
+
+    manifest = export_payload["manifest"]
+    date_col = manifest.loc[manifest["key"] == "date_column", "value"].iloc[0]
+    freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
+    target_cols = export_payload["series_profile_report"]["series"].tolist()
+    default_target = target_cols[0] if target_cols else None
+
+    top1, top2, top3, top4 = st.columns(4)
+    with top1:
+        st.metric("Frekans", str(freq_alias))
+    with top2:
+        st.metric("Hedef seri", len(target_cols))
+    with top3:
+        st.metric("Regularized satır", int(len(export_payload["raw_regular"])))
+    with top4:
+        st.metric("Anomali kaydı", int(len(export_payload["anomaly_governance"])))
+
+    target_col = st.selectbox("Tahminlenecek seri", target_cols, index=0 if default_target else None)
+    default_horizon = min(infer_default_horizon(freq_alias), max(2, len(export_payload["clean_model_input"]) // 5))
+    horizon = st.slider("Test ufku", min_value=2, max_value=min(24, max(2, len(export_payload["clean_model_input"]) // 3)), value=default_horizon)
+    use_exog_stat = st.checkbox("SARIMAX için açıklayıcı değişkenleri kullan", value=True)
+    use_exog_prophet = st.checkbox("Prophet için ek regressors kullan", value=True)
+
+    profile = get_profile_row(export_payload, target_col)
+    segment = series_segment_label(profile)
+    priority = recommend_model_priority(profile)
+
+    st.subheader("Seri profili")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Segment", segment)
+    c2.metric("Önerilen öncelik", priority)
+    c3.metric("CV", round(float(profile.get("cv", np.nan)), 3) if profile else np.nan)
+    c4.metric("Trend gücü", round(float(profile.get("trend_strength", np.nan)), 3) if profile else np.nan)
+    c5.metric("Sezonsallık", round(float(profile.get("seasonality_strength", np.nan)), 3) if profile else np.nan)
+
+    acf_pacf_fig = None
+    try:
+        df_series = make_series_analysis_frame(export_payload, target_col)
+        train_df_preview, _ = train_test_split_series(df_series, horizon)
+        acf_pacf_fig = build_acf_pacf_figure(train_df_preview, target_col)
+    except Exception:
+        acf_pacf_fig = None
+    if acf_pacf_fig is not None:
+        st.pyplot(acf_pacf_fig, clear_figure=True)
+
+    if st.button("Modelleri çalıştır ve karşılaştır", type="primary"):
+        with st.spinner("SARIMA / Prophet / XGBoost modelleri kuruluyor..."):
+            outputs = run_full_forecasting_pipeline(
+                export_payload=export_payload,
+                target_col=target_col,
+                horizon=horizon,
+                use_exog_for_stat_models=use_exog_stat,
+                use_exog_for_prophet=use_exog_prophet
+            )
+        st.session_state["forecast_outputs"] = outputs
+        st.session_state["forecast_target"] = target_col
+
+    outputs = st.session_state.get("forecast_outputs")
+    if outputs is None or st.session_state.get("forecast_target") != target_col:
+        st.info("Model karşılaştırmasını görmek için butona bas.")
+        return
+
+    st.subheader("Model karşılaştırma tablosu")
+    metrics_df = style_metric_dataframe(outputs["metrics_df"])
+    st.dataframe(metrics_df, use_container_width=True)
+    st.download_button(
+        "Karşılaştırma tablosunu indir (CSV)",
+        data=dataframe_to_download_bytes(metrics_df),
+        file_name=f"{selected_sheet}_{target_col}_model_karsilastirma.csv",
+        mime="text/csv"
+    )
+
+    best_model = outputs.get("best_model")
+    if best_model:
+        st.success(f"En iyi model: {best_model}")
+
+    fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin")
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Gerçek vs Tahmin Tabloları", "Önişleme Denetimleri"])
+
+    with tab1:
+        sarima = outputs["sarima"]
+        st.write({
+            "order": sarima["order"],
+            "seasonal_order": sarima["seasonal_order"],
+            "AIC": sarima["aic"],
+            "BIC": sarima["bic"],
+            "Ljung-Box p-value": sarima["ljung_box_pvalue"],
+            "d": sarima["d"],
+            "D": sarima["D"],
+        })
+        st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(sarima["search_table"]), use_container_width=True)
+
+    with tab2:
+        if "prophet" in outputs:
+            st.write(outputs["prophet"]["config"])
+            st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), use_container_width=True)
+            st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), use_container_width=True)
+        else:
+            st.warning(outputs.get("prophet_error", "Prophet sonucu üretilemedi."))
+
+    with tab3:
+        st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), use_container_width=True)
+        st.caption(f"Kullanılan ML feature sayısı: {len(outputs['metadata']['ml_feature_cols'])}")
+
+    with tab4:
+        combined = outputs["all_predictions_long"].copy()
+        st.dataframe(style_metric_dataframe(combined), use_container_width=True)
+        st.download_button(
+            "Gerçek vs tahmin tablosunu indir (CSV)",
+            data=dataframe_to_download_bytes(combined),
+            file_name=f"{selected_sheet}_{target_col}_actual_vs_forecast.csv",
+            mime="text/csv"
+        )
+
+    with tab5:
+        st.markdown("**Kalite raporu**")
+        st.dataframe(export_payload["quality_report"], use_container_width=True)
+        st.markdown("**Seri profil raporu**")
+        st.dataframe(export_payload["series_profile_report"], use_container_width=True)
+        st.markdown("**Anomali yönetişimi**")
+        st.dataframe(export_payload["anomaly_governance"], use_container_width=True)
+        st.markdown("**Review queue**")
+        st.dataframe(export_payload["review_queue"], use_container_width=True)
+
+    st.subheader("Akıllı öneriler")
+    suggestions = []
+    if float(profile.get("seasonality_strength", 0) or 0) >= 0.35:
+        suggestions.append("Bu seri sezonsal; SARIMA seasonal bileşenleri ve Prophet yearly seasonality kritik.")
+    if float(profile.get("cv", 0) or 0) >= 0.45:
+        suggestions.append("Oynaklık yüksek; XGBoost tarafında rolling istatistikler ve outlier governance daha fazla değer üretir.")
+    if float(profile.get("intermittency_ratio", 0) or 0) >= 0.25:
+        suggestions.append("Intermittent yapı işareti var; klasik modelleri yorumlarken stok-out ve gerçek talep yokluğu ayrımını ayrıca izle.")
+    if not suggestions:
+        suggestions.append("Seri dengeli görünüyor; üç modelin ensemble ya da champion-challenger mantığıyla takip edilmesi uygun.")
+    for s in suggestions:
+        st.write(f"- {s}")
+
+
+# =========================================================
+# ENHANCED FORECASTING LAYER v2
+# Batch forecasting, champion-challenger, ensemble,
+# ABC/XYZ segmentation, and deeper professional tuning.
+# =========================================================
+try:
+    from scipy.stats import boxcox
+    from scipy.special import inv_boxcox
+    HAS_SCIPY = True
+except Exception:
+    boxcox = None
+    inv_boxcox = None
+    HAS_SCIPY = False
+
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:
+    shap = None
+    HAS_SHAP = False
+
+
+def infer_abc_class(profile: Dict[str, Any]) -> str:
+    mean_ = safe_float(profile.get("mean", np.nan))
+    if pd.isna(mean_):
+        return "C"
+    if mean_ >= 250:
+        return "A"
+    if mean_ >= 100:
+        return "B"
+    return "C"
+
+
+def infer_xyz_class(profile: Dict[str, Any]) -> str:
+    cv = safe_float(profile.get("cv", np.nan))
+    if pd.isna(cv):
+        return "Z"
+    if cv <= 0.25:
+        return "X"
+    if cv <= 0.45:
+        return "Y"
+    return "Z"
+
+
+def infer_advanced_segment(profile: Dict[str, Any]) -> Dict[str, str]:
+    abc = infer_abc_class(profile)
+    xyz = infer_xyz_class(profile)
+    intermittency = safe_float(profile.get("intermittency_ratio", np.nan))
+    seasonality = safe_float(profile.get("seasonality_strength", np.nan))
+    trend_strength = safe_float(profile.get("trend_strength", np.nan))
+    cv = safe_float(profile.get("cv", np.nan))
+
+    if pd.notna(intermittency) and intermittency >= 0.35:
+        family = "intermittent"
+    elif pd.notna(seasonality) and seasonality >= 0.45:
+        family = "seasonal"
+    elif pd.notna(cv) and cv >= 0.45:
+        family = "volatile"
+    elif pd.notna(trend_strength) and trend_strength >= 0.45:
+        family = "trend_dominant"
+    elif xyz == "X":
+        family = "stable"
+    else:
+        family = "standard"
+
+    return {
+        "abc": abc,
+        "xyz": xyz,
+        "abc_xyz": f"{abc}{xyz}",
+        "family": family,
+        "label": f"{abc}{xyz}_{family}"
+    }
+
+
+def series_segment_label(profile: Dict[str, Any]) -> str:
+    return infer_advanced_segment(profile)["label"]
+
+
+def recommend_model_priority(profile: Dict[str, Any]) -> str:
+    seg = infer_advanced_segment(profile)
+    abcxyz = seg["abc_xyz"]
+    family = seg["family"]
+    if family == "seasonal":
+        return "SARIMA + Prophet + Ensemble"
+    if family == "intermittent":
+        return "XGBoost + Prophet + Ensemble"
+    if family == "volatile":
+        return "XGBoost + Prophet"
+    if abcxyz in ["AX", "BX"]:
+        return "SARIMA + XGBoost"
+    return "SARIMA + Prophet + XGBoost + Ensemble"
+
+
+def recommend_candidate_models(profile: Dict[str, Any]) -> List[str]:
+    seg = infer_advanced_segment(profile)
+    family = seg["family"]
+    abcxyz = seg["abc_xyz"]
+    if family == "seasonal":
+        return ["SARIMA/SARIMAX", "Prophet", "Ensemble"]
+    if family == "intermittent":
+        return ["XGBoost", "Prophet", "Ensemble"]
+    if family == "volatile":
+        return ["XGBoost", "Prophet", "SARIMA/SARIMAX", "Ensemble"]
+    if abcxyz in ["AX", "BX"]:
+        return ["SARIMA/SARIMAX", "XGBoost", "Ensemble"]
+    return ["SARIMA/SARIMAX", "Prophet", "XGBoost", "Ensemble"]
+
+
+def choose_target_transform(y: pd.Series) -> Dict[str, Any]:
+    s = pd.to_numeric(y, errors="coerce").dropna().astype(float)
+    if len(s) < 8:
+        return {"name": "none", "lambda": None, "shift": 0.0}
+    skew = safe_float(s.skew())
+    min_val = safe_float(s.min())
+    cv = safe_float(coefficient_of_variation(s))
+    if min_val >= 0 and ((pd.notna(skew) and skew >= 1.0) or (pd.notna(cv) and cv >= 0.50)):
+        if HAS_SCIPY and np.all(s > 0):
+            return {"name": "boxcox", "lambda": None, "shift": 0.0}
+        return {"name": "log1p", "lambda": None, "shift": 0.0}
+    return {"name": "none", "lambda": None, "shift": 0.0}
+
+
+def apply_target_transform(y: pd.Series, transform_cfg: Dict[str, Any]) -> Tuple[pd.Series, Dict[str, Any]]:
+    s = pd.to_numeric(y, errors="coerce").astype(float).copy()
+    name = transform_cfg.get("name", "none")
+    if name == "log1p":
+        return np.log1p(np.maximum(s, 0.0)), transform_cfg
+    if name == "boxcox" and HAS_SCIPY:
+        s2 = s.copy()
+        shift = 0.0
+        if safe_float(s2.min()) <= 0:
+            shift = abs(safe_float(s2.min())) + 1e-6
+            s2 = s2 + shift
+        transformed, lam = boxcox(s2.values)
+        cfg = dict(transform_cfg)
+        cfg["lambda"] = lam
+        cfg["shift"] = shift
+        return pd.Series(transformed, index=s.index), cfg
+    return s, transform_cfg
+
+
+def inverse_target_transform(arr: np.ndarray, transform_cfg: Dict[str, Any]) -> np.ndarray:
+    x = np.asarray(arr, dtype=float)
+    name = transform_cfg.get("name", "none")
+    if name == "log1p":
+        return np.maximum(np.expm1(x), 0.0)
+    if name == "boxcox" and HAS_SCIPY:
+        lam = transform_cfg.get("lambda", None)
+        shift = float(transform_cfg.get("shift", 0.0) or 0.0)
+        inv = inv_boxcox(x, lam)
+        inv = inv - shift
+        return np.maximum(inv, 0.0)
+    return np.maximum(x, 0.0)
+
+
+def make_inner_train_val_split(train_df: pd.DataFrame, val_ratio: float = 0.2, min_val: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    n = len(train_df)
+    val_len = max(min_val, int(np.ceil(n * val_ratio)))
+    val_len = min(val_len, max(2, n // 3))
+    return train_df.iloc[:-val_len].copy().reset_index(drop=True), train_df.iloc[-val_len:].copy().reset_index(drop=True)
+
+
+def safe_normalized_penalty(value: float, baseline: float) -> float:
+    if pd.isna(value) or pd.isna(baseline) or baseline == 0:
+        return 0.0
+    return float(value / abs(baseline))
+
+
+def generate_target_ml_features(full_df: pd.DataFrame, existing_exog: Optional[pd.DataFrame], freq_alias: str) -> Tuple[pd.DataFrame, List[str]]:
+    df = full_df[["ds", "y"]].copy().reset_index(drop=True)
+    season_len = infer_season_length_from_freq(freq_alias)
+    lag_set = [1, 2, 3, 6, 12]
+    if freq_alias == "W":
+        lag_set = [1, 2, 4, 8, 13, 26, 52]
+    elif freq_alias == "D":
+        lag_set = [1, 2, 3, 7, 14, 21, 28]
+    elif freq_alias == "M":
+        lag_set = [1, 2, 3, 6, 12, 18]
+    elif freq_alias == "H":
+        lag_set = [1, 2, 3, 6, 12, 24, 48]
+
+    for lag in sorted(set(lag_set)):
+        df[f"lag_{lag}"] = df["y"].shift(lag)
+    if season_len > 1:
+        df[f"seasonal_lag_{season_len}"] = df["y"].shift(season_len)
+
+    for w in sorted(set([3, 6, 12, max(2, season_len)])):
+        df[f"roll_mean_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).mean()
+        df[f"roll_std_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).std()
+        df[f"roll_min_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).min()
+        df[f"roll_max_{w}"] = df["y"].shift(1).rolling(w, min_periods=1).max()
+
+    ds = pd.to_datetime(df["ds"])
+    df["year"] = ds.dt.year
+    df["quarter"] = ds.dt.quarter
+    df["month"] = ds.dt.month
+    iso_week = ds.dt.isocalendar().week.astype(int)
+    df["weekofyear"] = iso_week
+    df["dayofweek"] = ds.dt.dayofweek
+    df["dayofmonth"] = ds.dt.day
+    df["is_month_start"] = ds.dt.is_month_start.astype(int)
+    df["is_month_end"] = ds.dt.is_month_end.astype(int)
+
+    month_num = ds.dt.month.fillna(1).astype(int)
+    df["month_sin"] = np.sin(2 * np.pi * month_num / 12.0)
+    df["month_cos"] = np.cos(2 * np.pi * month_num / 12.0)
+    if freq_alias in ["W", "D"]:
+        week_num = iso_week.clip(lower=1)
+        df["week_sin"] = np.sin(2 * np.pi * week_num / 52.0)
+        df["week_cos"] = np.cos(2 * np.pi * week_num / 52.0)
+    if freq_alias in ["D", "H"]:
+        dow = ds.dt.dayofweek.astype(int)
+        df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
+        df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
+
+    if existing_exog is not None and len(existing_exog.columns) > 0:
+        exog = existing_exog.copy().reset_index(drop=True)
+        for c in exog.columns:
+            df[f"exog__{c}"] = pd.to_numeric(exog[c], errors="coerce")
+
+    feature_cols = [c for c in df.columns if c not in ["ds", "y"]]
+    return df, feature_cols
+
+
+def walk_forward_refit_sarimax(history_y: pd.Series, future_y: pd.Series, order: Tuple[int, int, int], seasonal_order: Tuple[int, int, int, int], exog_hist: Optional[pd.DataFrame] = None, exog_future: Optional[pd.DataFrame] = None) -> np.ndarray:
+    preds = []
+    hist = pd.to_numeric(history_y, errors="coerce").astype(float).copy()
+    for i in range(len(future_y)):
+        exog_train_i = exog_hist if exog_hist is None else exog_hist.iloc[:len(hist)]
+        exog_step = None if exog_future is None else exog_future.iloc[[i]]
+        model = SARIMAX(hist, exog=exog_train_i, order=order, seasonal_order=seasonal_order, trend="c", enforce_stationarity=False, enforce_invertibility=False)
+        res = model.fit(disp=False)
+        fc = res.get_forecast(steps=1, exog=exog_step).predicted_mean.iloc[0]
+        preds.append(max(float(fc), 0.0))
+        hist = pd.concat([hist, pd.Series([future_y.iloc[i]])], ignore_index=True)
+    return np.asarray(preds, dtype=float)
+
+
+def fit_best_sarimax(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    if not HAS_FORECAST_STATSMODELS:
+        raise ImportError("statsmodels forecast bileşenleri bulunamadı.")
+    y_train_raw = pd.to_numeric(train_df["y"], errors="coerce").astype(float)
+    y_test_raw = pd.to_numeric(test_df["y"], errors="coerce").astype(float)
+    tr_inner, val_inner = make_inner_train_val_split(train_df)
+    exog_train_inner = exog_train.iloc[:len(tr_inner)].copy() if exog_train is not None else None
+    exog_val_inner = exog_train.iloc[len(tr_inner):len(tr_inner)+len(val_inner)].copy() if exog_train is not None else None
+
+    d = suggest_d_via_stationarity(y_train_raw)
+    D = suggest_D_via_profile(profile, infer_season_length_from_freq(freq_alias), len(y_train_raw))
+    season_length = infer_season_length_from_freq(freq_alias)
+    transform_candidates = [choose_target_transform(y_train_raw), {"name": "none", "lambda": None, "shift": 0.0}]
+    seen = set()
+    unique_transforms = []
+    for cfg in transform_candidates:
+        key = cfg.get("name")
+        if key not in seen:
+            seen.add(key)
+            unique_transforms.append(cfg)
+
+    best = None
+    best_score = np.inf
+    rows = []
+    for tcfg in unique_transforms:
+        y_tr_raw = pd.to_numeric(tr_inner["y"], errors="coerce").astype(float)
+        y_val_raw = pd.to_numeric(val_inner["y"], errors="coerce").astype(float)
+        y_tr, applied_cfg = apply_target_transform(y_tr_raw, dict(tcfg))
+
+        for cfg in build_sarimax_grid(freq_alias, profile, len(y_train_raw)):
+            p, q, P, Q, m = cfg["p"], cfg["q"], cfg["P"], cfg["Q"], cfg["m"]
+            seasonal_order = (P, D if m > 1 else 0, Q, m if m > 1 else 0)
+            order = (p, d, q)
+            try:
+                model = SARIMAX(y_tr, exog=exog_train_inner, order=order, seasonal_order=seasonal_order, trend="c", enforce_stationarity=False, enforce_invertibility=False)
+                res = model.fit(disp=False)
+                val_pred_t = res.get_forecast(steps=len(y_val_raw), exog=exog_val_inner).predicted_mean
+                val_pred = inverse_target_transform(np.asarray(val_pred_t, dtype=float), applied_cfg)
+                val_wape = wape(y_val_raw.values, val_pred)
+                val_smape = smape(y_val_raw.values, val_pred)
+                composite = val_wape + 0.35 * val_smape + 0.0005 * max(0.0, safe_float(getattr(res, "aic", 0.0)))
+                rows.append({
+                    "transform": applied_cfg.get("name", "none"),
+                    "order": str(order),
+                    "seasonal_order": str(seasonal_order),
+                    "aic": safe_float(getattr(res, "aic", np.nan)),
+                    "bic": safe_float(getattr(res, "bic", np.nan)),
+                    "val_wape": val_wape,
+                    "val_smape": val_smape,
+                    "composite_score": composite
+                })
+                if composite < best_score:
+                    best_score = composite
+                    best = {"order": order, "seasonal_order": seasonal_order, "transform_cfg": applied_cfg}
+            except Exception:
+                continue
+
+    if best is None:
+        raise RuntimeError("Uygun SARIMA/SARIMAX modeli kurulamadı.")
+
+    y_train_t, applied_cfg = apply_target_transform(y_train_raw, best["transform_cfg"])
+    final_model = SARIMAX(y_train_t, exog=exog_train, order=best["order"], seasonal_order=best["seasonal_order"], trend="c", enforce_stationarity=False, enforce_invertibility=False)
+    final_res = final_model.fit(disp=False)
+    pred_t = final_res.get_forecast(steps=len(y_test_raw), exog=exog_test).predicted_mean
+    pred = inverse_target_transform(np.asarray(pred_t, dtype=float), applied_cfg)
+    pred = np.maximum(pred, 0.0)
+
+    resid = pd.Series(final_res.resid).dropna()
+    try:
+        lb_p = acorr_ljungbox(resid, lags=[min(10, max(2, len(resid)//3))], return_df=True)["lb_pvalue"].iloc[0]
+    except Exception:
+        lb_p = np.nan
+    try:
+        rolling_refit_pred = walk_forward_refit_sarimax(y_train_t, apply_target_transform(y_test_raw, applied_cfg)[0], best["order"], best["seasonal_order"], exog_hist=exog_train, exog_future=exog_test)
+        rolling_refit_pred = inverse_target_transform(rolling_refit_pred, applied_cfg)
+    except Exception:
+        rolling_refit_pred = pred.copy()
+
+    return {
+        "model": final_res,
+        "forecast": rolling_refit_pred,
+        "static_forecast": pred,
+        "order": best["order"],
+        "seasonal_order": best["seasonal_order"],
+        "aic": safe_float(getattr(final_res, "aic", np.nan)),
+        "bic": safe_float(getattr(final_res, "bic", np.nan)),
+        "ljung_box_pvalue": safe_float(lb_p),
+        "d": d,
+        "D": D,
+        "transform": applied_cfg.get("name", "none"),
+        "residual_mean": safe_float(resid.mean()),
+        "residual_std": safe_float(resid.std()),
+        "residual_white_noise_ok": bool(pd.notna(lb_p) and lb_p > 0.05),
+        "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape", "aic"], ascending=[True, True, True]).reset_index(drop=True)
+    }
+
+
+def build_prophet_country_holidays() -> Optional[pd.DataFrame]:
+    try:
+        return None
+    except Exception:
+        return None
+
+
+def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    if not HAS_PROPHET:
+        raise ImportError("prophet paketi bulunamadı.")
+    tr_full, te_full, exog_cols = make_prophet_features(train_df, test_df, exog_train, exog_test)
+    tr_inner, val_inner = make_inner_train_val_split(train_df)
+    tr, val, _ = make_prophet_features(tr_inner, val_inner, exog_train.iloc[:len(tr_inner)] if exog_train is not None else None, exog_train.iloc[len(tr_inner):len(tr_inner)+len(val_inner)] if exog_train is not None else None)
+
+    seasonality_strength = safe_float(profile.get("seasonality_strength", np.nan))
+    mode_candidates = ["multiplicative", "additive"] if pd.notna(seasonality_strength) and seasonality_strength >= 0.30 else ["additive", "multiplicative"]
+    configs = []
+    for mode in mode_candidates:
+        for cps in [0.01, 0.05, 0.2]:
+            for sps in [1.0, 5.0, 10.0]:
+                for growth in ["linear", "logistic"]:
+                    configs.append({"seasonality_mode": mode, "changepoint_prior_scale": cps, "seasonality_prior_scale": sps, "growth": growth})
+
+    best = None
+    rows = []
+    best_score = np.inf
+    for cfg in configs:
+        try:
+            tr_fit = tr.copy()
+            val_fit = val.copy()
+            if cfg["growth"] == "logistic":
+                cap = max(1.1 * float(tr_fit["y"].max()), 1.0)
+                floor = 0.0
+                tr_fit["cap"] = cap
+                tr_fit["floor"] = floor
+                val_fit["cap"] = cap
+                val_fit["floor"] = floor
+            m = Prophet(
+                growth=cfg["growth"],
+                yearly_seasonality=(freq_alias == "M"),
+                weekly_seasonality=(freq_alias in ["D", "H"]),
+                daily_seasonality=(freq_alias == "H"),
+                seasonality_mode=cfg["seasonality_mode"],
+                changepoint_prior_scale=cfg["changepoint_prior_scale"],
+                seasonality_prior_scale=cfg["seasonality_prior_scale"]
+            )
+            try:
+                m.add_country_holidays(country_name="Turkey")
+            except Exception:
+                pass
+            if freq_alias == "M":
+                m.add_seasonality(name="month_cycle", period=365.25, fourier_order=8)
+            if freq_alias == "W":
+                m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=10)
+            for c in exog_cols:
+                m.add_regressor(c)
+            m.fit(tr_fit)
+            future = val_fit.drop(columns=["y"]).copy()
+            fc = m.predict(future)
+            pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
+            val_wape = wape(val_fit["y"].values, pred)
+            val_smape = smape(val_fit["y"].values, pred)
+            composite = val_wape + 0.35 * val_smape
+            rows.append({**cfg, "val_wape": val_wape, "val_smape": val_smape, "composite_score": composite})
+            if composite < best_score:
+                best_score = composite
+                best = cfg
+        except Exception:
+            continue
+
+    if best is None:
+        raise RuntimeError("Prophet modeli kurulamadı.")
+
+    tr_fit = tr_full.copy()
+    te_fit = te_full.copy()
+    if best["growth"] == "logistic":
+        cap = max(1.1 * float(tr_fit["y"].max()), 1.0)
+        floor = 0.0
+        tr_fit["cap"] = cap
+        tr_fit["floor"] = floor
+        te_fit["cap"] = cap
+        te_fit["floor"] = floor
+    m = Prophet(
+        growth=best["growth"],
+        yearly_seasonality=(freq_alias == "M"),
+        weekly_seasonality=(freq_alias in ["D", "H"]),
+        daily_seasonality=(freq_alias == "H"),
+        seasonality_mode=best["seasonality_mode"],
+        changepoint_prior_scale=best["changepoint_prior_scale"],
+        seasonality_prior_scale=best["seasonality_prior_scale"]
+    )
+    try:
+        m.add_country_holidays(country_name="Turkey")
+    except Exception:
+        pass
+    if freq_alias == "M":
+        m.add_seasonality(name="month_cycle", period=365.25, fourier_order=8)
+    if freq_alias == "W":
+        m.add_seasonality(name="annual_weekly_data", period=365.25, fourier_order=10)
+    for c in exog_cols:
+        m.add_regressor(c)
+    m.fit(tr_fit)
+    future = te_fit.drop(columns=["y"]).copy()
+    fc = m.predict(future)
+    pred = np.maximum(fc["yhat"].values.astype(float), 0.0)
+
+    comp_summary = {
+        "trend_abs_mean": safe_float(np.abs(fc.get("trend", pd.Series(dtype=float))).mean()) if "trend" in fc else np.nan,
+        "seasonality_abs_mean": safe_float(np.abs(fc.get("yearly", pd.Series(dtype=float))).mean()) if "yearly" in fc else np.nan,
+        "seasonality_present": bool("yearly" in fc or "weekly" in fc)
+    }
+    return {
+        "model": m,
+        "forecast_df": fc,
+        "forecast": pred,
+        "config": best,
+        "component_validation": comp_summary,
+        "search_table": pd.DataFrame(rows).sort_values(["composite_score", "val_wape"], ascending=[True, True]).reset_index(drop=True)
+    }
+
 
 def build_recursive_feature_row(history_values: List[float], target_date: pd.Timestamp, freq_alias: str, exog_row: Optional[pd.Series], all_feature_names: List[str]) -> pd.DataFrame:
     tmp = pd.DataFrame({"ds": pd.date_range(end=target_date, periods=len(history_values), freq={"M":"M","W":"W","D":"D","H":"H"}.get(freq_alias,"M")), "y": history_values})
@@ -8698,145 +5684,93 @@ def build_recursive_feature_row(history_values: List[float], target_date: pd.Tim
     return row[all_feature_names].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
-
-
-
 def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_combined: Optional[pd.DataFrame], freq_alias: str, strategy: str = "recursive") -> Dict[str, Any]:
-    if XGBRegressor is None and SKHistGradientBoostingRegressor is None:
-        raise ImportError("XGBoost veya hızlı GBM bileşeni bulunamadı.")
-
-    cache_key = build_search_signature(
-        f"xgb_strategy_{strategy}",
-        freq_alias,
-        train_df,
-        future_df,
-        exog_train=exog_combined,
-        extra={"feature_cap": FORECAST_RUNTIME_CONFIG.xgb_max_feature_cols, "grid": list(FORECAST_RUNTIME_CONFIG.xgb_param_grid)}
-    )
-    cached = SEARCH_ACCELERATOR.get_result(cache_key)
-    if cached is not None:
-        cached["search_accelerator_cache_hit"] = True
-        return cached
-
-    start_ts = time.perf_counter()
+    if XGBRegressor is None:
+        raise ImportError("XGBoost veya sklearn gradient boosting bulunamadı.")
     full = pd.concat([train_df[["ds", "y"]], future_df[["ds", "y"]]], axis=0, ignore_index=True)
+    feat_full, feature_cols = generate_target_ml_features(full, exog_combined, freq_alias)
     train_cut = len(train_df)
 
-    tr_inner, val_inner = SEARCH_ACCELERATOR.get_or_compute_artifact(
-        build_search_signature(f"xgb_inner_split_{strategy}", freq_alias, train_df, future_df, exog_train=exog_combined),
-        lambda: make_inner_train_val_split(train_df)
-    )
-    if len(tr_inner) > FORECAST_RUNTIME_CONFIG.xgb_inner_train_max_rows:
-        tr_inner = tr_inner.iloc[-FORECAST_RUNTIME_CONFIG.xgb_inner_train_max_rows:].reset_index(drop=True)
+    tr_inner, val_inner = make_inner_train_val_split(train_df)
     inner_full = pd.concat([tr_inner[["ds", "y"]], val_inner[["ds", "y"]]], axis=0, ignore_index=True)
-    exog_inner = exog_combined.iloc[:len(inner_full)].copy().reset_index(drop=True) if exog_combined is not None else None
+    exog_inner = exog_combined.iloc[:len(inner_full)].copy() if exog_combined is not None else None
     feat_inner, inner_cols = generate_target_ml_features(inner_full, exog_inner, freq_alias)
-    inner_cols = _select_core_ml_feature_columns(inner_cols, freq_alias, len(train_df))
     X_base = feat_inner.iloc[:len(tr_inner)][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_base_raw = tr_inner["y"].values.astype(float)
-    y_transform = choose_target_transform(pd.Series(y_base_raw))
-    y_base = apply_target_transform(pd.Series(y_base_raw), y_transform)[0].values.astype(float)
+    y_base = tr_inner["y"].values.astype(float)
 
-    grid = list(FORECAST_RUNTIME_CONFIG.xgb_param_grid) if (HAS_XGBOOST or SKHistGradientBoostingRegressor is not None) else [{"max_depth": 3, "learning_rate": 0.08, "n_estimators": 48}]
-    search_rows = []
+    grid = [
+        {"max_depth": 3, "learning_rate": 0.05, "n_estimators": 300, "subsample": 0.9, "colsample_bytree": 0.9, "reg_alpha": 0.0, "reg_lambda": 1.0, "min_child_weight": 1},
+        {"max_depth": 4, "learning_rate": 0.03, "n_estimators": 500, "subsample": 0.9, "colsample_bytree": 0.9, "reg_alpha": 0.0, "reg_lambda": 1.0, "min_child_weight": 1},
+        {"max_depth": 5, "learning_rate": 0.03, "n_estimators": 600, "subsample": 0.8, "colsample_bytree": 0.8, "reg_alpha": 0.1, "reg_lambda": 1.2, "min_child_weight": 2},
+    ] if HAS_XGBOOST else [{"max_depth": 6, "learning_rate": 0.05, "n_estimators": 300}]
+
     best = None
     best_score = np.inf
-    X_base_np = X_base.values.astype(float)
-    y_base_np = np.asarray(y_base, dtype=float)
-
-    def _evaluate_xgb_cfg(raw_cfg: Dict[str, Any]) -> Dict[str, Any]:
-        cfg = _prepare_xgb_cfg(raw_cfg, len(train_df), freq_alias)
+    search_rows = []
+    for cfg in grid:
         try:
             if strategy == "recursive":
-                model = build_fast_xgb_regressor(cfg)
-                if HAS_XGBOOST and type(model).__name__ == "XGBRegressor" and len(X_base_np) >= 12:
-                    es = max(3, min(8, len(X_base_np) // 4))
-                    X_fit = X_base_np[:-es]
-                    y_fit = y_base_np[:-es]
-                    X_eval = X_base_np[-es:]
-                    y_eval = y_base_np[-es:]
-                    model.fit(X_fit, y_fit, eval_set=[(X_eval, y_eval)], verbose=False)
-                else:
-                    model.fit(X_base_np, y_base_np)
+                model = XGBRegressor(objective="reg:squarederror", random_state=42, **cfg) if HAS_XGBOOST else XGBRegressor(random_state=42)
+                model.fit(X_base, y_base)
                 history = list(tr_inner["y"].astype(float).values)
                 preds = []
                 for i in range(len(val_inner)):
                     target_date = pd.to_datetime(val_inner.iloc[i]["ds"])
                     exog_row = exog_inner.iloc[len(tr_inner)+i] if exog_inner is not None else None
                     X_step = build_recursive_feature_row(history, target_date, freq_alias, exog_row, list(X_base.columns))
-                    pred_i_t = float(model.predict(X_step.values.astype(float))[0])
-                    pred_i = float(inverse_target_transform(np.asarray([pred_i_t], dtype=float), y_transform)[0])
+                    pred_i = float(model.predict(X_step)[0])
                     pred_i = max(pred_i, 0.0)
                     preds.append(pred_i)
                     history.append(pred_i)
                 pred_val = np.asarray(preds, dtype=float)
             else:
                 pred_direct = []
-                last_model = None
                 for h in range(1, len(val_inner)+1):
                     feat_shifted = feat_inner.copy()
                     feat_shifted["target_h"] = feat_shifted["y"].shift(-h)
-                    train_rows = max(0, len(tr_inner) - h)
-                    ds_train = feat_shifted.iloc[:train_rows][inner_cols + ["target_h"]].dropna().copy()
+                    train_mask = np.arange(len(feat_shifted)) < len(tr_inner)
+                    ds_train = feat_shifted.loc[train_mask, inner_cols + ["target_h"]].dropna().copy()
                     if len(ds_train) < 8:
                         raise ValueError("Direct strategy için yeterli gözlem yok.")
-                    X_h = ds_train[inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-                    y_h_raw = ds_train["target_h"].astype(float).values
-                    y_h = apply_target_transform(pd.Series(y_h_raw), y_transform)[0].values.astype(float)
-                    model_h = build_fast_xgb_regressor(cfg)
+                    X_h = ds_train[inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    y_h = ds_train["target_h"].astype(float).values
+                    model_h = XGBRegressor(objective="reg:squarederror", random_state=42, **cfg) if HAS_XGBOOST else XGBRegressor(random_state=42)
                     model_h.fit(X_h, y_h)
                     origin_idx = len(tr_inner) - 1
-                    row = feat_inner.iloc[[origin_idx]][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-                    pred_h_t = float(model_h.predict(row)[0])
-                    pred_direct.append(max(float(inverse_target_transform(np.asarray([pred_h_t]), y_transform)[0]), 0.0))
-                    last_model = model_h
+                    row = feat_inner.iloc[[origin_idx]][inner_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                    pred_direct.append(max(float(model_h.predict(row)[0]), 0.0))
                 pred_val = np.asarray(pred_direct[:len(val_inner)], dtype=float)
-                model = last_model
+                model = model_h
             score = wape(val_inner["y"].values, pred_val)
             sm = smape(val_inner["y"].values, pred_val)
-            asym = compute_asymmetric_validation_penalty(val_inner["y"].values, pred_val, tr_inner["y"].values, severity=1.0)
-            composite = float(score + 0.35 * sm + asym["penalty"])
-            row = {**raw_cfg, "strategy": strategy, "transform": y_transform.get("name", "none"), "val_wape": score, "val_smape": sm, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "backend": type(model).__name__ if model is not None else None, "composite_score": composite}
-            return {"row": row, "score": composite, "best": {"cfg": cfg, "strategy": strategy, "transform_cfg": y_transform}}
-        except Exception as e:
-            row = {**raw_cfg, "strategy": strategy, "transform": y_transform.get("name", "none"), "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:180]}
-            return {"row": row, "score": np.inf, "best": None}
-
-    for item in SEARCH_ACCELERATOR.parallel_map(_evaluate_xgb_cfg, grid, max_workers=FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers):
-        search_rows.append(item["row"])
-        if item["best"] is not None and item["score"] < best_score:
-            best_score = item["score"]
-            best = item["best"]
+            search_rows.append({**cfg, "strategy": strategy, "val_wape": score, "val_smape": sm})
+            if score < best_score:
+                best_score = score
+                best = {"cfg": cfg, "strategy": strategy}
+        except Exception:
+            continue
 
     if best is None:
         raise RuntimeError("XGBoost modeli kurulamadı.")
 
     feat_train_test, feature_cols = generate_target_ml_features(full, exog_combined, freq_alias)
-    feature_cols = _select_core_ml_feature_columns(feature_cols, freq_alias, len(train_df))
     X_train_final = feat_train_test.iloc[:train_cut][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    y_train_final_raw = train_df["y"].astype(float).values
-    y_train_final = apply_target_transform(pd.Series(y_train_final_raw), best["transform_cfg"])[0].values.astype(float)
+    y_train_final = train_df["y"].astype(float).values
 
     if best["strategy"] == "recursive":
-        model = build_fast_xgb_regressor(best["cfg"])
-        if HAS_XGBOOST and type(model).__name__ == "XGBRegressor" and len(X_train_final) >= 16:
-            es = max(4, min(12, len(X_train_final) // 5))
-            model.fit(
-                X_train_final.iloc[:-es].values.astype(float),
-                y_train_final[:-es],
-                eval_set=[(X_train_final.iloc[-es:].values.astype(float), y_train_final[-es:])],
-                verbose=False
-            )
+        model = XGBRegressor(objective="reg:squarederror", random_state=42, **best["cfg"]) if HAS_XGBOOST else XGBRegressor(random_state=42)
+        if HAS_XGBOOST and len(X_train_final) >= 12:
+            split = max(2, len(X_train_final)//5)
+            model.fit(X_train_final.iloc[:-split], y_train_final[:-split], eval_set=[(X_train_final.iloc[-split:], y_train_final[-split:])], verbose=False)
         else:
-            model.fit(X_train_final.values.astype(float), np.asarray(y_train_final, dtype=float))
+            model.fit(X_train_final, y_train_final)
         history = list(train_df["y"].astype(float).values)
         preds = []
         for i in range(len(future_df)):
             target_date = pd.to_datetime(future_df.iloc[i]["ds"])
             exog_row = exog_combined.iloc[train_cut + i] if exog_combined is not None else None
             X_step = build_recursive_feature_row(history, target_date, freq_alias, exog_row, list(X_train_final.columns))
-            pred_i_t = float(model.predict(X_step.values.astype(float))[0])
-            pred_i = max(float(inverse_target_transform(np.asarray([pred_i_t]), best["transform_cfg"])[0]), 0.0)
+            pred_i = max(float(model.predict(X_step)[0]), 0.0)
             preds.append(pred_i)
             history.append(pred_i)
         pred_test = np.asarray(preds, dtype=float)
@@ -8847,16 +5781,13 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
         for h in range(1, len(future_df)+1):
             feat_shifted = feat_train_test.copy()
             feat_shifted["target_h"] = feat_shifted["y"].shift(-h)
-            train_rows = max(0, train_cut - h)
-            ds_train = feat_shifted.iloc[:train_rows][feature_cols + ["target_h"]].dropna().copy()
-            X_h = ds_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-            y_h_raw = ds_train["target_h"].astype(float).values
-            y_h = apply_target_transform(pd.Series(y_h_raw), best["transform_cfg"])[0].values.astype(float)
-            model_h = build_fast_xgb_regressor(best["cfg"])
+            ds_train = feat_shifted.iloc[:train_cut][feature_cols + ["target_h"]].dropna().copy()
+            X_h = ds_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            y_h = ds_train["target_h"].astype(float).values
+            model_h = XGBRegressor(objective="reg:squarederror", random_state=42, **best["cfg"]) if HAS_XGBOOST else XGBRegressor(random_state=42)
             model_h.fit(X_h, y_h)
-            origin_row = feat_train_test.iloc[[train_cut-1]][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).values.astype(float)
-            pred_h_t = float(model_h.predict(origin_row)[0])
-            pred_test.append(max(float(inverse_target_transform(np.asarray([pred_h_t]), best["transform_cfg"])[0]), 0.0))
+            origin_row = feat_train_test.iloc[[train_cut-1]][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            pred_test.append(max(float(model_h.predict(origin_row)[0]), 0.0))
             trained_models.append(model_h)
         pred_test = np.asarray(pred_test, dtype=float)
 
@@ -8864,125 +5795,49 @@ def fit_xgboost_strategy(train_df: pd.DataFrame, future_df: pd.DataFrame, exog_c
     try:
         fi = getattr(trained_models[0], "feature_importances_", None)
         if fi is not None:
-            importance_df = pd.DataFrame({"feature": list(X_train_final.columns), "importance": fi}).sort_values("importance", ascending=False).head(25).reset_index(drop=True)
+            importance_df = pd.DataFrame({"feature": list(X_train_final.columns), "importance": fi}).sort_values("importance", ascending=False).head(20).reset_index(drop=True)
     except Exception:
         pass
 
-    shap_status = "disabled"
-    backend_name = type(trained_models[0]).__name__ if trained_models else None
-    result = {
+    shap_status = "not_available"
+    if HAS_SHAP:
+        try:
+            explainer = shap.Explainer(trained_models[0], X_train_final.head(min(100, len(X_train_final))))
+            sv = explainer(X_train_final.head(min(50, len(X_train_final))))
+            shap_status = f"computed_on_{sv.values.shape[0]}_rows"
+        except Exception:
+            shap_status = "failed_optional"
+
+    return {
         "model": trained_models[0],
         "forecast": pred_test,
         "strategy": best["strategy"],
-        "transform": best["transform_cfg"].get("name", "none"),
-        "search_table": pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True], na_position="last").reset_index(drop=True),
+        "search_table": pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True]).reset_index(drop=True),
         "feature_importance": importance_df,
         "shap_status": shap_status,
-        "used_feature_count": len(X_train_final.columns),
-        "fallback_used": False,
-        "fallback_method": None,
-        "backend_name": backend_name,
-        "validation_wape": safe_float(best_score),
-        "validation_smape": safe_float(pd.DataFrame(search_rows).sort_values(["val_wape", "val_smape"], ascending=[True, True], na_position="last").head(1)["val_smape"].iloc[0]) if len(search_rows) else np.nan,
-        "search_accelerator_cache_hit": False,
+        "used_feature_count": len(X_train_final.columns)
     }
-    SEARCH_ACCELERATOR.put_result(cache_key, result)
-    return result
+
 
 def fit_xgboost_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M") -> Dict[str, Any]:
-    if XGBRegressor is None and SKHistGradientBoostingRegressor is None:
-        fallback = seasonal_naive_forecast(train_df["y"], len(test_df), infer_seasonal_period(freq_alias))
-        return {
-            "model": None,
-            "forecast": np.maximum(np.asarray(fallback, dtype=float), 0.0),
-            "strategy": "fallback",
-            "search_table": pd.DataFrame(),
-            "feature_importance": pd.DataFrame(columns=["feature", "importance"]),
-            "shap_status": "disabled",
-            "used_feature_count": 0,
-            "fallback_used": True,
-            "fallback_method": "seasonal_naive",
-            "backend_name": "seasonal_naive"
-        }
-
-    cache_key = build_search_signature("xgb_family", freq_alias, train_df, test_df, exog_train=feature_train, exog_test=feature_test)
-    cached = SEARCH_ACCELERATOR.get_result(cache_key)
-    if cached is not None:
-        cached["search_accelerator_cache_hit"] = True
-        return cached
-
     exog_combined = None
-    selected_ml_cols: List[str] = []
-    dropped_ml_cols: List[str] = []
     if feature_train is not None and feature_test is not None and len(feature_train.columns) > 0:
-        red_key = build_search_signature("xgb_reduce_ml", freq_alias, train_df, test_df, exog_train=feature_train, exog_test=feature_test, extra={"max_cols": FORECAST_RUNTIME_CONFIG.xgb_max_feature_cols})
-        red_tr, red_te, selected_ml_cols, dropped_ml_cols = SEARCH_ACCELERATOR.get_or_compute_artifact(
-            red_key,
-            lambda: reduce_ml_feature_set(feature_train, feature_test, pd.to_numeric(train_df["y"], errors="coerce").astype(float), max_cols=FORECAST_RUNTIME_CONFIG.xgb_max_feature_cols)
-        )
-        if red_tr is not None and red_te is not None:
-            exog_combined = pd.concat([red_tr.reset_index(drop=True), red_te.reset_index(drop=True)], axis=0, ignore_index=True)
+        exog_combined = pd.concat([feature_train.reset_index(drop=True), feature_test.reset_index(drop=True)], axis=0, ignore_index=True)
 
-    short_monthly = str(freq_alias).upper() == "M" and len(train_df) <= 96
+    recursive_res = fit_xgboost_strategy(train_df, test_df, exog_combined, freq_alias, strategy="recursive")
+    direct_res = fit_xgboost_strategy(train_df, test_df, exog_combined, freq_alias, strategy="direct")
 
-    def _run_recursive():
-        res = fit_xgboost_strategy(train_df, test_df, exog_combined, freq_alias, strategy="recursive")
-        res["selected_ml_feature_cols"] = selected_ml_cols
-        res["dropped_ml_feature_cols"] = dropped_ml_cols
-        return res
-
-    if FORECAST_RUNTIME_CONFIG.xgb_skip_direct_on_short_series and short_monthly:
-        recursive_res = _run_recursive()
-        recursive_res["strategy_comparison"] = pd.DataFrame([{
-            "strategy": "recursive",
-            "WAPE": wape(test_df["y"].values, recursive_res["forecast"]),
-            "sMAPE": smape(test_df["y"].values, recursive_res["forecast"]),
-            "used_feature_count": recursive_res.get("used_feature_count", np.nan),
-            "backend_name": recursive_res.get("backend_name")
-        }])
-        SEARCH_ACCELERATOR.put_result(cache_key, recursive_res)
-        return recursive_res
-
-    def _run_direct():
-        res = fit_xgboost_strategy(train_df, test_df, exog_combined, freq_alias, strategy="direct")
-        res["selected_ml_feature_cols"] = selected_ml_cols
-        res["dropped_ml_feature_cols"] = dropped_ml_cols
-        return res
-
-    task_results = SEARCH_ACCELERATOR.run_parallel_tasks({"recursive": _run_recursive, "direct": _run_direct}, max_workers=min(2, FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers))
-    recursive_res = task_results["recursive"]
-    direct_res = task_results["direct"]
-    rec_val_wape = safe_float(recursive_res.get("validation_wape", np.nan))
-    dir_val_wape = safe_float(direct_res.get("validation_wape", np.nan))
-    rec_val_smape = safe_float(recursive_res.get("validation_smape", np.nan))
-    dir_val_smape = safe_float(direct_res.get("validation_smape", np.nan))
-    if pd.notna(rec_val_wape) and pd.notna(dir_val_wape):
-        rec_comp = safe_float(recursive_res.get("validation_wape", np.nan)) + 0.35 * safe_float(recursive_res.get("validation_smape", np.nan))
-        dir_comp = safe_float(direct_res.get("validation_wape", np.nan)) + 0.35 * safe_float(direct_res.get("validation_smape", np.nan))
-        best = recursive_res if (rec_comp, rec_val_wape, rec_val_smape) <= (dir_comp, dir_val_wape, dir_val_smape) else direct_res
-    elif pd.notna(rec_val_wape):
-        best = recursive_res
-    elif pd.notna(dir_val_wape):
-        best = direct_res
-    else:
-        best = recursive_res
+    rec_wape = wape(test_df["y"].values, recursive_res["forecast"])
+    dir_wape = wape(test_df["y"].values, direct_res["forecast"])
+    best = recursive_res if rec_wape <= dir_wape else direct_res
     best["strategy_comparison"] = pd.DataFrame([
-        {"strategy": "recursive", "val_WAPE": rec_val_wape, "val_sMAPE": rec_val_smape, "used_feature_count": recursive_res.get("used_feature_count", np.nan), "backend_name": recursive_res.get("backend_name")},
-        {"strategy": "direct", "val_WAPE": dir_val_wape, "val_sMAPE": dir_val_smape, "used_feature_count": direct_res.get("used_feature_count", np.nan), "backend_name": direct_res.get("backend_name")},
-    ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
-    best["search_accelerator_cache_hit"] = False
-    SEARCH_ACCELERATOR.put_result(cache_key, best)
+        {"strategy": "recursive", "WAPE": rec_wape, "sMAPE": smape(test_df["y"].values, recursive_res["forecast"]), "used_feature_count": recursive_res.get("used_feature_count", np.nan)},
+        {"strategy": "direct", "WAPE": dir_wape, "sMAPE": smape(test_df["y"].values, direct_res["forecast"]), "used_feature_count": direct_res.get("used_feature_count", np.nan)},
+    ]).sort_values(["WAPE", "sMAPE"], ascending=[True, True]).reset_index(drop=True)
     return best
 
+
 def build_model_metrics(model_name: str, y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    err = y_pred - y_true
-    scale = max(float(np.nanmean(np.abs(y_true))) if np.isfinite(np.nanmean(np.abs(y_true))) else 0.0, 1e-6)
-    bias = float(np.nanmean(err)) if len(err) else np.nan
-    bias_pct = float(100.0 * bias / scale) if pd.notna(bias) else np.nan
-    under_forecast_rate = float(np.nanmean((y_pred < y_true).astype(float))) if len(y_true) else np.nan
-    over_forecast_rate = float(np.nanmean((y_pred > y_true).astype(float))) if len(y_true) else np.nan
     return {
         "model": model_name,
         "MAE": mae(y_true, y_pred),
@@ -8991,10 +5846,6 @@ def build_model_metrics(model_name: str, y_train: np.ndarray, y_true: np.ndarray
         "sMAPE": smape(y_true, y_pred),
         "WAPE": wape(y_true, y_pred),
         "MASE": mase(y_true, y_pred, y_train, seasonality=1),
-        "Bias": bias,
-        "BiasPct": bias_pct,
-        "UnderForecastRate": under_forecast_rate,
-        "OverForecastRate": over_forecast_rate,
     }
 
 
@@ -9002,1195 +5853,98 @@ def build_champion_challenger(metrics_df: pd.DataFrame) -> Dict[str, Any]:
     ranked = metrics_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
     champion = ranked.iloc[0]["model"] if len(ranked) >= 1 else None
     challenger = ranked.iloc[1]["model"] if len(ranked) >= 2 else None
-    return {"champion": champion, "challenger": challenger, "holdout_winner": champion, "ranking": ranked}
+    return {"champion": champion, "challenger": challenger, "ranking": ranked}
 
 
-def infer_runtime_regime_from_profile(profile: Optional[Dict[str, Any]] = None, y_train: Optional[np.ndarray] = None) -> Dict[str, Any]:
-    profile = profile or {}
-    intermittency = safe_float(profile.get("intermittency_ratio", np.nan))
-    cv = safe_float(profile.get("cv", np.nan))
-    seasonality = safe_float(profile.get("seasonality_strength", np.nan))
-    trend = safe_float(profile.get("trend_strength", np.nan))
-    if y_train is not None and (pd.isna(intermittency) or pd.isna(cv)):
-        ys = pd.Series(np.asarray(y_train, dtype=float))
-        if pd.isna(intermittency):
-            intermittency = safe_float((ys.fillna(0) == 0).mean())
-        if pd.isna(cv):
-            mu = safe_float(ys.mean())
-            sigma = safe_float(ys.std())
-            cv = safe_float(sigma / mu) if pd.notna(mu) and mu not in [0, 0.0] else np.nan
-    return {
-        "intermittent_like": bool(pd.notna(intermittency) and intermittency >= 0.20),
-        "seasonal_like": bool(pd.notna(seasonality) and seasonality >= 0.18),
-        "trendy_like": bool(pd.notna(trend) and trend >= 0.10),
-        "volatile_like": bool(pd.notna(cv) and cv >= 0.35),
-        "intermittency": intermittency,
-        "cv": cv,
-        "seasonality": seasonality,
-        "trend": trend,
-    }
-
-
-def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    if not isinstance(validation_df, pd.DataFrame) or len(validation_df) == 0:
-        return pd.DataFrame(columns=["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"])
-    profile = profile or {}
-    regime = infer_runtime_regime_from_profile(profile=profile)
-    out = validation_df.copy()
-    out["bağlamsal_ceza"] = 0.0
-    freq_alias = str(profile.get("freq_alias", "")).upper() if isinstance(profile, dict) else ""
-    if not regime.get("intermittent_like", False):
-        out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 7.50
-        if freq_alias in ["W", "D", "H"]:
-            out.loc[out["model"].eq("Intermittent"), "bağlamsal_ceza"] += 1.25
-    if not regime.get("seasonal_like", False):
-        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.75
-    if freq_alias == "W":
-        out.loc[out["model"].eq("Prophet"), "bağlamsal_ceza"] += 0.85
-    if regime.get("volatile_like", False):
-        out.loc[out["model"].eq("ARIMA"), "bağlamsal_ceza"] += 0.20
-        out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] += 0.10
-    if regime.get("seasonal_like", False):
-        out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] -= 0.15
-    if regime.get("trendy_like", False):
-        out.loc[out["model"].eq("XGBoost"), "bağlamsal_ceza"] -= 0.10
-    out["bağlamsal_doğrulama_skoru"] = pd.to_numeric(out.get("val_WAPE"), errors="coerce").fillna(99.0) + pd.to_numeric(out.get("val_sMAPE"), errors="coerce").fillna(99.0) * 0.12 + out["bağlamsal_ceza"].fillna(0.0)
-    return out.sort_values(["bağlamsal_doğrulama_skoru", "val_WAPE", "val_sMAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
-
-
-def build_weighted_ensemble(
-    pred_map: Dict[str, np.ndarray],
-    metrics_df: pd.DataFrame,
-    validation_df: Optional[pd.DataFrame] = None,
-    y_train: Optional[np.ndarray] = None,
-    y_true: Optional[np.ndarray] = None,
-    rolling_summary: Optional[pd.DataFrame] = None,
-    profile: Optional[Dict[str, Any]] = None,
-) -> Tuple[np.ndarray, pd.DataFrame]:
-    """
-    Gerçek rolling-aware + bias-aware + peak-aware + regime-aware ansambl.
-    Haftalık veri için recent-local ve horizon-specific kaliteyi daha güçlü kullanır.
-    """
-    if not pred_map:
-        raise ValueError("Ansambl için model bulunamadı.")
-
-    profile = profile or {}
-    regime = infer_runtime_regime_from_profile(profile=profile, y_train=y_train)
-    freq_alias = str(profile.get("freq_alias", "")).upper() if isinstance(profile, dict) else ""
-
+def build_weighted_ensemble(pred_map: Dict[str, np.ndarray], metrics_df: pd.DataFrame) -> Tuple[np.ndarray, pd.DataFrame]:
     use_df = metrics_df.loc[metrics_df["model"].isin(pred_map.keys())].copy()
     if len(use_df) == 0:
-        raise ValueError("Ansambl için metrik bulunamadı.")
-
-    if validation_df is not None and len(validation_df) > 0:
-        val_ctx = build_contextual_validation_ranking(validation_df.loc[validation_df["model"].isin(pred_map.keys())].copy(), profile=profile)
-        keep = [c for c in ["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"] if c in val_ctx.columns]
-        if keep:
-            use_df = use_df.merge(val_ctx[keep], on="model", how="left")
-    else:
-        use_df["val_WAPE"] = np.nan
-        use_df["val_sMAPE"] = np.nan
-        use_df["bağlamsal_ceza"] = 0.0
-        use_df["bağlamsal_doğrulama_skoru"] = np.nan
-
-    if rolling_summary is not None and len(rolling_summary) > 0:
-        rs = rolling_summary.loc[rolling_summary["model"].isin(pred_map.keys())].copy()
-        if len(rs):
-            rs = rs.rename(columns={"WAPE": "ro_WAPE", "MAE": "ro_MAE"})
-            keep = [c for c in ["model", "ro_WAPE", "ro_MAE"] if c in rs.columns]
-            use_df = use_df.merge(rs[keep], on="model", how="left")
-    if "ro_WAPE" not in use_df.columns:
-        use_df["ro_WAPE"] = np.nan
-    if "ro_MAE" not in use_df.columns:
-        use_df["ro_MAE"] = np.nan
-
-    recent_rows = []
-    peak_rows = []
-    if y_train is not None and y_true is not None:
-        y_true_arr = np.asarray(y_true, dtype=float)
-        for model_name, pred in pred_map.items():
-            pred_arr = np.asarray(pred, dtype=float)
-            try:
-                peak = compute_peak_event_score(np.asarray(y_train, dtype=float), y_true_arr, pred_arr)
-                peak_rows.append({"model": model_name, "peak_event_score": safe_float(peak.get("peak_event_score", np.nan))})
-            except Exception:
-                peak_rows.append({"model": model_name, "peak_event_score": np.nan})
-            try:
-                ape = np.abs(y_true_arr - pred_arr) / np.where(np.abs(y_true_arr) > 1e-8, np.abs(y_true_arr), np.nan)
-                recent_window = min(4 if freq_alias == "W" else 3, len(ape))
-                horizon_w = np.linspace(1.0, 1.6 if freq_alias == "W" else 1.35, len(ape))
-                recent_local_wape = np.nanmean(ape[-recent_window:]) * 100.0 if recent_window > 0 else np.nan
-                horizon_specific_wape = np.nansum(ape * horizon_w) / np.nansum(np.isfinite(ape) * horizon_w) * 100.0 if len(ape) else np.nan
-                recent_rows.append({"model": model_name, "recent_local_WAPE": safe_float(recent_local_wape), "horizon_specific_WAPE": safe_float(horizon_specific_wape)})
-            except Exception:
-                recent_rows.append({"model": model_name, "recent_local_WAPE": np.nan, "horizon_specific_WAPE": np.nan})
-    if peak_rows:
-        use_df = use_df.merge(pd.DataFrame(peak_rows), on="model", how="left")
-    if recent_rows:
-        use_df = use_df.merge(pd.DataFrame(recent_rows), on="model", how="left")
-
-    for c in ["BiasPct", "UnderForecastRate", "peak_event_score", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "recent_local_WAPE", "horizon_specific_WAPE"]:
-        if c in use_df.columns:
-            use_df[c] = pd.to_numeric(use_df[c], errors="coerce")
-        else:
-            use_df[c] = np.nan
-
-    def _min_norm(series: pd.Series) -> pd.Series:
-        s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if s.notna().sum() == 0:
-            return pd.Series(1.0, index=series.index, dtype=float)
-        mn, mx = float(s.min()), float(s.max())
-        if not np.isfinite(mn) or not np.isfinite(mx) or abs(mx - mn) < 1e-9:
-            return pd.Series(0.0, index=series.index, dtype=float)
-        return (s - mn) / (mx - mn)
-
-    use_df["hold_norm"] = _min_norm(use_df["WAPE"])
-    use_df["val_norm"] = _min_norm(use_df["val_WAPE"].fillna(use_df["WAPE"]))
-    use_df["ro_norm"] = _min_norm(use_df["ro_WAPE"].fillna(use_df["WAPE"]))
-    use_df["recent_norm"] = _min_norm(use_df["recent_local_WAPE"].fillna(use_df["WAPE"]))
-    use_df["horizon_norm"] = _min_norm(use_df["horizon_specific_WAPE"].fillna(use_df["WAPE"]))
-    use_df["bias_pen"] = use_df["BiasPct"].abs().fillna(0.0).clip(upper=18.0) / 18.0
-    use_df["under_pen"] = (use_df["UnderForecastRate"].fillna(0.5) - 0.52).clip(lower=0.0, upper=0.40) / 0.40
-    use_df["peak_pen"] = (0.74 - use_df["peak_event_score"].fillna(0.0)).clip(lower=0.0, upper=0.74) / 0.74
-    use_df["regime_pen"] = 0.0
-    if not regime.get("intermittent_like", False):
-        use_df.loc[use_df["model"].eq("Intermittent"), "regime_pen"] += 0.55
-    if not regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.25
-    if freq_alias == "W":
-        use_df.loc[use_df["model"].eq("Prophet"), "regime_pen"] += 0.25
-    if regime.get("seasonal_like", False):
-        use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_pen"] -= 0.08
-    if regime.get("volatile_like", False):
-        use_df.loc[use_df["model"].eq("XGBoost"), "regime_pen"] -= 0.05
-
-    # Haftalıkta rolling ve lokal yakın geçmişe daha fazla ağırlık ver
-    if freq_alias == "W":
-        hold_w, val_w, ro_w, recent_w, horiz_w = 0.18, 0.18, 0.26, 0.16, 0.12
-    else:
-        hold_w, val_w, ro_w, recent_w, horiz_w = 0.26, 0.23, 0.24, 0.10, 0.06
-
-    use_df["birleşik_skor"] = (
-        use_df["hold_norm"].fillna(1.0) * hold_w
-        + use_df["val_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * val_w
-        + use_df["ro_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * ro_w
-        + use_df["recent_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * recent_w
-        + use_df["horizon_norm"].fillna(use_df["hold_norm"]).fillna(1.0) * horiz_w
-        + use_df["peak_pen"].fillna(0.0) * 0.08
-        + use_df["bias_pen"].fillna(0.0) * 0.04
-        + use_df["under_pen"].fillna(0.0) * 0.03
-        + use_df["regime_pen"].fillna(0.0) * 0.10
-    )
-    use_df = use_df.sort_values(["birleşik_skor", "ro_WAPE", "recent_local_WAPE", "WAPE", "val_WAPE"], ascending=[True, True, True, True, True], na_position="last").reset_index(drop=True)
-    best_score = float(pd.to_numeric(use_df.iloc[0].get("birleşik_skor", np.nan), errors="coerce")) if len(use_df) else 1.0
-    if not np.isfinite(best_score):
-        best_score = 1.0
-
-    pruned = use_df.copy()
-    if len(pruned) > 4:
-        pruned = pruned.head(4).copy()
-    # Haftalıkta Prophet fallback/uygun olmayan durumlarda erken ele
-    if "Prophet" in pruned["model"].tolist() and freq_alias == "W":
-        prow = pruned.loc[pruned["model"].eq("Prophet")].head(1)
-        if len(prow):
-            ps = float(pd.to_numeric(prow.iloc[0].get("birleşik_skor", np.nan), errors="coerce"))
-            if pd.notna(ps) and ps > best_score + 0.05 and len(pruned) > 2:
-                pruned = pruned.loc[~pruned["model"].eq("Prophet")].copy()
-
-    raw = np.exp(-5.5 * (pruned["birleşik_skor"].fillna(1.0) - best_score).clip(lower=0.0))
-    peak_bonus = 0.70 + 0.60 * pruned["peak_event_score"].fillna(0.5).clip(lower=0.0, upper=1.0)
-    bias_factor = np.exp(-0.040 * pruned["BiasPct"].abs().fillna(0.0).clip(upper=18.0))
-    under_factor = np.exp(-2.4 * (pruned["UnderForecastRate"].fillna(0.5) - 0.52).clip(lower=0.0, upper=0.40))
-    regime_factor = np.exp(-2.0 * pruned["regime_pen"].fillna(0.0).clip(lower=0.0, upper=0.80))
-    recent_factor = np.exp(-1.1 * pruned["recent_norm"].fillna(0.5).clip(lower=0.0, upper=1.0))
-    horizon_factor = np.exp(-0.9 * pruned["horizon_norm"].fillna(0.5).clip(lower=0.0, upper=1.0))
-    pruned["HamAğırlık"] = raw
-    pruned["raw_weight"] = raw * peak_bonus * bias_factor * under_factor * regime_factor * recent_factor * horizon_factor
-    if not regime.get("intermittent_like", False) and "Intermittent" in pruned["model"].tolist():
-        idx = pruned.index[pruned["model"].eq("Intermittent")]
-        pruned.loc[idx, "raw_weight"] = np.minimum(pruned.loc[idx, "raw_weight"].astype(float), 0.10 if freq_alias == "W" else 0.15)
-    pruned = pruned.sort_values(["birleşik_skor", "ro_WAPE", "recent_local_WAPE", "WAPE"], ascending=[True, True, True, True], na_position="last").reset_index(drop=True)
-    w = pruned["raw_weight"].astype(float).values
-    if not np.isfinite(w).all() or np.sum(w) <= 0:
-        w = np.ones(len(pruned), dtype=float)
-    w = w / np.sum(w)
-    if len(w) >= 2 and w[0] < (0.55 if freq_alias == "W" else 0.50):
-        target_top = 0.55 if freq_alias == "W" else 0.50
-        deficit = target_top - w[0]
-        w[0] = target_top
-        rest = w[1:]
-        if rest.sum() > 0:
-            rest = rest / rest.sum()
-            w[1:] = np.maximum(0.0, w[1:] - deficit * rest)
-            w = w / max(w.sum(), 1e-9)
-    pruned["weight"] = w
+        raise ValueError("Ensemble için model yok.")
+    use_df["raw_weight"] = 1.0 / np.maximum(use_df["WAPE"].astype(float), 1e-6)
+    use_df["weight"] = use_df["raw_weight"] / use_df["raw_weight"].sum()
     ensemble = None
-    for _, row in pruned.iterrows():
+    for _, row in use_df.iterrows():
         pred = np.asarray(pred_map[row["model"]], dtype=float)
         ensemble = pred * row["weight"] if ensemble is None else ensemble + pred * row["weight"]
-    out_cols = [c for c in ["model", "WAPE", "sMAPE", "val_WAPE", "val_sMAPE", "ro_WAPE", "ro_MAE", "recent_local_WAPE", "horizon_specific_WAPE", "BiasPct", "UnderForecastRate", "peak_event_score", "regime_pen", "birleşik_skor", "HamAğırlık", "raw_weight", "weight"] if c in pruned.columns]
-    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), pruned[out_cols]
+    return np.maximum(np.asarray(ensemble, dtype=float), 0.0), use_df[["model", "WAPE", "sMAPE", "weight"]]
 
-def build_model_level_fallback(model_name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, error_message: str) -> Dict[str, Any]:
-    season_length = infer_season_length_from_freq(freq_alias)
-    pred, method_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, season_length)
-    return {
-        "forecast": np.maximum(np.asarray(pred, dtype=float), 0.0),
-        "search_table": pd.DataFrame([{
-            "model": model_name,
-            "fallback_used": True,
-            "fallback_method": method_name,
-            "error": str(error_message)[:500]
-        }]),
-        "fallback_used": True,
-        "fallback_method": method_name,
-        "error": str(error_message)
-    }
-
-
-def compute_peak_event_score(y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, quantile: float = 0.80) -> Dict[str, Any]:
-    y_train = np.asarray(y_train, dtype=float)
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    if len(y_true) == 0:
-        return {"peak_threshold": np.nan, "peak_precision": np.nan, "peak_recall": np.nan, "peak_f1": np.nan, "peak_event_score": np.nan}
-    base_hist = y_train[np.isfinite(y_train)] if np.isfinite(y_train).any() else y_true[np.isfinite(y_true)]
-    if len(base_hist) == 0:
-        threshold = np.nanmedian(y_true)
-    else:
-        threshold = float(np.nanquantile(base_hist, quantile))
-    actual_peak = y_true >= threshold
-    pred_peak = y_pred >= max(threshold * 0.98, 1e-6)
-    tp = int(np.sum(actual_peak & pred_peak))
-    fp = int(np.sum((~actual_peak) & pred_peak))
-    fn = int(np.sum(actual_peak & (~pred_peak)))
-    precision = float(tp / max(tp + fp, 1))
-    recall = float(tp / max(tp + fn, 1))
-    f1 = float(2 * precision * recall / max(precision + recall, 1e-12)) if (precision + recall) > 0 else 0.0
-    return {
-        "peak_threshold": threshold,
-        "peak_precision": precision,
-        "peak_recall": recall,
-        "peak_f1": f1,
-        "peak_event_score": f1,
-        "actual_peak_count": int(np.sum(actual_peak)),
-        "pred_peak_count": int(np.sum(pred_peak)),
-    }
-
-
-def build_bias_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for model_name, table in (outputs.get("tables") or {}).items():
-        if table is None or len(table) == 0:
-            continue
-        y_true = pd.to_numeric(table["y"], errors="coerce").astype(float).values
-        y_pred = pd.to_numeric(table["prediction"], errors="coerce").astype(float).values
-        err = y_pred - y_true
-        mean_demand = max(float(np.nanmean(np.abs(y_true))) if len(y_true) else 0.0, 1e-6)
-        rows.append({
-            "model": model_name,
-            "mean_error": float(np.nanmean(err)) if len(err) else np.nan,
-            "median_error": float(np.nanmedian(err)) if len(err) else np.nan,
-            "bias_pct": float(100.0 * np.nanmean(err) / mean_demand) if len(err) else np.nan,
-            "under_forecast_rate": float(np.nanmean((y_pred < y_true).astype(float))) if len(y_true) else np.nan,
-            "over_forecast_rate": float(np.nanmean((y_pred > y_true).astype(float))) if len(y_true) else np.nan,
-            "max_under_error": float(np.nanmin(err)) if len(err) else np.nan,
-            "max_over_error": float(np.nanmax(err)) if len(err) else np.nan,
-        })
-    if not rows:
-        return pd.DataFrame(columns=["model", "mean_error", "median_error", "bias_pct", "under_forecast_rate", "over_forecast_rate", "max_under_error", "max_over_error"])
-    out = pd.DataFrame(rows)
-    out["abs_bias_pct"] = pd.to_numeric(out["bias_pct"], errors="coerce").abs()
-    out = out.sort_values(["abs_bias_pct", "mean_error"], ascending=[True, True]).drop(columns=["abs_bias_pct"]).reset_index(drop=True)
-    return out
-
-
-def build_peak_event_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    y_train = pd.to_numeric(outputs["train"]["y"], errors="coerce").astype(float).values if outputs.get("train") is not None else np.array([])
-    for model_name, table in (outputs.get("tables") or {}).items():
-        if table is None or len(table) == 0:
-            continue
-        peak = compute_peak_event_score(y_train, table["y"].values, table["prediction"].values)
-        peak["model"] = model_name
-        rows.append(peak)
-    if not rows:
-        return pd.DataFrame(columns=["model", "peak_threshold", "peak_precision", "peak_recall", "peak_f1", "peak_event_score", "actual_peak_count", "pred_peak_count"])
-    return pd.DataFrame(rows).sort_values(["peak_event_score", "peak_recall"], ascending=[False, False]).reset_index(drop=True)
-
-
-def estimate_model_interval_scale(outputs: Dict[str, Any], model_name: str) -> float:
-    robt = outputs.get("rolling_origin_backtest")
-    if isinstance(robt, pd.DataFrame) and len(robt) > 0 and "model" in robt.columns:
-        rows = robt.loc[robt["model"] == model_name].copy()
-        if len(rows) > 0 and "MAE" in rows.columns:
-            val = float(pd.to_numeric(rows["MAE"], errors="coerce").median())
-            if np.isfinite(val) and val > 0:
-                return val
-    metrics_df = outputs.get("metrics_df")
-    if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) > 0:
-        row = metrics_df.loc[metrics_df["model"] == model_name]
-        if len(row) > 0:
-            val = float(pd.to_numeric(row.iloc[0].get("MAE", np.nan), errors="coerce"))
-            if np.isfinite(val) and val > 0:
-                return val
-    table = (outputs.get("tables") or {}).get(model_name)
-    if isinstance(table, pd.DataFrame) and len(table) > 0:
-        val = float(pd.to_numeric(table.get("abs_error"), errors="coerce").median())
-        if np.isfinite(val) and val > 0:
-            return val
-    return 1.0
-
-
-def build_prediction_interval_table(test_df: pd.DataFrame, pred: np.ndarray, scale: float, coverage_levels: Tuple[float, ...] = (0.80, 0.90, 0.95)) -> pd.DataFrame:
-    out = test_df[["ds", "y"]].copy().reset_index(drop=True)
-    out["q50"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    z_map = {0.80: 1.2816, 0.90: 1.6449, 0.95: 1.9600}
-    for level in coverage_levels:
-        z = z_map.get(round(float(level), 2), 1.6449)
-        h_idx = np.arange(1, len(out) + 1, dtype=float)
-        width = np.maximum(float(scale), 1e-6) * np.sqrt(h_idx) * z
-        low = np.maximum(out["q50"].values - width, 0.0)
-        high = np.maximum(out["q50"].values + width, 0.0)
-        low_q = int(round(((1.0 - level) / 2.0) * 100.0))
-        high_q = int(round((1.0 - (1.0 - level) / 2.0) * 100.0))
-        out[f"q{low_q:02d}"] = low
-        out[f"q{high_q:02d}"] = high
-        out[f"coverage_{int(level*100)}"] = ((out["y"] >= low) & (out["y"] <= high)).astype(int)
-    return out
-
-
-def build_feature_availability_audit(df_features: pd.DataFrame, date_col: str, target_col: str, stat_exog_cols: List[str], prophet_exog_cols: List[str], ml_feature_cols: List[str]) -> pd.DataFrame:
-    safe_future_keywords = ["month", "quarter", "year", "week", "dayofweek", "dayofmonth", "sin", "cos", "is_month", "is_quarter", "is_year", "holiday", "calendar"]
-    risky_keywords = ["price", "promo", "campaign", "stock", "inventory", "epidem", "rx", "otc", "channel", "weather", "temp", "shipment", "supply"]
-    rows: List[Dict[str, Any]] = []
-    memberships = {}
-    for c in stat_exog_cols:
-        memberships.setdefault(c, set()).add("statistical")
-    for c in prophet_exog_cols:
-        memberships.setdefault(c, set()).add("prophet")
-    for c in ml_feature_cols:
-        memberships.setdefault(c, set()).add("ml")
-    for c, used_in in sorted(memberships.items()):
-        lc = str(c).lower()
-        if any(k in lc for k in safe_future_keywords):
-            status = "future_known"
-            risk_score = 0.05
-            recommendation = "Üretimde güvenle üretilebilir/türetilir."
-        elif any(k in lc for k in risky_keywords):
-            status = "requires_business_plan_or_forecast"
-            risk_score = 0.65
-            recommendation = "Üretim anında bu değişken için ayrı plan/forecast gerekir."
-        else:
-            status = "unknown_future_availability"
-            risk_score = 0.40
-            recommendation = "Üretimde varlığı veri kontratı ile doğrulanmalı."
-        non_na_ratio = float(pd.to_numeric(df_features[c], errors="coerce").notna().mean()) if c in df_features.columns else np.nan
-        rows.append({
-            "feature": c,
-            "used_in": ", ".join(sorted(used_in)),
-            "availability_status": status,
-            "availability_risk_score": risk_score,
-            "historical_non_null_ratio": non_na_ratio,
-            "recommendation": recommendation,
-        })
-    if not rows:
-        return pd.DataFrame(columns=["feature", "used_in", "availability_status", "availability_risk_score", "historical_non_null_ratio", "recommendation"])
-    return pd.DataFrame(rows).sort_values(["availability_risk_score", "feature"], ascending=[False, True]).reset_index(drop=True)
-
-
-def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.DataFrame) -> pd.DataFrame:
-    profile = outputs.get("metadata", {}).get("profile", {}) or {}
-    n_obs = int(outputs.get("metadata", {}).get("train_n", 0) + outputs.get("metadata", {}).get("test_n", 0))
-    intermittency = float(profile.get("intermittency_ratio", 0.0) or 0.0)
-    seasonality = float(profile.get("seasonality_strength", 0.0) or 0.0)
-    trend_strength = float(profile.get("trend_strength", 0.0) or 0.0)
-    val_df = outputs.get("validation_metrics_df", pd.DataFrame()).copy()
-    bias_df = build_bias_dashboard(outputs)
-    peak_df = build_peak_event_dashboard(outputs)
-    metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
-    robt = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
-    best_val = float(pd.to_numeric(val_df.get("val_WAPE"), errors="coerce").min()) if len(val_df) else np.nan
-    best_ro = float(pd.to_numeric(robt.get("WAPE"), errors="coerce").min()) if len(robt) else np.nan
-    risk_by_area = {}
-    if isinstance(feature_audit_df, pd.DataFrame) and len(feature_audit_df) > 0 and "used_in" in feature_audit_df.columns:
-        for area in ["statistical", "prophet", "ml"]:
-            rows = feature_audit_df[feature_audit_df["used_in"].str.contains(area, na=False)]
-            risk_by_area[area] = float(rows["availability_risk_score"].max()) if len(rows) else 0.0
-    rows_out: List[Dict[str, Any]] = []
-    for model_name in ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "Intermittent", "Ensemble"]:
-        reasons = []
-        score = 100.0
-        area_risk = 0.0
-        if model_name in ["SARIMA/SARIMAX", "ARIMA"]:
-            area_risk = risk_by_area.get("statistical", 0.0)
-        elif model_name == "Prophet":
-            area_risk = risk_by_area.get("prophet", 0.0)
-        elif model_name == "XGBoost":
-            area_risk = risk_by_area.get("ml", 0.0)
-        score -= 20.0 * area_risk
-        if area_risk >= 0.60:
-            reasons.append("Gelecekte hazır olmayabilecek özellik bağımlılığı yüksek.")
-        val_row = val_df.loc[val_df["model"] == model_name] if len(val_df) else pd.DataFrame()
-        val_wape = float(pd.to_numeric(val_row.iloc[0].get("val_WAPE", np.nan), errors="coerce")) if len(val_row) else np.nan
-        if pd.notna(val_wape):
-            score -= min(max(val_wape - 8.0, 0.0), 40.0)
-            if val_wape > 22.0:
-                reasons.append("Doğrulama WAPE yüksek.")
-            if pd.notna(best_val) and val_wape > min(best_val * 1.12, best_val + 1.0):
-                score -= 8.0
-                reasons.append("Doğrulama performansı lider modele göre belirgin zayıf.")
-        ro_row = robt.loc[robt["model"] == model_name] if len(robt) else pd.DataFrame()
-        ro_wape = float(pd.to_numeric(ro_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(ro_row) else np.nan
-        if pd.notna(ro_wape):
-            score -= min(max(ro_wape - 8.0, 0.0) * 1.3, 35.0)
-            if pd.notna(best_ro) and ro_wape > min(best_ro * 1.08, best_ro + 0.75):
-                score -= 10.0
-                reasons.append("Rolling-origin performansı lider modele göre zayıf.")
-        bias_row = bias_df.loc[bias_df["model"] == model_name] if len(bias_df) else pd.DataFrame()
-        bias_pct = float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan
-        if pd.notna(bias_pct):
-            score -= min(abs(bias_pct) * 0.8, 20.0)
-            if abs(bias_pct) > 12.0:
-                reasons.append("Sapma yüksek.")
-        peak_row = peak_df.loc[peak_df["model"] == model_name] if len(peak_df) else pd.DataFrame()
-        peak_score = float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan
-        if pd.notna(peak_score):
-            score -= 15.0 * max(0.0, 0.45 - peak_score)
-            if peak_score < 0.35:
-                reasons.append("Tepe dönem yakalama zayıf.")
-        if model_name == "Prophet":
-            if n_obs < 84:
-                score -= 16.0
-                reasons.append("Kısa aylık seri için Prophet kırılgan olabilir.")
-            if intermittency >= 0.20:
-                score -= 20.0
-                reasons.append("Aralıklı yapı Prophet için zayıf uyumlu.")
-            if seasonality < 0.18 and trend_strength < 0.10:
-                score -= 14.0
-                reasons.append("Trend/sezonsallık sinyali Prophet için sınırlı.")
-            if bool((outputs.get("prophet") or {}).get("fallback_used", False)):
-                score -= 18.0
-                reasons.append("Prophet fallback ile çalıştı; üretim için güven zayıf.")
-            hold_row = metrics_df.loc[metrics_df["model"] == "Prophet"] if len(metrics_df) else pd.DataFrame()
-            hold_wape = float(pd.to_numeric(hold_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(hold_row) else np.nan
-            best_hold = float(pd.to_numeric(metrics_df.get("WAPE"), errors="coerce").min()) if len(metrics_df) else np.nan
-            if pd.notna(hold_wape) and pd.notna(best_hold) and hold_wape > min(best_hold * 1.15, best_hold + 1.0):
-                score -= 12.0
-                reasons.append("Holdout performansı lider modele göre zayıf.")
-        if model_name == "Intermittent" and intermittency < 0.20:
-            score -= 38.0
-            reasons.append("Intermittent model, düzenli seri için birincil aday değil.")
-        elif model_name == "Intermittent" and intermittency < 0.30:
-            score -= 14.0
-            reasons.append("Seri tam intermittent değil; intermittent modelin etkisi sınırlandı.")
-        if model_name == "XGBoost" and n_obs < 30:
-            score -= 15.0
-            reasons.append("Makine öğrenmesi için gözlem sayısı sınırlı.")
-        if model_name == "Ensemble":
-            metric_row = metrics_df.loc[metrics_df["model"] == model_name] if len(metrics_df) else pd.DataFrame()
-            champion_row = metrics_df.sort_values(["WAPE", "sMAPE"], ascending=[True, True]).head(1)
-            if len(metric_row) and len(champion_row):
-                ens_wape = float(pd.to_numeric(metric_row.iloc[0].get("WAPE", np.nan), errors="coerce"))
-                champ_wape = float(pd.to_numeric(champion_row.iloc[0].get("WAPE", np.nan), errors="coerce"))
-                if pd.notna(ens_wape) and pd.notna(champ_wape) and ens_wape > champ_wape + 0.50:
-                    score -= 24.0
-                    reasons.append("Ansambl, lider modelin üzerine çıkamıyor.")
-        status = "eligible"
-        if model_name == "Prophet" and score < 85.0:
-            status = "challenger_only"
-        elif score < 75.0:
-            status = "challenger_only"
-        if model_name == "Prophet" and score < 72.0:
-            status = "reject"
-        elif score < 58.0:
-            status = "reject"
-        rows_out.append({
-            "model": model_name,
-            "eligibility_score": float(np.clip(score, 0.0, 100.0)),
-            "status": status,
-            "validation_wape": val_wape,
-            "rolling_wape": ro_wape,
-            "bias_pct": bias_pct,
-            "peak_event_score": peak_score,
-            "feature_availability_risk": area_risk,
-            "reasons": " | ".join(reasons) if reasons else "Uygunluk açısından belirgin kırmızı bayrak yok.",
-        })
-    rank_map = {"eligible": 0, "challenger_only": 1, "reject": 2}
-    out = pd.DataFrame(rows_out)
-    out["status_rank"] = out["status"].map(rank_map).fillna(9)
-    out = out.sort_values(["status_rank", "eligibility_score"], ascending=[True, False]).drop(columns=["status_rank"]).reset_index(drop=True)
-    return out
-
-
-def build_forecast_value_add(outputs: Dict[str, Any], freq_alias: str) -> pd.DataFrame:
-    train_df = outputs.get("train")
-    test_df = outputs.get("test")
-    if train_df is None or test_df is None or len(test_df) == 0:
-        return pd.DataFrame(columns=["model", "baseline_name", "baseline_WAPE", "model_WAPE", "fva_wape_pct", "baseline_MAE", "model_MAE", "fva_mae_pct"])
-    season_len = infer_season_length_from_freq(freq_alias)
-    baseline_pred, baseline_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, season_len)
-    baseline_w = wape(test_df["y"].values, baseline_pred)
-    baseline_m = mae(test_df["y"].values, baseline_pred)
-    rows = []
-    for _, row in outputs.get("metrics_df", pd.DataFrame()).iterrows():
-        model_name = row["model"]
-        model_w = float(pd.to_numeric(row.get("WAPE", np.nan), errors="coerce"))
-        model_m = float(pd.to_numeric(row.get("MAE", np.nan), errors="coerce"))
-        rows.append({
-            "model": model_name,
-            "baseline_name": baseline_name,
-            "baseline_WAPE": baseline_w,
-            "model_WAPE": model_w,
-            "fva_wape_pct": float(100.0 * (baseline_w - model_w) / max(baseline_w, 1e-6)) if pd.notna(model_w) else np.nan,
-            "baseline_MAE": baseline_m,
-            "model_MAE": model_m,
-            "fva_mae_pct": float(100.0 * (baseline_m - model_m) / max(baseline_m, 1e-6)) if pd.notna(model_m) else np.nan,
-        })
-    return pd.DataFrame(rows).sort_values(["fva_wape_pct", "fva_mae_pct"], ascending=[False, False]).reset_index(drop=True)
-
-
-def build_service_level_simulation(test_df: pd.DataFrame, pred: np.ndarray, interval_df: pd.DataFrame) -> pd.DataFrame:
-    if test_df is None or len(test_df) == 0:
-        return pd.DataFrame(columns=["service_level_target", "achieved_cycle_service", "avg_safety_stock", "avg_total_stock_target", "avg_stockout_units"])
-    actual = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
-    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    rows = []
-    for level, hi_col in [(0.80, "q90"), (0.90, "q95")]:
-        if hi_col not in interval_df.columns:
-            continue
-        stock_target = np.maximum(pd.to_numeric(interval_df[hi_col], errors="coerce").astype(float).values, pred)
-        safety_stock = np.maximum(stock_target - pred, 0.0)
-        achieved = float(np.mean(actual <= stock_target)) if len(actual) else np.nan
-        stockout_units = np.maximum(actual - stock_target, 0.0)
-        rows.append({
-            "service_level_target": level,
-            "achieved_cycle_service": achieved,
-            "avg_safety_stock": float(np.nanmean(safety_stock)) if len(safety_stock) else np.nan,
-            "avg_total_stock_target": float(np.nanmean(stock_target)) if len(stock_target) else np.nan,
-            "avg_stockout_units": float(np.nanmean(stockout_units)) if len(stockout_units) else np.nan,
-        })
-    return pd.DataFrame(rows)
-
-
-def build_live_monitoring_pack(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
-    prod_model = production_pack.get("production_model", outputs.get("best_model"))
-    bias_df = production_pack.get("bias_dashboard", pd.DataFrame())
-    peak_df = production_pack.get("peak_event_dashboard", pd.DataFrame())
-    gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame())
-    interval_df = production_pack.get("production_interval_table", pd.DataFrame())
-    feature_df = production_pack.get("feature_availability_audit", pd.DataFrame())
-    service_df = production_pack.get("production_service_table", pd.DataFrame())
-    full_ro = outputs.get("rolling_origin_backtest", pd.DataFrame())
-    robt = summarize_full_backtest(full_ro)
-    fallback_flags = {
-        "XGBoost": bool((outputs.get("xgboost") or {}).get("fallback_used", False)),
-        "Prophet": bool((outputs.get("prophet") or {}).get("fallback_used", False)),
-        "SARIMA/SARIMAX": bool((outputs.get("sarima") or {}).get("fallback_used", False)),
-        "ARIMA": bool((outputs.get("arima") or {}).get("fallback_used", False)),
-        "Intermittent": bool((outputs.get("intermittent") or {}).get("fallback_used", False)),
-        "Ensemble": False,
-    }
-    fallback_rate = float(np.mean(list(fallback_flags.values()))) if fallback_flags else 0.0
-    alerts = []
-    train_y = pd.to_numeric(outputs.get("train", pd.DataFrame()).get("y"), errors="coerce").astype(float) if isinstance(outputs.get("train"), pd.DataFrame) else pd.Series(dtype=float)
-    prod_pred = np.asarray((outputs.get("predictions") or {}).get(prod_model, np.array([])), dtype=float)
-    recent_mean = float(train_y.tail(min(6, len(train_y))).mean()) if len(train_y) else np.nan
-    drift_ratio = float(np.mean(prod_pred) / max(recent_mean, 1e-6)) if len(prod_pred) and pd.notna(recent_mean) else np.nan
-    bias_row = bias_df.loc[bias_df["model"] == prod_model].head(1) if len(bias_df) else pd.DataFrame()
-    peak_row = peak_df.loc[peak_df["model"] == prod_model].head(1) if len(peak_df) else pd.DataFrame()
-    gate_row = gate_df.loc[gate_df["model"] == prod_model].head(1) if len(gate_df) else pd.DataFrame()
-    ro_row = robt.loc[robt["model"] == prod_model].head(1) if len(robt) else pd.DataFrame()
-    service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) else pd.DataFrame()
-    achieved_service = float(pd.to_numeric(service_row.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce")) if len(service_row) else np.nan
-    target_service = float(pd.to_numeric(service_row.iloc[0].get("service_level_target", np.nan), errors="coerce")) if len(service_row) else np.nan
-    freq_desc = outputs.get("metadata", {}).get("freq_alias", outputs.get("metadata", {}).get("frequency", "?"))
-    summary_row = {
-        "üretim_modeli": prod_model,
-        "üretim_durumu": production_pack.get("production_status", "eligible"),
-        "frekans": freq_desc,
-        "sapma_yüzde": float(pd.to_numeric(bias_row.iloc[0].get("bias_pct", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "eksik_tahmin_oranı": float(pd.to_numeric(bias_row.iloc[0].get("under_forecast_rate", np.nan), errors="coerce")) if len(bias_row) else np.nan,
-        "tepe_olay_skoru": float(pd.to_numeric(peak_row.iloc[0].get("peak_event_score", np.nan), errors="coerce")) if len(peak_row) else np.nan,
-        "uygunluk_skoru": float(pd.to_numeric(gate_row.iloc[0].get("eligibility_score", np.nan), errors="coerce")) if len(gate_row) else np.nan,
-        "rolling_wape": float(pd.to_numeric(ro_row.iloc[0].get("WAPE", np.nan), errors="coerce")) if len(ro_row) else np.nan,
-        "drift_oranı": drift_ratio,
-        "kapsama_80": float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
-        "kapsama_90": float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
-        "maksimum_özellik_riski": float(pd.to_numeric(feature_df.get("availability_risk_score"), errors="coerce").max()) if isinstance(feature_df, pd.DataFrame) and len(feature_df) and "availability_risk_score" in feature_df.columns else np.nan,
-        "fallback_oranı": fallback_rate,
-        "gerçekleşen_servis": achieved_service,
-        "hedef_servis": target_service,
-    }
-    if pd.notna(summary_row["sapma_yüzde"]) and abs(summary_row["sapma_yüzde"]) > 8.0:
-        alerts.append({"severity": "high", "alert": "sapma_alarmı", "detail": f"Sapma yüksek: {summary_row['sapma_yüzde']:.2f}%"})
-    if pd.notna(summary_row["eksik_tahmin_oranı"]) and summary_row["eksik_tahmin_oranı"] > 0.60:
-        alerts.append({"severity": "high", "alert": "eksik_tahmin_alarmı", "detail": f"Eksik tahmin oranı yüksek: {summary_row['eksik_tahmin_oranı']:.2f}"})
-    if pd.notna(summary_row["tepe_olay_skoru"]) and summary_row["tepe_olay_skoru"] < 0.35:
-        alerts.append({"severity": "high", "alert": "tepe_yakalama_alarmı", "detail": f"Tepe olay yakalama zayıf: {summary_row['tepe_olay_skoru']:.2f}"})
-    if pd.notna(summary_row["drift_oranı"]) and not (0.82 <= summary_row["drift_oranı"] <= 1.22):
-        alerts.append({"severity": "medium", "alert": "drift_alarmı", "detail": f"Tahmin/son dönem seviye oranı: {summary_row['drift_oranı']:.2f}"})
-    if pd.notna(summary_row["maksimum_özellik_riski"]) and summary_row["maksimum_özellik_riski"] > 0.25:
-        alerts.append({"severity": "high", "alert": "özellik_kontratı_alarmı", "detail": "Production feature contract tamamen güvenli değil."})
-    if pd.notna(summary_row["gerçekleşen_servis"]) and pd.notna(summary_row["hedef_servis"]) and summary_row["gerçekleşen_servis"] + 1e-9 < summary_row["hedef_servis"]:
-        alerts.append({"severity": "high", "alert": "servis_seviyesi_alarmı", "detail": f"Servis seviyesi hedef altında: {summary_row['gerçekleşen_servis']:.2f} < {summary_row['hedef_servis']:.2f}"})
-    if fallback_rate > 0.20:
-        alerts.append({"severity": "medium", "alert": "fallback_oranı_alarmı", "detail": f"Model ailelerinde fallback oranı yüksek: {fallback_rate:.2f}"})
-    recommendation = "guardrailli_üretime_uygun"
-    if any(a["severity"] == "high" for a in alerts):
-        recommendation = "shadow_mode_zorunlu"
-    elif alerts:
-        recommendation = "şampiyon_meydan_okuyan_paralel"
-    summary = pd.DataFrame([summary_row])
-    summary["alarm_sayısı"] = len(alerts)
-    summary["yüksek_alarm_sayısı"] = sum(1 for a in alerts if a["severity"] == "high")
-    summary["canlı_kullanım_önerisi"] = recommendation
-    summary["karar_açıklaması"] = build_production_decision_explanation(production_pack.get("production_ranking", pd.DataFrame()), prod_model)
-    summary["karar_kartı"] = summary.apply(lambda r: f"Model: {r['üretim_modeli']} | Sapma: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f} | Fallback: {safe_float(r.get('fallback_oranı', np.nan)):.2f} | Drift: {safe_float(r.get('drift_oranı', np.nan)):.2f} | Servis: {safe_float(r.get('gerçekleşen_servis', np.nan)):.2f}/{safe_float(r.get('hedef_servis', np.nan)):.2f} | Alarm: {int(r.get('alarm_sayısı', 0)) if pd.notna(r.get('alarm_sayısı', np.nan)) else 0}", axis=1)
-
-    metric_df = outputs.get("metrics_df", pd.DataFrame())
-    prediction_interval_tables = production_pack.get("quantile_forecasts", {}) or {}
-    service_level_tables = production_pack.get("service_level_simulation", {}) or {}
-    health_rows = []
-    for model_name in metric_df.get("model", pd.Series(dtype=str)).tolist() if isinstance(metric_df, pd.DataFrame) else []:
-        mrow = metric_df.loc[metric_df["model"] == model_name].head(1)
-        brow = bias_df.loc[bias_df["model"] == model_name].head(1) if len(bias_df) else pd.DataFrame()
-        prow = peak_df.loc[peak_df["model"] == model_name].head(1) if len(peak_df) else pd.DataFrame()
-        grow = gate_df.loc[gate_df["model"] == model_name].head(1) if len(gate_df) else pd.DataFrame()
-        rrow = robt.loc[robt["model"] == model_name].head(1) if len(robt) else pd.DataFrame()
-        qtbl = prediction_interval_tables.get(model_name, pd.DataFrame())
-        stbl = service_level_tables.get(model_name, pd.DataFrame())
-        srow = stbl.loc[stbl["service_level_target"] == stbl["service_level_target"].max()].head(1) if isinstance(stbl, pd.DataFrame) and len(stbl) else pd.DataFrame()
-        health_rows.append({
-            "model": model_name,
-            "WAPE": safe_float(mrow.iloc[0].get("WAPE", np.nan)) if len(mrow) else np.nan,
-            "rolling_WAPE": safe_float(rrow.iloc[0].get("WAPE", np.nan)) if len(rrow) else np.nan,
-            "sapma_yüzde": safe_float(brow.iloc[0].get("bias_pct", np.nan)) if len(brow) else np.nan,
-            "eksik_tahmin_oranı": safe_float(brow.iloc[0].get("under_forecast_rate", np.nan)) if len(brow) else np.nan,
-            "tepe_olay_skoru": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
-            "uygunluk_skoru": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
-            "durum": grow.iloc[0].get("status", np.nan) if len(grow) else np.nan,
-            "kapsama_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
-            "gerçekleşen_servis": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
-            "fallback_kullanıldı": bool(fallback_flags.get(model_name, False)),
-            "fallback_yöntemi": ((outputs.get(model_name.lower().replace("/", "_").replace("-", "_"), {}) or {}).get("fallback_method") if isinstance(outputs, dict) else None),
-        })
-    model_health_table = pd.DataFrame(health_rows)
-    if not len(model_health_table):
-        model_health_table = pd.DataFrame(columns=["model", "WAPE", "rolling_WAPE", "sapma_yüzde", "eksik_tahmin_oranı", "tepe_olay_skoru", "uygunluk_skoru", "durum", "kapsama_80", "gerçekleşen_servis", "fallback_kullanıldı", "fallback_yöntemi"])
-    return {"summary": summary, "alerts": pd.DataFrame(alerts) if alerts else pd.DataFrame(columns=["severity", "alert", "detail"]), "model_health_table": model_health_table}
-
-
-def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
-    feature_audit_df = build_feature_availability_audit(export_payload.get("features", pd.DataFrame()), export_payload.get("metadata", {}).get("date_col", "ds"), target_col, outputs.get("metadata", {}).get("stat_exog_cols", []) or [], outputs.get("metadata", {}).get("prophet_exog_cols", []) or [], outputs.get("metadata", {}).get("ml_feature_cols", []) or [])
-    bias_df = build_bias_dashboard(outputs)
-    peak_df = build_peak_event_dashboard(outputs)
-    eligibility_df = build_model_eligibility_gate(outputs, feature_audit_df)
-    eligibility_df = enforce_hard_feature_contract_gate(eligibility_df, feature_audit_df)
-    fva_df = build_forecast_value_add(outputs, freq_alias)
-    quantile_tables: Dict[str, pd.DataFrame] = {}
-    service_tables: Dict[str, pd.DataFrame] = {}
-    full_robt = outputs.get("rolling_origin_backtest", pd.DataFrame())
-    for model_name, pred in (outputs.get("predictions") or {}).items():
-        scale = estimate_model_interval_scale(outputs, model_name)
-        qdf = build_calibrated_prediction_interval_table(outputs["test"], pred, model_name, full_robt, fallback_scale=scale)
-        quantile_tables[model_name] = qdf
-        service_tables[model_name] = build_service_level_simulation(outputs["test"], pred, qdf)
-    metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
-    robt_summary = summarize_full_backtest(full_robt)
-    ranked = metrics_df.copy()
-    if len(robt_summary):
-        ranked = ranked.merge(robt_summary[["model", "WAPE", "MAE"]].rename(columns={"WAPE": "ro_WAPE", "MAE": "ro_MAE"}), on="model", how="left")
-    ranked = ranked.merge(eligibility_df[["model", "status", "eligibility_score"]], on="model", how="left")
-    bias_small = bias_df[["model", "bias_pct", "under_forecast_rate"]] if len(bias_df) else pd.DataFrame(columns=["model", "bias_pct", "under_forecast_rate"])
-    peak_small = peak_df[["model", "peak_event_score"]] if len(peak_df) else pd.DataFrame(columns=["model", "peak_event_score"])
-    ranked = ranked.merge(bias_small, on="model", how="left").merge(peak_small, on="model", how="left")
-    service_rows = []
-    for model_name, sdf in service_tables.items():
-        if isinstance(sdf, pd.DataFrame) and len(sdf):
-            top = sdf.loc[sdf["service_level_target"] == sdf["service_level_target"].max()].head(1)
-            if len(top):
-                tgt = float(pd.to_numeric(top.iloc[0].get("service_level_target", np.nan), errors="coerce"))
-                ach = float(pd.to_numeric(top.iloc[0].get("achieved_cycle_service", np.nan), errors="coerce"))
-                service_rows.append({"model": model_name, "service_level_target": tgt, "achieved_cycle_service": ach, "service_gap": max(tgt - ach, 0.0) if pd.notna(tgt) and pd.notna(ach) else np.nan})
-    service_df = pd.DataFrame(service_rows)
-    if len(service_df):
-        ranked = ranked.merge(service_df[["model", "service_gap", "achieved_cycle_service"]], on="model", how="left")
-    status_rank = {"eligible": 0, "challenger_only": 1, "reject": 2}
-    ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
-    ranked["bias_penalty"] = pd.to_numeric(ranked.get("bias_pct"), errors="coerce").fillna(0.0).abs()
-    ranked["under_penalty"] = (pd.to_numeric(ranked.get("under_forecast_rate"), errors="coerce").fillna(0.0) - 0.50).clip(lower=0.0)
-    ranked["peak_penalty"] = (0.45 - pd.to_numeric(ranked.get("peak_event_score"), errors="coerce").fillna(0.0)).clip(lower=0.0)
-    ranked["service_penalty"] = pd.to_numeric(ranked.get("service_gap"), errors="coerce").fillna(0.0)
-    ranked["ro_WAPE_norm"] = pd.to_numeric(ranked.get("ro_WAPE"), errors="coerce")
-    ranked["hold_WAPE_norm"] = pd.to_numeric(ranked.get("WAPE"), errors="coerce")
-    regime = infer_runtime_regime_from_profile(profile=outputs.get("metadata", {}).get("profile", {}) or {}, y_train=np.asarray(outputs.get("train", pd.DataFrame()).get("y", pd.Series(dtype=float)), dtype=float) if isinstance(outputs.get("train"), pd.DataFrame) and "y" in outputs.get("train", pd.DataFrame()).columns else None)
-    ranked["bağlamsal_ceza"] = 0.0
-    if not regime.get("intermittent_like", False):
-        ranked.loc[ranked["model"].eq("Intermittent"), "bağlamsal_ceza"] += 2.5
-    if not regime.get("seasonal_like", False):
-        ranked.loc[ranked["model"].eq("Prophet"), "bağlamsal_ceza"] += 1.1
-    ranked["operasyonel_skor"] = (
-        ranked["status_rank"].fillna(9.0) * 1000.0
-        + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.78
-        + ranked["hold_WAPE_norm"].fillna(99.0) * 0.10
-        + ranked["service_penalty"].fillna(0.0) * 22.0
-        + ranked["under_penalty"].fillna(0.0) * 14.5
-        + ranked["bias_penalty"].fillna(0.0) * 1.45
-        + ranked["peak_penalty"].fillna(0.0) * 12.5
-        + ranked["bağlamsal_ceza"].fillna(0.0) * 9.5
-        - pd.to_numeric(ranked.get("eligibility_score"), errors="coerce").fillna(0.0) * 0.03
-    )
-    sort_cols = ["operasyonel_skor", "ro_WAPE", "WAPE", "service_penalty", "under_penalty", "bias_penalty", "peak_penalty", "eligibility_score"]
-    asc = [True, True, True, True, True, True, True, False]
-    ranked = ranked.sort_values(sort_cols, ascending=asc, na_position="last").reset_index(drop=True)
-    production_model = ranked.iloc[0]["model"] if len(ranked) else outputs.get("best_model")
-    production_status = ranked.iloc[0]["status"] if len(ranked) else "eligible"
-    if production_status == "reject":
-        preferred = ["ARIMA", "SARIMA/SARIMAX", outputs.get("best_model")]
-        for cand in preferred:
-            if cand in set(outputs.get("predictions", {}).keys()):
-                production_model = cand
-                break
-        production_status = "guarded_fallback"
-    production_interval = quantile_tables.get(production_model, pd.DataFrame())
-    production_service = service_tables.get(production_model, pd.DataFrame())
-    pack = {"feature_availability_audit": feature_audit_df, "bias_dashboard": bias_df, "peak_event_dashboard": peak_df, "forecast_value_add": fva_df, "model_eligibility_gate": eligibility_df, "quantile_forecasts": quantile_tables, "service_level_simulation": service_tables, "production_model": production_model, "production_status": production_status, "production_interval_table": production_interval, "production_service_table": production_service, "rolling_origin_summary": robt_summary, "production_ranking": ranked, "production_decision_explanation": build_production_decision_explanation(ranked, production_model)}
-    pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, pack)
-    return pack
-
-
-
-def _safe_sort_columns(df: pd.DataFrame, preferred_cols: List[str], fallback_cols: Optional[List[str]] = None) -> List[str]:
-    if df is None or len(df) == 0:
-        return []
-    cols = [c for c in preferred_cols if c in df.columns]
-    if cols:
-        return cols
-    fallback_cols = fallback_cols or []
-    return [c for c in fallback_cols if c in df.columns]
-
-
-def _derive_production_ranking(outputs: Dict[str, Any]) -> pd.DataFrame:
-    prod_pack = outputs.get("production_governance", {}) or {}
-    existing = prod_pack.get("production_ranking", pd.DataFrame())
-    if isinstance(existing, pd.DataFrame) and len(existing) > 0:
-        return existing.copy()
-
-    metrics_df = outputs.get("metrics_df", pd.DataFrame())
-    if not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
-        return pd.DataFrame(columns=["model", "status", "eligibility_score", "WAPE", "sMAPE", "MAE"])
-
-    ranked = metrics_df.copy()
-    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
-    if isinstance(gate_df, pd.DataFrame) and len(gate_df) > 0 and "model" in gate_df.columns:
-        merge_cols = [c for c in ["model", "status", "eligibility_score"] if c in gate_df.columns]
-        ranked = ranked.merge(gate_df[merge_cols].drop_duplicates(subset=["model"]), on="model", how="left")
-
-    if "status" not in ranked.columns:
-        ranked["status"] = outputs.get("production_status", "eligible")
-    if "eligibility_score" not in ranked.columns:
-        ranked["eligibility_score"] = np.nan
-
-    status_rank = {"eligible": 0, "guarded_fallback": 1, "challenger_only": 2, "reject": 3}
-    ranked["status_rank"] = ranked["status"].map(status_rank).fillna(9)
-
-    sort_cols = [c for c in ["status_rank", "WAPE", "sMAPE", "MAE", "eligibility_score"] if c in ranked.columns]
-    ascending = []
-    for c in sort_cols:
-        ascending.append(False if c == "eligibility_score" else True)
-    if sort_cols:
-        ranked = ranked.sort_values(sort_cols, ascending=ascending, na_position="last").reset_index(drop=True)
-    return ranked
-
-
-
-def _build_minimum_live_summary(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
-    prod_model = prod_pack.get("production_model") or outputs.get("production_model") or outputs.get("best_model")
-    prod_status = prod_pack.get("production_status") or outputs.get("production_status") or "eligible"
-    metrics_df = outputs.get("metrics_df", pd.DataFrame())
-    bias_df = prod_pack.get("bias_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    peak_df = prod_pack.get("peak_event_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    interval_df = prod_pack.get("production_interval_table", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    service_df = prod_pack.get("production_service_table", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    robt = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
-    metric_row = metrics_df.loc[metrics_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) and "model" in metrics_df.columns else pd.DataFrame()
-    bias_row = bias_df.loc[bias_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(bias_df, pd.DataFrame) and len(bias_df) and "model" in bias_df.columns else pd.DataFrame()
-    peak_row = peak_df.loc[peak_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(peak_df, pd.DataFrame) and len(peak_df) and "model" in peak_df.columns else pd.DataFrame()
-    gate_row = gate_df.loc[gate_df["model"].astype(str) == str(prod_model)].head(1) if isinstance(gate_df, pd.DataFrame) and len(gate_df) and "model" in gate_df.columns else pd.DataFrame()
-    ro_row = robt.loc[robt["model"].astype(str) == str(prod_model)].head(1) if isinstance(robt, pd.DataFrame) and len(robt) and "model" in robt.columns else pd.DataFrame()
-    service_row = service_df.loc[service_df["service_level_target"] == service_df["service_level_target"].max()].head(1) if isinstance(service_df, pd.DataFrame) and len(service_df) and "service_level_target" in service_df.columns else pd.DataFrame()
-    fallback_summary = outputs.get("fallback_summary", pd.DataFrame())
-    fb_rate = np.nan
-    if isinstance(fallback_summary, pd.DataFrame) and len(fallback_summary) and "fallback_used" in fallback_summary.columns:
-        fb_rate = float(pd.to_numeric(fallback_summary["fallback_used"], errors="coerce").fillna(0).mean())
-    elif isinstance(outputs, dict):
-        fb_flags = []
-        for k in ["xgboost", "prophet", "sarima", "arima", "intermittent"]:
-            fb_flags.append(bool((outputs.get(k) or {}).get("fallback_used", False)))
-        fb_rate = float(np.mean(fb_flags)) if fb_flags else np.nan
-    row = {
-        "üretim_modeli": prod_model,
-        "üretim_durumu": prod_status,
-        "frekans": outputs.get("metadata", {}).get("freq_alias", "?"),
-        "holdout_wape": safe_float(metric_row.iloc[0].get("WAPE", np.nan)) if len(metric_row) else np.nan,
-        "sapma_yüzde": safe_float(bias_row.iloc[0].get("bias_pct", metric_row.iloc[0].get("BiasPct", np.nan) if len(metric_row) else np.nan)) if (len(bias_row) or len(metric_row)) else np.nan,
-        "eksik_tahmin_oranı": safe_float(bias_row.iloc[0].get("under_forecast_rate", metric_row.iloc[0].get("UnderForecastRate", np.nan) if len(metric_row) else np.nan)) if (len(bias_row) or len(metric_row)) else np.nan,
-        "tepe_olay_skoru": safe_float(peak_row.iloc[0].get("peak_event_score", np.nan)) if len(peak_row) else np.nan,
-        "uygunluk_skoru": safe_float(gate_row.iloc[0].get("eligibility_score", np.nan)) if len(gate_row) else np.nan,
-        "rolling_wape": safe_float(ro_row.iloc[0].get("WAPE", np.nan)) if len(ro_row) else np.nan,
-        "kapsama_80": safe_float(interval_df["coverage_80"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_80" in interval_df.columns else np.nan,
-        "kapsama_90": safe_float(interval_df["coverage_90"].mean()) if isinstance(interval_df, pd.DataFrame) and "coverage_90" in interval_df.columns else np.nan,
-        "fallback_oranı": safe_float(fb_rate),
-        "gerçekleşen_servis": safe_float(service_row.iloc[0].get("achieved_cycle_service", np.nan)) if len(service_row) else np.nan,
-        "hedef_servis": safe_float(service_row.iloc[0].get("service_level_target", np.nan)) if len(service_row) else np.nan,
-    }
-    out = pd.DataFrame([row])
-    out["alarm_sayısı"] = 0
-    out["yüksek_alarm_sayısı"] = 0
-    out["canlı_kullanım_önerisi"] = prod_status
-    out["karar_açıklaması"] = prod_pack.get("production_decision_explanation") or build_production_decision_explanation(prod_pack.get("production_ranking", pd.DataFrame()), prod_model)
-    out["karar_kartı"] = out.apply(lambda r: f"Model: {r['üretim_modeli']} | WAPE: {safe_float(r.get('holdout_wape', np.nan)):.2f} | Rolling: {safe_float(r.get('rolling_wape', np.nan)):.2f} | Bias: {safe_float(r.get('sapma_yüzde', np.nan)):.2f}% | Kapsama80: {safe_float(r.get('kapsama_80', np.nan)):.2f}", axis=1)
-    return out
-
-
-def _build_minimum_model_health_table(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
-    metrics_df = outputs.get("metrics_df", pd.DataFrame())
-    if not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
-        preds = outputs.get("predictions", {}) or {}
-        metrics_df = pd.DataFrame([{"model": k} for k in preds.keys()]) if preds else pd.DataFrame(columns=["model"])
-    bias_df = prod_pack.get("bias_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    peak_df = prod_pack.get("peak_event_dashboard", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
-    qtables = prod_pack.get("quantile_forecasts", {}) if isinstance(prod_pack, dict) else {}
-    stables = prod_pack.get("service_level_simulation", {}) if isinstance(prod_pack, dict) else {}
-    robt = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
-    fallback_map = {
-        "XGBoost": outputs.get("xgboost", {}) or {},
-        "Prophet": outputs.get("prophet", {}) or {},
-        "SARIMA/SARIMAX": outputs.get("sarima", {}) or {},
-        "ARIMA": outputs.get("arima", {}) or {},
-        "Intermittent": outputs.get("intermittent", {}) or {},
-        "Ensemble": {},
-    }
-    rows = []
-    models = metrics_df.get("model", pd.Series(dtype=str)).astype(str).tolist() if "model" in metrics_df.columns else []
-    for model_name in models:
-        mrow = metrics_df.loc[metrics_df["model"].astype(str) == str(model_name)].head(1) if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) and "model" in metrics_df.columns else pd.DataFrame()
-        brow = bias_df.loc[bias_df["model"].astype(str) == str(model_name)].head(1) if isinstance(bias_df, pd.DataFrame) and len(bias_df) and "model" in bias_df.columns else pd.DataFrame()
-        prow = peak_df.loc[peak_df["model"].astype(str) == str(model_name)].head(1) if isinstance(peak_df, pd.DataFrame) and len(peak_df) and "model" in peak_df.columns else pd.DataFrame()
-        grow = gate_df.loc[gate_df["model"].astype(str) == str(model_name)].head(1) if isinstance(gate_df, pd.DataFrame) and len(gate_df) and "model" in gate_df.columns else pd.DataFrame()
-        rrow = robt.loc[robt["model"].astype(str) == str(model_name)].head(1) if isinstance(robt, pd.DataFrame) and len(robt) and "model" in robt.columns else pd.DataFrame()
-        qtbl = qtables.get(model_name, pd.DataFrame()) if isinstance(qtables, dict) else pd.DataFrame()
-        stbl = stables.get(model_name, pd.DataFrame()) if isinstance(stables, dict) else pd.DataFrame()
-        srow = stbl.loc[stbl["service_level_target"] == stbl["service_level_target"].max()].head(1) if isinstance(stbl, pd.DataFrame) and len(stbl) and "service_level_target" in stbl.columns else pd.DataFrame()
-        fallback_obj = fallback_map.get(model_name, {}) or {}
-        rows.append({
-            "model": model_name,
-            "WAPE": safe_float(mrow.iloc[0].get("WAPE", np.nan)) if len(mrow) else np.nan,
-            "rolling_WAPE": safe_float(rrow.iloc[0].get("WAPE", np.nan)) if len(rrow) else np.nan,
-            "sapma_yüzde": safe_float(brow.iloc[0].get("bias_pct", mrow.iloc[0].get("BiasPct", np.nan) if len(mrow) else np.nan)) if (len(brow) or len(mrow)) else np.nan,
-            "eksik_tahmin_oranı": safe_float(brow.iloc[0].get("under_forecast_rate", mrow.iloc[0].get("UnderForecastRate", np.nan) if len(mrow) else np.nan)) if (len(brow) or len(mrow)) else np.nan,
-            "tepe_olay_skoru": safe_float(prow.iloc[0].get("peak_event_score", np.nan)) if len(prow) else np.nan,
-            "uygunluk_skoru": safe_float(grow.iloc[0].get("eligibility_score", np.nan)) if len(grow) else np.nan,
-            "durum": grow.iloc[0].get("status", prod_pack.get("production_status", "eligible")) if len(grow) else prod_pack.get("production_status", "eligible"),
-            "kapsama_80": safe_float(qtbl["coverage_80"].mean()) if isinstance(qtbl, pd.DataFrame) and "coverage_80" in qtbl.columns else np.nan,
-            "gerçekleşen_servis": safe_float(srow.iloc[0].get("achieved_cycle_service", np.nan)) if len(srow) else np.nan,
-            "fallback_kullanıldı": bool(fallback_obj.get("fallback_used", False)),
-            "fallback_yöntemi": fallback_obj.get("fallback_method"),
-        })
-    cols = ["model", "WAPE", "rolling_WAPE", "sapma_yüzde", "eksik_tahmin_oranı", "tepe_olay_skoru", "uygunluk_skoru", "durum", "kapsama_80", "gerçekleşen_servis", "fallback_kullanıldı", "fallback_yöntemi"]
-    return pd.DataFrame(rows, columns=cols)
-
-
-def ensure_production_reporting_tables(outputs: Dict[str, Any], export_payload: Optional[Dict[str, pd.DataFrame]] = None, target_col: Optional[str] = None, freq_alias: Optional[str] = None) -> Dict[str, Any]:
-    if not isinstance(outputs, dict):
-        return outputs
-    prod_pack = outputs.get("production_governance", {}) or {}
-    if not isinstance(prod_pack, dict):
-        prod_pack = {}
-
-    if (not prod_pack) and export_payload is not None and target_col is not None and freq_alias is not None:
-        try:
-            prod_pack = build_production_governance_pack(outputs, export_payload, target_col, freq_alias) or {}
-        except Exception:
-            prod_pack = {}
-
-    ranking = prod_pack.get("production_ranking", pd.DataFrame())
-    if not isinstance(ranking, pd.DataFrame) or len(ranking) == 0:
-        tmp_outputs = dict(outputs)
-        tmp_outputs["production_governance"] = prod_pack
-        ranking = _derive_production_ranking(tmp_outputs)
-        prod_pack["production_ranking"] = ranking
-
-    if not prod_pack.get("production_model"):
-        if isinstance(ranking, pd.DataFrame) and len(ranking) and "model" in ranking.columns:
-            prod_pack["production_model"] = ranking.iloc[0]["model"]
-        else:
-            prod_pack["production_model"] = outputs.get("best_model")
-    if not prod_pack.get("production_status"):
-        if isinstance(ranking, pd.DataFrame) and len(ranking) and "status" in ranking.columns:
-            prod_pack["production_status"] = ranking.iloc[0]["status"]
-        else:
-            prod_pack["production_status"] = outputs.get("production_status", "eligible")
-
-    outputs["production_model"] = prod_pack.get("production_model", outputs.get("best_model"))
-    outputs["production_status"] = prod_pack.get("production_status", outputs.get("production_status", "eligible"))
-
-    live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
-    need_live_rebuild = (
-        not isinstance(live_pack, dict)
-        or not isinstance(live_pack.get("summary"), pd.DataFrame)
-        or len(live_pack.get("summary", pd.DataFrame())) == 0
-        or not isinstance(live_pack.get("model_health_table"), pd.DataFrame)
-        or len(live_pack.get("model_health_table", pd.DataFrame())) == 0
-    )
-    if need_live_rebuild:
-        try:
-            live_pack = build_live_monitoring_pack(outputs, prod_pack)
-        except Exception:
-            live_pack = {}
-
-    if not isinstance(live_pack, dict):
-        live_pack = {}
-    if not isinstance(live_pack.get("summary"), pd.DataFrame) or len(live_pack.get("summary", pd.DataFrame())) == 0:
-        live_pack["summary"] = _build_minimum_live_summary(outputs, prod_pack)
-    if not isinstance(live_pack.get("model_health_table"), pd.DataFrame) or len(live_pack.get("model_health_table", pd.DataFrame())) == 0:
-        live_pack["model_health_table"] = _build_minimum_model_health_table(outputs, prod_pack)
-    if not isinstance(live_pack.get("alerts"), pd.DataFrame):
-        live_pack["alerts"] = pd.DataFrame(columns=["severity", "alert", "detail"])
-
-    prod_pack["live_monitoring_pack"] = live_pack
-    prod_pack["production_decision_explanation"] = prod_pack.get("production_decision_explanation") or build_production_decision_explanation(prod_pack.get("production_ranking", pd.DataFrame()), prod_pack.get("production_model"))
-    outputs["production_governance"] = prod_pack
-    return outputs
-
-def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
-    satirlar = []
-    hold_df = outputs.get("metrics_df", pd.DataFrame())
-    val_df = outputs.get("validation_metrics_df", pd.DataFrame())
-    ro_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
-    prod_rank = _derive_production_ranking(outputs)
-
-    hold_cols = _safe_sort_columns(hold_df, ["WAPE", "sMAPE", "RMSE"], ["WAPE", "sMAPE", "MAE"])
-    val_cols = _safe_sort_columns(val_df, ["validation_operational_score", "val_WAPE", "val_sMAPE"], ["val_WAPE", "val_sMAPE"])
-    ro_cols = _safe_sort_columns(ro_df, ["WAPE", "sMAPE", "MAE"], ["WAPE", "MAE"])
-
-    hold_winner = hold_df.sort_values(hold_cols, ascending=[True] * len(hold_cols)).iloc[0]["model"] if isinstance(hold_df, pd.DataFrame) and len(hold_df) > 0 and hold_cols else outputs.get("best_model")
-    val_winner = val_df.sort_values(val_cols, ascending=[True] * len(val_cols)).iloc[0]["model"] if isinstance(val_df, pd.DataFrame) and len(val_df) > 0 and val_cols else outputs.get("best_model")
-    ro_winner = ro_df.sort_values(ro_cols, ascending=[True] * len(ro_cols)).iloc[0]["model"] if isinstance(ro_df, pd.DataFrame) and len(ro_df) > 0 and ro_cols else outputs.get("best_model")
-    prod_winner = prod_rank.iloc[0]["model"] if isinstance(prod_rank, pd.DataFrame) and len(prod_rank) > 0 and "model" in prod_rank.columns else outputs.get("production_model", outputs.get("best_model"))
-
-    satirlar.append({"karar_kademesi": "Holdout kazananı", "model": hold_winner})
-    satirlar.append({"karar_kademesi": "Doğrulama kazananı", "model": val_winner})
-    satirlar.append({"karar_kademesi": "Rolling-origin kazananı", "model": ro_winner})
-    satirlar.append({"karar_kademesi": "Üretim kazananı", "model": prod_winner})
-    return pd.DataFrame(satirlar)
-
-
-def build_karar_hiyerarsisi_ozeti(outputs: Dict[str, Any]) -> pd.DataFrame:
-    lider = build_model_liderleri(outputs)
-    aciklama_map = {
-        "Holdout kazananı": "Son test ufkunda en düşük hata üreten model.",
-        "Doğrulama kazananı": "İç doğrulama / arama sonuçlarına göre öne çıkan model.",
-        "Rolling-origin kazananı": "Zaman boyunca geri testte daha stabil performans veren model.",
-        "Üretim kazananı": "Uygunluk, risk ve operasyonel kullanılabilirlik açısından canlı kullanım için önerilen model.",
-    }
-    karar_amaci_map = {
-        "Holdout kazananı": "Kısa dönem doğruluk",
-        "Doğrulama kazananı": "Model seçimi doğrulaması",
-        "Rolling-origin kazananı": "Zamansal dayanıklılık",
-        "Üretim kazananı": "Canlı kullanım kararı",
-    }
-    if not isinstance(lider, pd.DataFrame) or len(lider) == 0:
-        return pd.DataFrame(columns=["KararAşaması", "KazananModel", "KararAmacı", "Anlamı"])
-
-    out = lider.rename(columns={"karar_kademesi": "KararAşaması", "model": "KazananModel"}).copy()
-    out["KararAmacı"] = out["KararAşaması"].map(karar_amaci_map)
-    out["Anlamı"] = out["KararAşaması"].map(aciklama_map)
-
-    prod_pack = outputs.get("production_governance", {}) or {}
-    prod_expl = prod_pack.get("production_decision_explanation")
-    if not prod_expl:
-        try:
-            prod_expl = build_production_decision_explanation(_derive_production_ranking(outputs), outputs.get("production_model", outputs.get("best_model")))
-        except Exception:
-            prod_expl = None
-    if prod_expl:
-        extra = pd.DataFrame([{
-            "KararAşaması": "Üretim karar açıklaması",
-            "KazananModel": str(outputs.get("production_model", outputs.get("best_model", "-"))),
-            "KararAmacı": "Neden seçildi?",
-            "Anlamı": str(prod_expl),
-        }])
-        out = pd.concat([out, extra], axis=0, ignore_index=True)
-    return out
-
-
-def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFrame:
-    if not isinstance(prophet_result, dict) or len(prophet_result) == 0:
-        return pd.DataFrame(columns=["Alan", "Değer"])
-
-    mode = prophet_result.get("fit_mode") or prophet_result.get("mode") or "bilinmiyor"
-    fallback_used = bool(prophet_result.get("fallback_used", False))
-    fallback_method = prophet_result.get("fallback_method") or prophet_result.get("fallback_reason")
-    note = prophet_result.get("fit_visibility_note") or prophet_result.get("note") or prophet_result.get("status_note") or "-"
-
-    return pd.DataFrame([
-        {"Alan": "Prophet çalışma modu", "Değer": mode},
-        {"Alan": "Gerçek Prophet fit kullanıldı mı?", "Değer": "evet" if (str(mode) == "gercek_prophet_fit" and not fallback_used) else "hayır"},
-        {"Alan": "Fallback kullanıldı mı?", "Değer": "evet" if fallback_used else "hayır"},
-        {"Alan": "Fallback yöntemi", "Değer": fallback_method or "yok"},
-        {"Alan": "Açıklama", "Değer": note},
-    ])
-
-
-def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
-    prod_pack = prod_pack or {}
-    production_ranking = prod_pack.get("production_ranking", pd.DataFrame())
-    if not isinstance(production_ranking, pd.DataFrame) or len(production_ranking) == 0:
-        production_ranking = _derive_production_ranking(outputs)
-
-    live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
-    if not isinstance(live_pack, dict):
-        live_pack = {}
-
-    adaylar: List[Tuple[str, pd.DataFrame]] = [
-        ("ModelKarşılaştırma", outputs.get("metrics_df", pd.DataFrame())),
-        ("DoğrulamaMetrikleri", outputs.get("validation_metrics_df", pd.DataFrame())),
-        ("KararHiyerarşisi", build_karar_hiyerarsisi_ozeti(outputs)),
-        ("ModelLiderleri", build_model_liderleri(outputs)),
-        ("AnsamblAğırlıkları", outputs.get("ensemble_weights", pd.DataFrame())),
-        ("RollingOriginÖzet", summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))),
-        ("FallbackÖzeti", outputs.get("fallback_summary", pd.DataFrame())),
-        ("ProphetGörünürlük", build_prophet_gorunurluk_ozeti(outputs.get("prophet", {}))),
-        ("ÜretimUygunlukKapısı", prod_pack.get("model_eligibility_gate", pd.DataFrame())),
-        ("ÜretimSıralaması", production_ranking),
-        ("BiasDashboard", prod_pack.get("bias_dashboard", pd.DataFrame())),
-        ("PeakEventDashboard", prod_pack.get("peak_event_dashboard", pd.DataFrame())),
-        ("ForecastValueAdd", prod_pack.get("forecast_value_add", pd.DataFrame())),
-        ("FeatureAudit", prod_pack.get("feature_availability_audit", pd.DataFrame())),
-        ("PredictionIntervals", prod_pack.get("production_interval_table", pd.DataFrame())),
-        ("ServiceLevelSimulation", prod_pack.get("production_service_table", pd.DataFrame())),
-        ("CanlıİzlemeÖzet", live_pack.get("summary", pd.DataFrame())),
-        ("CanlıİzlemeAlarm", live_pack.get("alerts", pd.DataFrame())),
-        ("StageTiming", outputs.get("stage_timing_table", pd.DataFrame())),
-    ]
-
-    rows = []
-    for rapor_adi, df in adaylar:
-        if not isinstance(df, pd.DataFrame) or len(df) == 0:
-            continue
-        rows.append({
-            "Rapor": rapor_adi,
-            "SatırSayısı": int(len(df)),
-            "KolonSayısı": int(len(df.columns)),
-            "Kolonlar": ", ".join(map(str, df.columns.tolist()[:12])) + (" ..." if len(df.columns) > 12 else ""),
-        })
-
-    if not rows:
-        return pd.DataFrame(columns=["Rapor", "SatırSayısı", "KolonSayısı", "Kolonlar"])
-    return pd.DataFrame(rows).sort_values(["Rapor"], ascending=[True]).reset_index(drop=True)
 
 def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
-    ensure_forecasting_runtime_dependencies(include_streamlit=False)
-    progress_log("Pipeline Hazırlık", f"{target_col} için forecasting pipeline başlatıldı.", target=target_col, extra={"horizon": int(horizon)})
     manifest = export_payload["manifest"]
     date_col = manifest.loc[manifest["key"] == "date_column", "value"].iloc[0]
     freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
     df_series = make_series_analysis_frame(export_payload, target_col)
-    profile = get_profile_row(export_payload, target_col)
-    pipeline_key = build_search_signature("pipeline_exact_family_search", freq_alias, df_series, export_payload.get("features"), profile=profile, extra={"target_col": target_col, "horizon": int(horizon), "use_exog_for_stat_models": bool(use_exog_for_stat_models), "use_exog_for_prophet": bool(use_exog_for_prophet), "app_version": APP_VERSION})
-    cached = SEARCH_ACCELERATOR.get_result(pipeline_key)
-    if cached is not None:
-        cached["metadata"]["search_accelerator_pipeline_cache_hit"] = True
-        progress_log("Pipeline Cache", "Önceden hesaplanmış sonuç bulundu; cache çıktısı kullanıldı.", level="SUCCESS", target=target_col)
-        return cached
     train_df, test_df = train_test_split_series(df_series, horizon=horizon)
-    progress_log("Veri Bölme", "Eğitim ve test ayrımı tamamlandı.", level="SUCCESS", target=target_col, extra={"train_n": len(train_df), "test_n": len(test_df), "freq": freq_alias})
     df_features = export_payload["features"].copy()
     df_features[date_col] = pd.to_datetime(df_features[date_col])
     df_features = df_features.sort_values(date_col).reset_index(drop=True)
+
     usable_dates = pd.concat([train_df[["ds"]], test_df[["ds"]]], axis=0)["ds"]
     feature_subset = df_features[df_features[date_col].isin(usable_dates)].copy().sort_values(date_col).reset_index(drop=True)
     train_feat = feature_subset.iloc[:len(train_df)].copy().reset_index(drop=True)
     test_feat = feature_subset.iloc[len(train_df):len(train_df)+len(test_df)].copy().reset_index(drop=True)
+
+    profile = get_profile_row(export_payload, target_col)
+    seg = infer_advanced_segment(profile)
     stat_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_stat_models else []
     prophet_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_prophet else []
-    ml_feature_cols = detect_safe_ml_exog_columns(df_features, target_col, date_col)
-    seg = infer_advanced_segment(profile)
+    ml_feature_cols = detect_ml_feature_columns(df_features, target_col, date_col)
+
     stat_exog_train = train_feat[stat_exog_cols] if stat_exog_cols else None
     stat_exog_test = test_feat[stat_exog_cols] if stat_exog_cols else None
     prophet_exog_train = train_feat[prophet_exog_cols] if prophet_exog_cols else None
     prophet_exog_test = test_feat[prophet_exog_cols] if prophet_exog_cols else None
     ml_train_X = train_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=train_feat.index)
     ml_test_X = test_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=test_feat.index)
-    progress_log("Özellik Hazırlığı", "Exog ve ML özellik setleri hazırlandı.", level="SUCCESS", target=target_col, extra={"stat_exog": len(stat_exog_cols), "prophet_exog": len(prophet_exog_cols), "ml_features": len(ml_feature_cols)})
-    outputs = {"metadata": {"target_col": target_col, "freq_alias": freq_alias, "horizon": horizon, "profile": profile, "segment": seg["label"], "abc_xyz": seg["abc_xyz"], "priority": recommend_model_priority(profile), "candidate_models": recommend_candidate_models(profile), "stat_exog_cols": stat_exog_cols, "prophet_exog_cols": prophet_exog_cols, "ml_feature_cols": ml_feature_cols, "runtime_guardrails": build_runtime_guardrail_notes(freq_alias, len(train_df), horizon, stat_exog_cols, prophet_exog_cols), "train_n": int(len(train_df)), "test_n": int(len(test_df)), "search_accelerator_enabled": bool(SEARCH_ACCELERATOR.config.enabled), "search_accelerator_pipeline_cache_hit": False}, "train": train_df, "test": test_df, "metrics": [], "predictions": {}, "tables": {}}
-    def _wrap_model_run(label: str, fn):
-        progress_log("Model Araması", f"{label} modeli için arama / fit süreci başladı.", target=target_col, extra={"model": label})
-        start = time.perf_counter(); error = None
-        try:
-            res = fn()
-        except Exception as e:
-            error = str(e); res = build_model_level_fallback(label, train_df, test_df, freq_alias, error)
-            progress_log("Model Araması", f"{label} beklenmeyen hata nedeniyle fallback ile tamamlandı.", level="ERROR", target=target_col, extra={"model": label, "error": error})
-        raw_forecast = np.asarray(res.get("forecast", np.array([])), dtype=float)
-        res["raw_forecast"] = raw_forecast.copy()
-        res["forecast"] = operational_bias_peak_postprocess(train_df["y"], raw_forecast, freq_alias=freq_alias, model_name=label, profile=profile)
-        if "static_forecast" in res:
-            try:
-                res["static_forecast"] = operational_bias_peak_postprocess(train_df["y"], np.asarray(res.get("static_forecast"), dtype=float), freq_alias=freq_alias, model_name=label, profile=profile)
-            except Exception:
-                pass
-        metric = build_model_metrics(label, train_df["y"].values, test_df["y"].values, res["forecast"])
-        table = build_actual_vs_pred_df(test_df, res["forecast"], label)
-        fallback_used = bool((res or {}).get("fallback_used", False))
-        status_level = "WARNING" if fallback_used else "SUCCESS"
-        msg = f"{label} tamamlandı."
-        if fallback_used:
-            msg += " Fallback kullanıldı."
-        progress_log("Model Araması", msg, level=status_level, target=target_col, extra={"model": label, "seconds": round(time.perf_counter() - start, 2), "WAPE": round(float(metric.get('WAPE', np.nan)), 4) if pd.notna(metric.get('WAPE', np.nan)) else np.nan, "fallback": fallback_used})
-        return {"name": label, "result": res, "metric": metric, "table": table, "error": error, "timing": time.perf_counter() - start}
-    progress_log("Model Araması", "Model aileleri paralel olarak başlatılıyor.", target=target_col)
-    family_outputs = SEARCH_ACCELERATOR.run_parallel_tasks({
-        "xgboost": lambda: _wrap_model_run("XGBoost", lambda: fit_xgboost_forecast(train_df, test_df, ml_train_X, ml_test_X, freq_alias=freq_alias)),
-        "prophet": lambda: _wrap_model_run("Prophet", lambda: fit_best_prophet(train_df, test_df, freq_alias, profile, prophet_exog_train, prophet_exog_test) if HAS_PROPHET else build_model_level_fallback("Prophet", train_df, test_df, freq_alias, "prophet paketi yüklü değil")),
-        "sarima": lambda: _wrap_model_run("SARIMA/SARIMAX", lambda: fit_best_sarimax(train_df, test_df, freq_alias, profile, stat_exog_train, stat_exog_test)),
-        "arima": lambda: _wrap_model_run("ARIMA", lambda: fit_best_arima(train_df, test_df, freq_alias, profile)),
-        "intermittent": lambda: _wrap_model_run("Intermittent", lambda: fit_best_intermittent(train_df, test_df, freq_alias, profile)),
-    }, max_workers=min(5, FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers))
-    progress_log("Model Araması", "Tüm model aileleri tamamlandı.", level="SUCCESS", target=target_col)
-    model_errors, stage_timings = {}, {}
-    alias_map = {"xgboost": "xgboost", "prophet": "prophet", "sarima": "sarima", "arima": "arima", "intermittent": "intermittent"}
-    for key, label in [("xgboost", "XGBoost"), ("prophet", "Prophet"), ("sarima", "SARIMA/SARIMAX"), ("arima", "ARIMA"), ("intermittent", "Intermittent")]:
-        block = family_outputs[key]
-        if block["error"]:
-            model_errors[label] = block["error"]
-        outputs["metrics"].append(block["metric"])
-        outputs["predictions"][label] = block["result"]["forecast"]
-        outputs["tables"][label] = block["table"]
-        outputs[alias_map[key]] = block["result"]
-        stage_timings[f"{alias_map[key]}_seconds"] = block["timing"]
-    validation_df = pd.DataFrame([
-        extract_validation_metrics_from_result("SARIMA/SARIMAX", outputs["sarima"]),
-        extract_validation_metrics_from_result("ARIMA", outputs["arima"]),
-        extract_validation_metrics_from_result("Prophet", outputs["prophet"]),
-        extract_validation_metrics_from_result("XGBoost", outputs["xgboost"]),
-        extract_validation_metrics_from_result("Intermittent", outputs["intermittent"]),
-    ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
-    outputs["validation_metrics_df"] = validation_df
+
+    outputs = {
+        "metadata": {
+            "target_col": target_col,
+            "freq_alias": freq_alias,
+            "horizon": horizon,
+            "profile": profile,
+            "segment": seg["label"],
+            "abc_xyz": seg["abc_xyz"],
+            "priority": recommend_model_priority(profile),
+            "candidate_models": recommend_candidate_models(profile),
+            "stat_exog_cols": stat_exog_cols,
+            "prophet_exog_cols": prophet_exog_cols,
+            "ml_feature_cols": ml_feature_cols,
+        },
+        "train": train_df,
+        "test": test_df,
+        "metrics": [],
+        "predictions": {},
+        "tables": {}
+    }
+
+    sarima_res = fit_best_sarimax(train_df, test_df, freq_alias, profile, stat_exog_train, stat_exog_test)
+    outputs["sarima"] = sarima_res
+    outputs["predictions"]["SARIMA/SARIMAX"] = sarima_res["forecast"]
+    outputs["metrics"].append(build_model_metrics("SARIMA/SARIMAX", train_df["y"].values, test_df["y"].values, sarima_res["forecast"]))
+    outputs["tables"]["SARIMA/SARIMAX"] = build_actual_vs_pred_df(test_df, sarima_res["forecast"], "SARIMA/SARIMAX")
+
+    if HAS_PROPHET:
+        prophet_res = fit_best_prophet(train_df, test_df, freq_alias, profile, prophet_exog_train, prophet_exog_test)
+        outputs["prophet"] = prophet_res
+        outputs["predictions"]["Prophet"] = prophet_res["forecast"]
+        outputs["metrics"].append(build_model_metrics("Prophet", train_df["y"].values, test_df["y"].values, prophet_res["forecast"]))
+        outputs["tables"]["Prophet"] = build_actual_vs_pred_df(test_df, prophet_res["forecast"], "Prophet")
+    else:
+        outputs["prophet_error"] = "prophet paketi yüklü değil. 'pip install prophet' gerekli olabilir."
+
+    xgb_res = fit_xgboost_forecast(train_df, test_df, ml_train_X, ml_test_X, freq_alias=freq_alias)
+    outputs["xgboost"] = xgb_res
+    outputs["predictions"]["XGBoost"] = xgb_res["forecast"]
+    outputs["metrics"].append(build_model_metrics("XGBoost", train_df["y"].values, test_df["y"].values, xgb_res["forecast"]))
+    outputs["tables"]["XGBoost"] = build_actual_vs_pred_df(test_df, xgb_res["forecast"], "XGBoost")
+
     metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
-    progress_log("Backtest", "Rolling-origin backtest başlatıldı.", target=target_col)
-    outputs["rolling_origin_backtest"] = run_rolling_origin_backtest_full(export_payload, target_col, outputs, freq_alias, horizon=min(max(2, int(horizon)), 3), use_exog_for_stat_models=use_exog_for_stat_models, use_exog_for_prophet=use_exog_for_prophet, max_folds=3)
-    progress_log("Backtest", "Rolling-origin backtest tamamlandı.", level="SUCCESS", target=target_col)
-    rolling_summary_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
-    progress_log("Ansambl", "Ansambl ağırlıkları ve birleşik tahmin hesaplanıyor.", target=target_col)
-    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values, rolling_summary=rolling_summary_df, profile=profile)
+    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df)
     outputs["predictions"]["Ensemble"] = ensemble_pred
     outputs["metrics"].append(build_model_metrics("Ensemble", train_df["y"].values, test_df["y"].values, ensemble_pred))
     outputs["tables"]["Ensemble"] = build_actual_vs_pred_df(test_df, ensemble_pred, "Ensemble")
+
     metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
     cc = build_champion_challenger(metrics_df)
     outputs["metrics_df"] = metrics_df
@@ -10198,751 +5952,56 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     outputs["best_model"] = cc["champion"]
     outputs["ensemble_weights"] = ensemble_weights
     outputs["all_predictions_long"] = pd.concat(list(outputs["tables"].values()), axis=0, ignore_index=True) if outputs["tables"] else pd.DataFrame()
-    outputs["model_errors"] = model_errors
-    outputs["stage_timings"] = stage_timings
-    outputs["stage_timing_table"] = build_stage_timer_rows(stage_timings)
-    outputs["fallback_summary"] = pd.DataFrame([
-        {"model": "XGBoost", "fallback_used": bool((outputs.get("xgboost") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("xgboost") or {}).get("fallback_method")},
-        {"model": "Prophet", "fallback_used": bool((outputs.get("prophet") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("prophet") or {}).get("fallback_method")},
-        {"model": "SARIMA/SARIMAX", "fallback_used": bool((outputs.get("sarima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("sarima") or {}).get("fallback_method")},
-        {"model": "ARIMA", "fallback_used": bool((outputs.get("arima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("arima") or {}).get("fallback_method")},
-        {"model": "Intermittent", "fallback_used": bool((outputs.get("intermittent") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("intermittent") or {}).get("fallback_method")},
-    ])
-    prophet_info = outputs.get("prophet") or {}
-    if bool(prophet_info.get("fallback_used", False)):
-        progress_log("Prophet Kontrolü", "Prophet gerçek fit yerine fallback ile tamamlandı.", level="WARNING", target=target_col, extra={"fallback_method": prophet_info.get("fallback_method")})
-    outputs["production_governance"] = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
-    outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
-    outputs["production_model"] = outputs["production_governance"].get("production_model", outputs.get("best_model"))
-    outputs["production_status"] = outputs["production_governance"].get("production_status", "eligible")
-    outputs["model_gorsel_stil_haritasi"] = build_model_visual_style_map(outputs)
-    outputs["karar_hiyerarsisi"] = build_karar_hiyerarsisi_ozeti(outputs)
-    outputs["prophet_gorunurluk_ozeti"] = build_prophet_gorunurluk_ozeti(outputs.get("prophet", {}))
-    outputs["benzersiz_rapor_katalogu"] = build_benzersiz_rapor_katalogu(outputs, outputs["production_governance"])
-    progress_log("Raporlama", "Üretim yönetişimi ve raporlama tabloları hazırlandı.", level="SUCCESS", target=target_col, extra={"best_model": outputs.get("best_model"), "production_model": outputs.get("production_model")})
-    SEARCH_ACCELERATOR.put_result(pipeline_key, outputs)
-    fallback_count = int(outputs["fallback_summary"]["fallback_used"].astype(bool).sum()) if isinstance(outputs.get("fallback_summary"), pd.DataFrame) and "fallback_used" in outputs["fallback_summary"].columns else np.nan
-    progress_log("Pipeline Tamamlandı", f"{target_col} serisi tamamlandı.", level="SUCCESS", target=target_col, extra={"best_model": outputs.get("best_model"), "fallback_models": fallback_count})
-    return copy.deepcopy(outputs)
-
-def _dedupe_best_summary_df(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df, pd.DataFrame) or len(df) == 0:
-        return pd.DataFrame() if not isinstance(df, pd.DataFrame) else df
-    out = df.copy()
-    if "target_col" not in out.columns:
-        return out
-    if "model" not in out.columns:
-        return out.drop_duplicates(subset=["target_col"], keep="last")
-    model_rank = np.where(out["model"].astype(str).str.upper() == "ERROR", 1, 0)
-    out = out.assign(_error_rank=model_rank, _row_order=np.arange(len(out)))
-    out = out.sort_values(["target_col", "_error_rank", "_row_order"], ascending=[True, True, False])
-    out = out.drop_duplicates(subset=["target_col"], keep="first")
-    return out.drop(columns=["_error_rank", "_row_order"], errors="ignore").reset_index(drop=True)
+    return outputs
 
 
-def _dedupe_series_status_df(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df, pd.DataFrame) or len(df) == 0:
-        return pd.DataFrame() if not isinstance(df, pd.DataFrame) else df
-    if "target_col" not in df.columns:
-        return df
-    out = df.copy()
-    status_rank = out.get("status", pd.Series("", index=out.index)).astype(str).str.upper().map({"SUCCESS": 0, "WARNING": 1, "ERROR": 2, "RUNNING": 3}).fillna(9)
-    out = out.assign(_status_rank=status_rank, _row_order=np.arange(len(out)))
-    out = out.sort_values(["target_col", "_status_rank", "_row_order"], ascending=[True, True, False])
-    out = out.drop_duplicates(subset=["target_col"], keep="first")
-    return out.drop(columns=["_status_rank", "_row_order"], errors="ignore").reset_index(drop=True)
-
-
-def run_batch_forecasting(
-    export_payload: Dict[str, pd.DataFrame],
-    horizon: int,
-    selected_sheet: str,
-    use_exog_for_stat_models: bool = True,
-    use_exog_for_prophet: bool = True,
-    selected_targets: Optional[List[str]] = None,
-    persist_output_root: Optional[str] = None,
-    persist_after_each_series: bool = False,
-    keep_batch_outputs_in_memory: bool = True,
-) -> Dict[str, Any]:
-    targets = list(selected_targets) if selected_targets else export_payload["series_profile_report"]["series"].tolist()
-    progress_log("Batch Planı", "Batch forecasting serileri hazırlandı.", level="SUCCESS", extra={"sheet": selected_sheet, "target_count": len(targets), "horizon": int(horizon)})
+def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
+    targets = export_payload["series_profile_report"]["series"].tolist()
     rows = []
     champion_rows = []
     batch_outputs = {}
-    series_status_rows = []
-
-    if persist_after_each_series and persist_output_root:
-        write_incremental_batch_common_outputs(export_payload, persist_output_root, selected_sheet, int(horizon))
-
-    for idx, target in enumerate(targets, start=1):
-        progress_log("Seri Çalıştırma", f"{idx}/{len(targets)} seri işleme alındı.", target=target, extra={"index": idx, "total": len(targets)})
-        started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        target_output_dir = None
-        status_record = {
-            "target_col": target,
-            "index": idx,
-            "total": len(targets),
-            "status": "RUNNING",
-            "started_at": started_at,
-            "completed_at": None,
-            "best_model": None,
-            "champion": None,
-            "error": None,
-            "output_dir": None,
-        }
+    for target in targets:
         try:
-            out = run_full_forecasting_pipeline(
-                export_payload,
-                target,
-                horizon,
-                use_exog_for_stat_models,
-                use_exog_for_prophet
-            )
-            out["named_output_tables"] = build_named_output_tables(out, export_payload)
-
+            out = run_full_forecasting_pipeline(export_payload, target, horizon, use_exog_for_stat_models, use_exog_for_prophet)
+            batch_outputs[target] = out
             mdf = out["metrics_df"].copy()
             best_row = mdf.iloc[0].to_dict()
-            prod_pack = out.get("production_governance", {}) or {}
-            prophet_pack = out.get("prophet", {}) or {}
-            xgb_pack = out.get("xgboost", {}) or {}
-            sarima_pack = out.get("sarima", {}) or {}
-            live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
-            alerts_df = live_pack.get("alerts", pd.DataFrame()) if isinstance(live_pack, dict) else pd.DataFrame()
-            champion_name = out["champion_challenger"].get("champion")
-            challenger_name = out["champion_challenger"].get("challenger")
             best_row["target_col"] = target
             best_row["segment"] = out["metadata"]["segment"]
             best_row["abc_xyz"] = out["metadata"]["abc_xyz"]
-            best_row["champion"] = champion_name
-            best_row["challenger"] = challenger_name
-            best_row["best_model"] = out.get("best_model", best_row.get("model"))
-            best_row["production_model"] = prod_pack.get("production_model", out.get("best_model", best_row.get("model")))
-            best_row["production_status"] = prod_pack.get("production_status", "eligible")
-            best_row["production_eligibility_score"] = prod_pack.get("production_eligibility_score")
-            best_row["prophet_fallback_used"] = bool(prophet_pack.get("fallback_used", False))
-            best_row["xgboost_fallback_used"] = bool(xgb_pack.get("fallback_used", False))
-            best_row["sarima_fallback_used"] = bool(sarima_pack.get("fallback_used", False))
-            best_row["alert_count"] = int(len(alerts_df)) if isinstance(alerts_df, pd.DataFrame) else 0
             rows.append(best_row)
-
             champion_rows.append({
                 "target_col": target,
-                "champion": champion_name,
-                "challenger": challenger_name,
+                "champion": out["champion_challenger"]["champion"],
+                "challenger": out["champion_challenger"]["challenger"],
                 "segment": out["metadata"]["segment"],
-                "abc_xyz": out["metadata"]["abc_xyz"],
-                "best_model": out.get("best_model", best_row.get("model")),
-                "production_model": prod_pack.get("production_model", out.get("best_model", best_row.get("model"))),
-                "production_status": prod_pack.get("production_status", "eligible"),
-                "prophet_fallback_used": bool(prophet_pack.get("fallback_used", False)),
-                "xgboost_fallback_used": bool(xgb_pack.get("fallback_used", False)),
-                "sarima_fallback_used": bool(sarima_pack.get("fallback_used", False)),
+                "abc_xyz": out["metadata"]["abc_xyz"]
             })
-
-            export_warning = None
-            if persist_after_each_series and persist_output_root:
-                try:
-                    target_output_dir = write_incremental_series_outputs(export_payload, out, target, persist_output_root, int(horizon))
-                except Exception as export_exc:
-                    export_warning = str(export_exc)
-                    progress_log("Disk Çıktısı", "Seri hesaplandı ancak seri bazlı rapor dosyaları yazılırken uyarı oluştu.", level="WARNING", target=target, extra={"error": export_warning})
-
-            if keep_batch_outputs_in_memory:
-                batch_outputs[target] = out
-
-            status_record.update({
-                "status": "SUCCESS" if export_warning is None else "WARNING",
-                "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "best_model": out.get("best_model"),
-                "champion": champion_name,
-                "challenger": challenger_name,
-                "production_model": prod_pack.get("production_model", out.get("best_model")),
-                "production_status": prod_pack.get("production_status", "eligible"),
-                "prophet_fallback_used": bool(prophet_pack.get("fallback_used", False)),
-                "xgboost_fallback_used": bool(xgb_pack.get("fallback_used", False)),
-                "sarima_fallback_used": bool(sarima_pack.get("fallback_used", False)),
-                "output_dir": target_output_dir,
-                "error": export_warning,
-            })
-            progress_log("Seri Çalıştırma", "Seri tamamlandı ve batch özete eklendi.", level="SUCCESS" if export_warning is None else "WARNING", target=target, extra={"champion": champion_name, "output_dir": target_output_dir, "export_warning": export_warning})
         except Exception as e:
-            status_record.update({
-                "status": "ERROR",
-                "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "error": str(e),
-            })
-            if persist_after_each_series and persist_output_root:
-                try:
-                    error_root = os.path.join(persist_output_root, _safe_artifact_name(target))
-                    os.makedirs(error_root, exist_ok=True)
-                    _write_single_table_excel_file(os.path.join(error_root, f"{_safe_artifact_name(target)} - hata özeti.xlsx"), "Hata Özeti", pd.DataFrame([{"target_col": target, "error": str(e), "stage": "run_full_forecasting_pipeline"}]))
-                    _write_text_file(os.path.join(error_root, f"{_safe_artifact_name(target)} - hata özeti.txt"), [str(e)])
-                    target_output_dir = error_root
-                except Exception:
-                    pass
-            progress_log("Seri Çalıştırma", "Seri hata ile sonlandı; batch özete error satırı eklendi.", level="ERROR", target=target, extra={"error": str(e)})
-            rows.append({
-                "target_col": target,
-                "model": "ERROR",
-                "best_model": "ERROR",
-                "production_model": None,
-                "production_status": "blocked",
-                "prophet_fallback_used": False,
-                "xgboost_fallback_used": False,
-                "sarima_fallback_used": False,
-                "alert_count": 0,
-                "MAE": np.nan,
-                "RMSE": np.nan,
-                "MAPE": np.nan,
-                "sMAPE": np.nan,
-                "WAPE": np.nan,
-                "MASE": np.nan,
-                "error": str(e)
-            })
-        finally:
-            series_status_rows.append(status_record)
-            if persist_after_each_series and persist_output_root:
-                try:
-                    write_incremental_batch_status_outputs(
-                        persist_output_root,
-                        pd.DataFrame(rows),
-                        pd.DataFrame(champion_rows),
-                        pd.DataFrame(series_status_rows),
-                    )
-                except Exception as persist_exc:
-                    progress_log("Disk Çıktısı", f"Kısmi batch özetleri yazılırken uyarı oluştu: {persist_exc}", level="WARNING", target=target)
-            if not keep_batch_outputs_in_memory:
-                try:
-                    del out
-                except Exception:
-                    pass
-                gc.collect()
-
-    best_summary_df = _dedupe_best_summary_df(pd.DataFrame(rows))
-    champion_table_df = pd.DataFrame(champion_rows)
-    if isinstance(champion_table_df, pd.DataFrame) and len(champion_table_df) and "target_col" in champion_table_df.columns:
-        champion_table_df = champion_table_df.drop_duplicates(subset=["target_col"], keep="last").reset_index(drop=True)
-    series_status_df = _dedupe_series_status_df(pd.DataFrame(series_status_rows))
-
-    result = {
-        "best_summary": best_summary_df,
-        "champion_table": champion_table_df,
-        "batch_outputs": batch_outputs,
-        "series_status": series_status_df,
-        "selected_sheet": selected_sheet,
-        "horizon": int(horizon),
-        "zip_cache_key": f"{_safe_artifact_name(selected_sheet)}__h{int(horizon)}__{len(rows)}",
-        "incremental_output_root": persist_output_root,
-    }
-    progress_log("Batch Özeti", "Batch forecasting hesaplaması tamamlandı.", level="SUCCESS", extra={"successful_series": int((result["series_status"].get("status", pd.Series(dtype=object)) == "SUCCESS").sum()) if isinstance(result.get("series_status"), pd.DataFrame) else len(batch_outputs), "requested_series": len(targets)})
-    return result
-
-
-
-def _seasonal_naive_array(y_train: pd.Series, horizon: int, season_length: int) -> np.ndarray:
-    y_train = pd.to_numeric(y_train, errors="coerce").astype(float).dropna().reset_index(drop=True)
-    if horizon <= 0:
-        return np.array([], dtype=float)
-    if season_length > 1 and len(y_train) >= season_length:
-        vals = y_train.iloc[-season_length:].tolist()
-        return np.array([vals[i % season_length] for i in range(horizon)], dtype=float)
-    if len(y_train) == 0:
-        return np.zeros(horizon, dtype=float)
-    return np.repeat(float(y_train.iloc[-1]), horizon).astype(float)
-
-
-def compute_asymmetric_validation_penalty(y_true: np.ndarray, y_pred: np.ndarray, y_train: Optional[np.ndarray] = None, severity: float = 1.0) -> Dict[str, float]:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    y_train = np.asarray(y_train if y_train is not None else y_true, dtype=float)
-    if len(y_true) == 0:
-        return {"penalty": 0.0, "bias_pct": np.nan, "under_forecast_rate": np.nan, "peak_event_score": np.nan, "service_gap": np.nan}
-    scale = max(
-        float(np.nanmean(np.abs(y_true))) if np.isfinite(y_true).any() else 0.0,
-        float(np.nanmean(np.abs(y_train))) if np.isfinite(y_train).any() else 0.0,
-        1.0,
-    )
-    err = y_pred - y_true
-    bias_pct = float(100.0 * np.nanmean(err) / scale) if len(err) else np.nan
-    under_rate = float(np.nanmean((y_pred < y_true).astype(float))) if len(y_true) else np.nan
-    peak = compute_peak_event_score(y_train, y_true, y_pred)
-    peak_score = float(peak.get("peak_event_score", np.nan)) if isinstance(peak, dict) else np.nan
-    target_service = 0.90 if len(y_true) <= 6 else 0.85
-    achieved_service = float(np.nanmean(y_pred >= y_true)) if len(y_true) else np.nan
-    service_gap = max(target_service - achieved_service, 0.0) if pd.notna(achieved_service) else np.nan
-    penalty = 0.0
-    if pd.notna(bias_pct) and bias_pct < 0:
-        penalty += min(abs(bias_pct) * 0.06 * severity, 2.0)
-    if pd.notna(under_rate) and under_rate > 0.55:
-        penalty += (under_rate - 0.55) * 3.0 * severity
-    if pd.notna(peak_score) and peak_score < 0.35:
-        penalty += (0.35 - peak_score) * 2.5 * severity
-    if pd.notna(service_gap) and service_gap > 0:
-        penalty += service_gap * 2.0 * severity
+            rows.append({"target_col": target, "model": "ERROR", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan, "error": str(e)})
     return {
-        "penalty": float(penalty),
-        "bias_pct": bias_pct,
-        "under_forecast_rate": under_rate,
-        "peak_event_score": peak_score,
-        "service_gap": float(service_gap) if pd.notna(service_gap) else np.nan,
+        "best_summary": pd.DataFrame(rows),
+        "champion_table": pd.DataFrame(champion_rows),
+        "batch_outputs": batch_outputs
     }
 
-
-def operational_bias_peak_postprocess(train_y: pd.Series, pred: np.ndarray, freq_alias: str, model_name: str, profile: Optional[Dict[str, Any]] = None) -> np.ndarray:
-    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    if pred.size == 0:
-        return pred
-    s = pd.to_numeric(train_y, errors="coerce").astype(float).dropna().reset_index(drop=True)
-    if len(s) == 0:
-        return pred
-    profile = profile or {}
-    season_length = infer_season_length_from_freq(freq_alias)
-    seasonal_naive = _seasonal_naive_array(s, len(pred), season_length)
-    recent_window = min(max(6, len(pred) * 2), len(s))
-    recent_hist = s.iloc[-recent_window:]
-    recent_mean = float(recent_hist.mean()) if len(recent_hist) else float(s.mean())
-    recent_median = float(recent_hist.median()) if len(recent_hist) else float(s.median())
-    recent_std = float(recent_hist.std()) if len(recent_hist) else 0.0
-    pred_mean = float(np.mean(pred)) if len(pred) else 0.0
-    trend_strength = float(profile.get("trend_strength", 0.0) or 0.0)
-    seasonality = float(profile.get("seasonality_strength", 0.0) or 0.0)
-    cv = float(profile.get("cv", 0.0) or 0.0)
-
-    if model_name == "Prophet":
-        pred = 0.40 * pred + 0.40 * seasonal_naive + 0.20 * np.repeat(recent_mean, len(pred))
-    elif model_name == "Ensemble":
-        pred = 0.70 * pred + 0.20 * seasonal_naive + 0.10 * np.repeat(recent_median, len(pred))
-    elif model_name in ["ARIMA", "SARIMA/SARIMAX"]:
-        pred = 0.85 * pred + 0.10 * seasonal_naive + 0.05 * np.repeat(recent_mean, len(pred))
-    else:
-        pred = 0.90 * pred + 0.10 * seasonal_naive
-
-    anchor_ratio_mean = recent_mean / max(pred_mean, 1e-6)
-    anchor_ratio_median = recent_median / max(pred_mean, 1e-6)
-    uplift = 0.0
-    if np.isfinite(anchor_ratio_mean) and anchor_ratio_mean > 1.0:
-        uplift += min((anchor_ratio_mean - 1.0) * 0.45, 0.10)
-    if np.isfinite(anchor_ratio_median) and anchor_ratio_median > 1.0:
-        uplift += min((anchor_ratio_median - 1.0) * 0.25, 0.06)
-    if model_name in ["XGBoost", "ARIMA", "SARIMA/SARIMAX", "Ensemble"]:
-        uplift += 0.015
-    if seasonality >= 0.12 or trend_strength >= 0.10:
-        uplift += 0.01
-    if cv <= 0.35:
-        uplift += 0.01
-    uplift = min(max(uplift, 0.0), 0.16)
-    if uplift > 0:
-        pred = pred * (1.0 + uplift)
-
-    seasonal_q = float(np.nanquantile(seasonal_naive, 0.67)) if len(seasonal_naive) else 0.0
-    recent_q = float(np.nanquantile(recent_hist, 0.60)) if len(recent_hist) else recent_mean
-    service_floor = max(0.94 * seasonal_q, 0.96 * recent_q)
-    if (seasonality >= 0.10 or trend_strength >= 0.08) and service_floor > 0:
-        pred = np.maximum(pred, np.minimum(np.repeat(service_floor, len(pred)), np.maximum(seasonal_naive * 1.06, service_floor)))
-
-    if len(pred) >= 2 and len(seasonal_naive) == len(pred):
-        peak_ref = float(np.nanquantile(seasonal_naive, 0.75)) if len(seasonal_naive) else 0.0
-        peak_mask = seasonal_naive >= peak_ref if peak_ref > 0 else np.zeros(len(pred), dtype=bool)
-        if np.any(peak_mask):
-            peak_floor = np.maximum(seasonal_naive[peak_mask] * 1.08, 0.98 * np.maximum(recent_mean, recent_median))
-            pred[peak_mask] = np.maximum(pred[peak_mask], peak_floor)
-
-    if recent_std > 0 and float(np.std(pred)) < 0.18 * recent_std:
-        pred = 0.82 * pred + 0.18 * seasonal_naive
-
-    return np.maximum(pred, 0.0)
-
-
-def compute_peak_event_score(y_train: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, quantile: float = 0.75) -> Dict[str, Any]:
-    y_train = np.asarray(y_train, dtype=float)
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    if len(y_true) == 0:
-        return {"peak_threshold": np.nan, "peak_precision": np.nan, "peak_recall": np.nan, "peak_f1": np.nan, "peak_event_score": np.nan}
-    base_hist = y_train[np.isfinite(y_train)] if np.isfinite(y_train).any() else y_true[np.isfinite(y_true)]
-    if len(base_hist) == 0:
-        threshold = float(np.nanmedian(y_true)) if len(y_true) else np.nan
-    else:
-        q = 0.70 if len(y_true) <= 6 else quantile
-        threshold = float(np.nanquantile(base_hist, q))
-    k = max(1, int(np.ceil(len(y_true) * 0.34)))
-    actual_idx = set(np.argsort(y_true)[-k:].tolist())
-    pred_idx = set(np.argsort(y_pred)[-k:].tolist())
-    soft_hits = 0
-    matched_pred = set()
-    for ai in sorted(actual_idx):
-        for pj in sorted(pred_idx):
-            if pj in matched_pred:
-                continue
-            if abs(int(ai) - int(pj)) <= 1:
-                soft_hits += 1
-                matched_pred.add(pj)
-                break
-    precision = float(soft_hits / max(len(pred_idx), 1))
-    recall = float(soft_hits / max(len(actual_idx), 1))
-    f1 = float(2 * precision * recall / max(precision + recall, 1e-12)) if (precision + recall) > 0 else 0.0
-    actual_peak_mass = float(np.sum(y_true[list(actual_idx)])) if actual_idx else 0.0
-    captured_mass = float(np.sum(y_pred[list(actual_idx)])) if actual_idx else 0.0
-    amplitude_capture = float(np.clip(captured_mass / max(actual_peak_mass, 1e-6), 0.0, 1.2)) if actual_peak_mass > 0 else 0.0
-    score = float(np.clip(0.70 * f1 + 0.30 * min(amplitude_capture, 1.0), 0.0, 1.0))
-    return {"peak_threshold": threshold, "peak_precision": precision, "peak_recall": recall, "peak_f1": f1, "peak_event_score": score, "actual_peak_count": int(len(actual_idx)), "pred_peak_count": int(len(pred_idx)), "peak_amplitude_capture": amplitude_capture}
-
-
-def run_rolling_origin_backtest_full(export_payload: Dict[str, pd.DataFrame], target_col: str, outputs: Dict[str, Any], freq_alias: str, horizon: int = 3, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True, max_folds: int = 3) -> pd.DataFrame:
-    df_series = make_series_analysis_frame(export_payload, target_col)
-    ds = df_series.loc[df_series["is_usable"], ["ds", "y"]].copy().sort_values("ds").reset_index(drop=True)
-    h = max(1, int(horizon))
-    min_train = max(24, h * 6) if str(freq_alias).upper() == "M" else max(30, h * 6)
-    if len(ds) < (min_train + h + 2):
-        return pd.DataFrame(columns=["fold", "step", "model", "WAPE", "sMAPE", "MAE", "actual", "prediction", "abs_error"])
-    date_col = export_payload["manifest"].loc[export_payload["manifest"]["key"] == "date_column", "value"].iloc[0]
-    df_features = export_payload.get("features", pd.DataFrame()).copy()
-    if date_col in df_features.columns:
-        df_features[date_col] = pd.to_datetime(df_features[date_col], errors="coerce")
-        df_features = df_features.sort_values(date_col).reset_index(drop=True)
-    profile = outputs.get("metadata", {}).get("profile", {}) or get_profile_row(export_payload, target_col)
-    stat_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_stat_models else []
-    prophet_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_prophet else []
-    ml_feature_cols = detect_safe_ml_exog_columns(df_features, target_col, date_col)
-    fold_ends: List[int] = []
-    end = len(ds) - h
-    while end >= min_train and len(fold_ends) < max_folds:
-        fold_ends.append(end)
-        end -= h
-    fold_ends = sorted(fold_ends)
-    rows: List[Dict[str, Any]] = []
-    for fold_no, train_end in enumerate(fold_ends, start=1):
-        tr = ds.iloc[:train_end].copy().reset_index(drop=True)
-        te = ds.iloc[train_end:train_end + h].copy().reset_index(drop=True)
-        usable_dates = pd.concat([tr[["ds"]], te[["ds"]]], axis=0)["ds"]
-        feat_subset = df_features[df_features[date_col].isin(usable_dates)].copy().sort_values(date_col).reset_index(drop=True) if len(df_features) else pd.DataFrame()
-        tr_feat = feat_subset.iloc[:len(tr)].copy().reset_index(drop=True) if len(feat_subset) else pd.DataFrame()
-        te_feat = feat_subset.iloc[len(tr):len(tr)+len(te)].copy().reset_index(drop=True) if len(feat_subset) else pd.DataFrame()
-        stat_tr = tr_feat[stat_exog_cols] if stat_exog_cols and len(tr_feat) else None
-        stat_te = te_feat[stat_exog_cols] if stat_exog_cols and len(te_feat) else None
-        pro_tr = tr_feat[prophet_exog_cols] if prophet_exog_cols and len(tr_feat) else None
-        pro_te = te_feat[prophet_exog_cols] if prophet_exog_cols and len(te_feat) else None
-        ml_tr = tr_feat[ml_feature_cols] if ml_feature_cols and len(tr_feat) else pd.DataFrame(index=tr_feat.index if len(tr_feat) else range(len(tr)))
-        ml_te = te_feat[ml_feature_cols] if ml_feature_cols and len(te_feat) else pd.DataFrame(index=te_feat.index if len(te_feat) else range(len(te)))
-        model_results: Dict[str, Dict[str, Any]] = {}
-        def _record(model_name: str, pred_arr: np.ndarray):
-            pred_arr = operational_bias_peak_postprocess(tr["y"], pred_arr, freq_alias=freq_alias, model_name=model_name, profile=profile)
-            actual = pd.to_numeric(te["y"], errors="coerce").astype(float).values
-            for step, (a, p) in enumerate(zip(actual, pred_arr), start=1):
-                rows.append({"fold": fold_no, "step": step, "model": model_name, "WAPE": wape(np.array([a]), np.array([p])), "sMAPE": smape(np.array([a]), np.array([p])), "MAE": mae(np.array([a]), np.array([p])), "actual": float(a), "prediction": float(p), "abs_error": float(abs(p - a))})
-        try:
-            res = fit_best_sarimax(tr, te, freq_alias, profile, stat_tr, stat_te)
-            model_results["SARIMA/SARIMAX"] = res
-            _record("SARIMA/SARIMAX", np.asarray(res["forecast"], dtype=float))
-        except Exception:
-            pass
-        try:
-            res = fit_best_arima(tr, te, freq_alias, profile)
-            model_results["ARIMA"] = res
-            _record("ARIMA", np.asarray(res["forecast"], dtype=float))
-        except Exception:
-            pass
-        try:
-            if HAS_PROPHET:
-                res = fit_best_prophet(tr, te, freq_alias, profile, pro_tr, pro_te)
-                model_results["Prophet"] = res
-                _record("Prophet", np.asarray(res["forecast"], dtype=float))
-        except Exception:
-            pass
-        try:
-            res = fit_best_intermittent(tr, te, freq_alias, profile)
-            model_results["Intermittent"] = res
-            _record("Intermittent", np.asarray(res["forecast"], dtype=float))
-        except Exception:
-            pass
-        try:
-            res = fit_xgboost_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias)
-            model_results["XGBoost"] = res
-            _record("XGBoost", np.asarray(res["forecast"], dtype=float))
-        except Exception:
-            pass
-        try:
-            pred_map = {k: operational_bias_peak_postprocess(tr["y"], np.asarray(v["forecast"], dtype=float), freq_alias=freq_alias, model_name=k, profile=profile) for k, v in model_results.items()}
-            metrics_rows = [build_model_metrics(k, tr["y"].values, te["y"].values, v) for k, v in pred_map.items()]
-            val_rows = [extract_validation_metrics_from_result(k, model_results[k]) for k in model_results.keys()]
-            ens_pred, _ = build_weighted_ensemble(pred_map, pd.DataFrame(metrics_rows), validation_df=pd.DataFrame(val_rows), y_train=tr["y"].values, y_true=te["y"].values, profile=profile)
-            _record("Ensemble", ens_pred)
-        except Exception:
-            pass
-    return pd.DataFrame(rows)
-
-
-def summarize_full_backtest(backtest_df: pd.DataFrame) -> pd.DataFrame:
-    if backtest_df is None or len(backtest_df) == 0:
-        return pd.DataFrame(columns=["model", "folds", "WAPE", "sMAPE", "MAE", "MedianAE"])
-    g = backtest_df.groupby("model", dropna=False)
-    out = g.agg(folds=("fold", "nunique"), MAE=("abs_error", "mean"), MedianAE=("abs_error", "median")).reset_index()
-    rows = []
-    for model_name, part in g:
-        rows.append({"model": model_name, "WAPE": wape(part["actual"].values, part["prediction"].values), "sMAPE": smape(part["actual"].values, part["prediction"].values)})
-    score_df = pd.DataFrame(rows)
-    out = out.merge(score_df, on="model", how="left")
-    return out.sort_values(["WAPE", "sMAPE", "MAE"], ascending=[True, True, True]).reset_index(drop=True)
-
-
-def build_calibrated_prediction_interval_table(test_df: pd.DataFrame, pred: np.ndarray, model_name: str, backtest_df: pd.DataFrame, fallback_scale: float, coverage_levels: Tuple[float, ...] = (0.80, 0.90, 0.95)) -> pd.DataFrame:
-    if backtest_df is None or len(backtest_df) == 0 or model_name not in set(backtest_df.get("model", pd.Series(dtype=str)).astype(str)):
-        return build_prediction_interval_table(test_df, pred, fallback_scale, coverage_levels)
-    model_bt = backtest_df.loc[backtest_df["model"].astype(str) == str(model_name)].copy()
-    if len(model_bt) == 0 or "abs_error" not in model_bt.columns:
-        return build_prediction_interval_table(test_df, pred, fallback_scale, coverage_levels)
-    out = test_df[["ds", "y"]].copy().reset_index(drop=True)
-    out["q50"] = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    for level in coverage_levels:
-        widths = []
-        q = min(max(float(level), 0.50), 0.99)
-        for step in range(1, len(out) + 1):
-            part = model_bt.loc[model_bt["step"] == step, "abs_error"] if "step" in model_bt.columns else pd.Series(dtype=float)
-            if len(part.dropna()) < 2:
-                part = model_bt["abs_error"]
-            width = float(np.nanquantile(pd.to_numeric(part, errors="coerce").dropna(), q)) if len(part.dropna()) else float(fallback_scale)
-            widths.append(max(width, 1e-6))
-        widths = np.asarray(widths, dtype=float)
-        low = np.maximum(out["q50"].values - widths, 0.0)
-        high = np.maximum(out["q50"].values + widths, 0.0)
-        low_q = int(round(((1.0 - level) / 2.0) * 100.0))
-        high_q = int(round((1.0 - (1.0 - level) / 2.0) * 100.0))
-        out[f"q{low_q:02d}"] = low
-        out[f"q{high_q:02d}"] = high
-        out[f"coverage_{int(level*100)}"] = ((out["y"] >= low) & (out["y"] <= high)).astype(int)
-        out[f"avg_width_{int(level*100)}"] = float(np.mean(high - low)) if len(out) else np.nan
-    return out
-
-
-def enforce_hard_feature_contract_gate(eligibility_df: pd.DataFrame, feature_audit_df: pd.DataFrame) -> pd.DataFrame:
-    if eligibility_df is None or len(eligibility_df) == 0:
-        return pd.DataFrame(columns=["model", "status", "eligibility_score"])
-    out = eligibility_df.copy()
-    if feature_audit_df is None or len(feature_audit_df) == 0:
-        return out
-    def _has_unknown(area: str) -> bool:
-        part = feature_audit_df[feature_audit_df["used_in"].str.contains(area, na=False)]
-        if len(part) == 0:
-            return False
-        return bool((part["availability_status"].astype(str) != "future_known").any())
-    for model_name, area in [("XGBoost", "ml"), ("Prophet", "prophet")]:
-        idx = out.index[out["model"] == model_name]
-        if len(idx) == 0:
-            continue
-        i = idx[0]
-        if _has_unknown(area):
-            prev = str(out.loc[i, "status"])
-            out.loc[i, "status"] = "challenger_only" if prev == "eligible" else prev
-            out.loc[i, "eligibility_score"] = float(max(0.0, float(out.loc[i, "eligibility_score"]) - 12.0))
-            reason = str(out.loc[i, "rejection_or_limit_reason"] or "")
-            extra = "Hard feature contract gate: future-known olmayan feature var."
-            out.loc[i, "rejection_or_limit_reason"] = (reason + " | " + extra).strip(" |")
-    return out
-
-
-def build_production_decision_explanation(production_ranking: pd.DataFrame, production_model: Optional[str]) -> str:
-    if production_ranking is None or len(production_ranking) == 0 or not production_model:
-        return "Üretim modeli, uygunluk ve performans bilgileri sınırlı olduğu için temkinli seçildi."
-    row = production_ranking.loc[production_ranking["model"].astype(str) == str(production_model)].head(1)
-    if len(row) == 0:
-        return f"{production_model} seçildi; çünkü güvenli varsayılan aday olarak öne çıktı."
-    row = row.iloc[0]
-    nedenler = []
-    if pd.notna(row.get("ro_WAPE")):
-        nedenler.append(f"rolling-origin WAPE={safe_float(row.get('ro_WAPE')):.2f}")
-    if pd.notna(row.get("WAPE")):
-        nedenler.append(f"holdout WAPE={safe_float(row.get('WAPE')):.2f}")
-    if pd.notna(row.get("eligibility_score")):
-        nedenler.append(f"uygunluk skoru={safe_float(row.get('eligibility_score')):.1f}")
-    if pd.notna(row.get("service_gap")) and float(row.get("service_gap")) <= 1e-9:
-        nedenler.append("servis açığı yok")
-    if pd.notna(row.get("peak_event_score")):
-        nedenler.append(f"tepe skoru={safe_float(row.get('peak_event_score')):.3f}")
-    durum = TURKCE_DEGER_HARITASI.get(str(row.get("status", "eligible")), str(row.get("status", "eligible")))
-    return f"{production_model} seçildi; çünkü {', '.join(nedenler[:4])} ve üretim durumu '{durum}' olarak değerlendirildi."
-
-
-
-def assess_production_readiness(export_payload: Dict[str, pd.DataFrame], metrics_df: pd.DataFrame, target_col: str, outputs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    notes: List[str] = []
-    status = "guarded_use_only"
-    try:
-        profile_df = export_payload.get("series_profile_report", pd.DataFrame())
-        anomaly_df = export_payload.get("anomaly_governance", pd.DataFrame())
-        if outputs is not None:
-            prod_pack = outputs.get("production_governance", {}) or {}
-            gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
-            live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
-            alerts_df = live_pack.get("alerts", pd.DataFrame()) if isinstance(live_pack, dict) else pd.DataFrame()
-            if len(gate_df):
-                top = gate_df.sort_values(["status", "eligibility_score"], ascending=[True, False]).iloc[0]
-                notes.append(f"Üretim kapısı: {top['model']} -> {TURKCE_DEGER_HARITASI.get(str(top['status']), top['status'])} (skor={safe_float(top.get('eligibility_score')):.1f})")
-            if len(alerts_df):
-                notes.append(f"Canlı izleme için {len(alerts_df)} alarm üretildi; kör tam otomasyon öncesi shadow-mode zorunlu.")
-        if not profile_df.empty and "series" in profile_df.columns:
-            row = profile_df.loc[profile_df["series"] == target_col]
-            if not row.empty:
-                n_obs = float(pd.to_numeric(pd.Series([row.iloc[0].get("n_obs", np.nan)]), errors="coerce").iloc[0])
-                if pd.notna(n_obs) and n_obs < 84:
-                    notes.append(f"Seri uzunluğu {int(n_obs)} gözlem; aylık ilaç planlama için sınırlı ve overfit riski taşır.")
-        if not anomaly_df.empty and "series" in anomaly_df.columns:
-            a = anomaly_df.loc[anomaly_df["series"] == target_col].copy()
-            if len(a) > 0 and "is_training_excluded" in a.columns:
-                excluded = int(a["is_training_excluded"].fillna(False).astype(bool).sum())
-                if excluded > 0:
-                    notes.append(f"Bu seri için eğitim dışı bırakılan {excluded} kayıt var; yönetişim doğru fakat model belirsizliğini artırır.")
-        if not metrics_df.empty and "WAPE" in metrics_df.columns:
-            best_row = metrics_df.copy()
-            best_row["WAPE_num"] = pd.to_numeric(best_row["WAPE"], errors="coerce")
-            best_row["sMAPE_num"] = pd.to_numeric(best_row.get("sMAPE"), errors="coerce") if "sMAPE" in best_row.columns else np.nan
-            best_row = best_row.sort_values(["WAPE_num", "sMAPE_num"], ascending=[True, True])
-            if len(best_row):
-                bw = best_row.iloc[0]["WAPE_num"]
-                bs = best_row.iloc[0]["sMAPE_num"]
-                if pd.notna(bw) and pd.notna(bs):
-                    if bw <= 7 and bs <= 6:
-                        notes.append("Holdout performansı güçlü; kontrollü karar desteği için uygundur.")
-                    else:
-                        notes.append("Holdout performansı kabul edilebilir olsa da tam otomatik üretim kullanımı için ek onay katmanı gerekir.")
-    except Exception:
-        notes.append("Üretim uygunluğu değerlendirmesi hesaplanırken hata oluştu; temkinli kullanım önerilir.")
-    if not notes:
-        notes.append("Bu çıktı tez ve analitik inceleme için uygundur; tam otomatik gerçek hayat kullanımı için ek doğrulama gerekir.")
-    return {"status": status, "notes": notes}
-
-def build_model_liderleri(outputs: Dict[str, Any]) -> pd.DataFrame:
-    satirlar = []
-    hold_df = outputs.get("metrics_df", pd.DataFrame())
-    val_df = outputs.get("validation_metrics_df", pd.DataFrame())
-    profile = outputs.get("metadata", {}).get("profile", {}) or {}
-    val_rank = build_contextual_validation_ranking(val_df, profile=profile)
-    ro_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
-    prod_pack = outputs.get("production_governance", {}) or {}
-    prod_rank = prod_pack.get("production_ranking", pd.DataFrame())
-    hold_winner = hold_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).iloc[0]["model"] if len(hold_df) else None
-    val_winner = val_rank.iloc[0]["model"] if len(val_rank) else None
-    ro_winner = ro_df.sort_values(["WAPE", "MAE"], ascending=[True, True]).iloc[0]["model"] if len(ro_df) else None
-    prod_winner = prod_rank.iloc[0]["model"] if len(prod_rank) else outputs.get("production_model")
-    satirlar.append({"karar_kademesi": "Holdout kazananı", "model": hold_winner})
-    satirlar.append({"karar_kademesi": "Doğrulama kazananı", "model": val_winner})
-    satirlar.append({"karar_kademesi": "Rolling-origin kazananı", "model": ro_winner})
-    satirlar.append({"karar_kademesi": "Üretim kazananı", "model": prod_winner})
-    return pd.DataFrame(satirlar)
-
-
-
-def build_karar_hiyerarsisi_ozeti(outputs: Dict[str, Any]) -> pd.DataFrame:
-    lider = build_model_liderleri(outputs)
-    aciklama_map = {
-        "Holdout kazananı": "Son test penceresinde en düşük hata üreten model.",
-        "Doğrulama kazananı": "İç doğrulama bölmesinde en iyi model; bağlamsal ceza uygulanmıştır.",
-        "Rolling-origin kazananı": "Zaman boyunca en stabil geri test performansını veren model.",
-        "Üretim kazananı": "Risk, stabilite, uygulanabilirlik ve canlı yönetişim kurallarından sonra önerilen model.",
-    }
-    karar_map = {
-        "Holdout kazananı": "Kısa dönem doğruluk",
-        "Doğrulama kazananı": "Aşırı öğrenme kontrolü",
-        "Rolling-origin kazananı": "Zamana karşı dayanıklılık",
-        "Üretim kazananı": "Canlı kullanım kararı",
-    }
-    if len(lider) == 0:
-        return pd.DataFrame(columns=["KararAşaması", "KazananModel", "KararAmacı", "Anlamı"])
-    out = lider.rename(columns={"karar_kademesi": "KararAşaması", "model": "KazananModel"}).copy()
-    out["KararAmacı"] = out["KararAşaması"].map(karar_map)
-    out["Anlamı"] = out["KararAşaması"].map(aciklama_map)
-    prod_expl = ((outputs.get("production_governance", {}) or {}).get("production_decision_explanation") if isinstance(outputs, dict) else None)
-    if prod_expl:
-        extra = pd.DataFrame([{"KararAşaması": "Üretim karar açıklaması", "KazananModel": str((outputs.get("production_governance", {}) or {}).get("production_model", "-")), "KararAmacı": "Neden seçildi?", "Anlamı": str(prod_expl)}])
-        out = pd.concat([out, extra], axis=0, ignore_index=True)
-    return out
-
-
-
-def build_prophet_gorunurluk_ozeti(prophet_result: Dict[str, Any]) -> pd.DataFrame:
-    if not isinstance(prophet_result, dict) or len(prophet_result) == 0:
-        return pd.DataFrame(columns=["Alan", "Değer"])
-    mode = prophet_result.get("fit_mode", "bilinmiyor")
-    fallback_used = bool(prophet_result.get("fallback_used", False))
-    fallback_method = prophet_result.get("fallback_method")
-    note = prophet_result.get("fit_visibility_note", "")
-    if mode == "gercek_prophet_fit" and not fallback_used:
-        rozet = "Gerçek Prophet"
-        production_note = "Üretimde ancak doğrulama ve uygunluk kapısından geçerse kullanılmalı."
-    elif fallback_used:
-        rozet = "Fallback Prophet"
-        production_note = "Production’da kullanılmaz; görselde soluk gösterilir ve yalnız meydan okuyucu/tanısal amaçla kullanılır."
-    else:
-        rozet = "Prophet belirsiz"
-        production_note = "Bu çalışma modu temkinli yorumlanmalı."
-    return pd.DataFrame([
-        {"Alan": "Prophet rozeti", "Değer": rozet},
-        {"Alan": "Prophet çalışma modu", "Değer": mode},
-        {"Alan": "Gerçek Prophet fit kullanıldı mı?", "Değer": "evet" if (mode == "gercek_prophet_fit" and not fallback_used) else "hayır"},
-        {"Alan": "Fallback kullanıldı mı?", "Değer": "evet" if fallback_used else "hayır"},
-        {"Alan": "Fallback yöntemi", "Değer": fallback_method or "yok"},
-        {"Alan": "Üretim notu", "Değer": production_note},
-        {"Alan": "Açıklama", "Değer": note or "-"},
-    ])
-
-
-
-def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str, Any]) -> pd.DataFrame:
-    adaylar: List[Tuple[str, pd.DataFrame]] = [
-        ("ModelKarşılaştırma", outputs.get("metrics_df", pd.DataFrame())),
-        ("DoğrulamaMetrikleri", outputs.get("validation_metrics_df", pd.DataFrame())),
-        ("KararHiyerarşisi", build_karar_hiyerarsisi_ozeti(outputs)),
-        ("AnsamblAğırlıkları", outputs.get("ensemble_weights", pd.DataFrame())),
-        ("RollingOrigin", outputs.get("rolling_origin_backtest", pd.DataFrame())),
-        ("BiasDashboard", prod_pack.get("bias_dashboard", pd.DataFrame())),
-        ("PeakDashboard", prod_pack.get("peak_event_dashboard", pd.DataFrame())),
-        ("CanlıİzlemeÖzeti", (prod_pack.get("live_monitoring_pack", {}) or {}).get("summary", pd.DataFrame())),
-        ("ÜretimAlarmları", (prod_pack.get("live_monitoring_pack", {}) or {}).get("alerts", pd.DataFrame())),
-        ("ÜretimSıralaması", prod_pack.get("production_ranking", pd.DataFrame())),
-        ("ÖzellikDenetimi", prod_pack.get("feature_availability_audit", pd.DataFrame())),
-        ("ServisSeviyesi", prod_pack.get("production_service_table", pd.DataFrame())),
-        ("TahminAralığı", prod_pack.get("production_interval_table", pd.DataFrame())),
-    ]
-    rows = []
-    seen = {}
-    for rapor_adi, df in adaylar:
-        if not isinstance(df, pd.DataFrame) or len(df) == 0:
-            continue
-        try:
-            key = hashlib.sha1(df.to_csv(index=False).encode("utf-8", errors="ignore")).hexdigest()
-        except Exception:
-            key = f"{rapor_adi}_{len(df)}_{len(df.columns)}"
-        duplicate_of = seen.get(key)
-        if duplicate_of is None:
-            seen[key] = rapor_adi
-            rows.append({"Rapor": rapor_adi, "SatırSayısı": int(len(df)), "KolonSayısı": int(len(df.columns)), "Durum": "benzersiz", "TekrarEttiğiRapor": ""})
-        else:
-            rows.append({"Rapor": rapor_adi, "SatırSayısı": int(len(df)), "KolonSayısı": int(len(df.columns)), "Durum": "yinelenen_içerik", "TekrarEttiğiRapor": duplicate_of})
-    return pd.DataFrame(rows)
 
 def render_streamlit_app():
-    ensure_forecasting_runtime_dependencies(include_streamlit=True)
-    if st is None:
-        raise ImportError("Streamlit kurulu değil veya yüklenemedi.")
     st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
     st.title("Talep Tahminleme Studio")
-    st.caption("Üretim sınıfı veri önişleme + ileri seviye şampiyon-meydan okuyan + ansambl + toplu tahminleme")
+    st.caption("Production-grade veri önişleme + ileri seviye champion-challenger + ensemble + batch forecasting")
 
     with st.sidebar:
         st.subheader("Girdi")
         uploaded_excel = st.file_uploader("Excel dosyası yükle", type=["xlsx", "xls"])
-        st.markdown("Bu uygulama mevcut üretim sınıfı veri önişleme mantığını korur; üstüne SARIMA/SARIMAX, Prophet, XGBoost, ansambl, ABC/XYZ ve toplu tahminleme ekler.")
-        st.info("İnteraktif hız modu açık: özellikle kısa aylık serilerde SARIMAX açıklayıcı değişken ve Prophet ayar araması otomatik daraltılır. Amaç, Streamlit ekranında takılmayı önlemek ve yanıt süresini düşürmektir.")
+        st.markdown("Bu uygulama mevcut production-grade veri önişleme mantığını korur; üstüne SARIMA/SARIMAX, Prophet, XGBoost, ensemble, ABC/XYZ ve batch forecasting ekler.")
 
     if uploaded_excel is None:
         st.info("Başlamak için Excel dosyanı yükle.")
         return
 
-    try:
-        excel_path = save_uploaded_file(uploaded_excel)
-        xls = safe_excel_file(excel_path)
-    except Exception as e:
-        st.error(f"Excel dosyası yüklenemedi/açılamadı: {e}")
-        return
+    excel_path = save_uploaded_file(uploaded_excel)
+    xls = pd.ExcelFile(excel_path)
     selected_sheet = st.sidebar.selectbox("Sheet seç", xls.sheet_names)
     output_base_dir = os.path.join(os.path.dirname(excel_path), "streamlit_outputs")
     os.makedirs(output_base_dir, exist_ok=True)
@@ -10950,22 +6009,12 @@ def render_streamlit_app():
     cache_key = f"{uploaded_excel.name}::{selected_sheet}"
     if "preprocess_cache" not in st.session_state:
         st.session_state["preprocess_cache"] = {}
-    if "forecast_run_cache" not in st.session_state:
-        st.session_state["forecast_run_cache"] = {}
 
     if st.sidebar.button("Önişleme + Tahminleme için hazırla", type="primary") or cache_key not in st.session_state["preprocess_cache"]:
         with st.spinner("Veri önişleme ve yönetişim çalışıyor..."):
-            try:
-                export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
-                st.session_state["preprocess_cache"][cache_key] = export_payload
-            except Exception as e:
-                st.error(f"Önişleme sırasında hata oluştu: {e}")
-                st.exception(e)
-                return
-    export_payload = st.session_state["preprocess_cache"].get(cache_key)
-    if export_payload is None:
-        st.info("Önişleme sonucu üretilemedi.")
-        return
+            export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
+            st.session_state["preprocess_cache"][cache_key] = export_payload
+    export_payload = st.session_state["preprocess_cache"][cache_key]
 
     manifest = export_payload["manifest"]
     freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
@@ -10980,22 +6029,9 @@ def render_streamlit_app():
     mode = st.radio("Çalışma modu", ["Tek seri", "Çok serili batch forecasting"], horizontal=True)
     default_target = target_cols[0] if target_cols else None
     if mode == "Tek seri":
-        batch_targets = [default_target] if default_target else []
         target_col = st.selectbox("Tahminlenecek seri", target_cols, index=0 if default_target else None)
     else:
-        batch_targets = st.multiselect(
-            "Batch'e alınacak seriler",
-            options=target_cols,
-            default=target_cols
-        )
-        if not batch_targets:
-            st.warning("Batch için en az bir seri seçmelisin.")
-            return
-        target_col = st.selectbox(
-            "Detay panosunda gösterilecek seri",
-            options=batch_targets,
-            index=0
-        )
+        target_col = default_target
 
     default_horizon = min(infer_default_horizon(freq_alias), max(2, len(export_payload["clean_model_input"]) // 5))
     horizon = st.slider("Test ufku", min_value=2, max_value=min(24, max(2, len(export_payload["clean_model_input"]) // 3)), value=default_horizon)
@@ -11023,262 +6059,97 @@ def render_streamlit_app():
     except Exception:
         pass
 
-    cache_target_signature = "|".join(sorted(batch_targets)) if mode == "Çok serili batch forecasting" else str(target_col)
-
-    forecast_cache_key = "||".join([
-        cache_key,
-        str(mode),
-        cache_target_signature,
-        str(horizon),
-        str(int(use_exog_stat)),
-        str(int(use_exog_prophet)),
-        APP_VERSION
-    ])
-
     run_label = "Batch forecasting çalıştır" if mode == "Çok serili batch forecasting" else "Modelleri çalıştır ve karşılaştır"
     if st.button(run_label, type="primary"):
         with st.spinner("Gelişmiş tahminleme katmanı çalışıyor..."):
-            try:
-                if forecast_cache_key in st.session_state["forecast_run_cache"]:
-                    cached_obj = st.session_state["forecast_run_cache"][forecast_cache_key]
-                else:
-                    if mode == "Tek seri":
-                        cached_obj = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
-                    else:
-                        cached_obj = run_batch_forecasting(
-                            export_payload=export_payload,
-                            horizon=horizon,
-                            selected_sheet=selected_sheet,
-                            use_exog_for_stat_models=use_exog_stat,
-                            use_exog_for_prophet=use_exog_prophet,
-                            selected_targets=batch_targets
-                        )
-                    st.session_state["forecast_run_cache"][forecast_cache_key] = cached_obj
-
-                if mode == "Tek seri":
-                    st.session_state["forecast_outputs"] = cached_obj
-                    st.session_state["forecast_target"] = target_col
-                    st.session_state["batch_mode"] = False
-                else:
-                    st.session_state["batch_outputs_full"] = cached_obj
-                    st.session_state["batch_mode"] = True
-            except Exception as e:
-                st.error(f"Tahminleme sırasında hata oluştu: {e}")
-                st.exception(e)
-                return
+            if mode == "Tek seri":
+                outputs = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
+                st.session_state["forecast_outputs"] = outputs
+                st.session_state["forecast_target"] = target_col
+            else:
+                batch = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet)
+                st.session_state["batch_outputs_full"] = batch
+                st.session_state["batch_mode"] = True
 
     if mode == "Çok serili batch forecasting":
         batch = st.session_state.get("batch_outputs_full")
         if batch is None:
             st.info("Batch sonucu görmek için butona bas.")
             return
-
         st.subheader("Batch forecasting özeti")
-        st.dataframe(style_metric_dataframe(batch["best_summary"]), width="stretch")
-
+        st.dataframe(style_metric_dataframe(batch["best_summary"]), use_container_width=True)
         st.subheader("Champion - Challenger tablosu")
-        st.dataframe(batch["champion_table"], width="stretch")
+        st.dataframe(batch["champion_table"], use_container_width=True)
+        st.download_button("Batch özetini indir (CSV)", data=dataframe_to_download_bytes(batch["best_summary"]), file_name=f"{selected_sheet}_batch_forecasting_summary.csv", mime="text/csv")
+        return
 
-        batch_summary_excel = build_batch_summary_excel_bytes(batch)
-        if batch_summary_excel is not None:
-            st.download_button(
-                "Batch özetini indir (Excel)",
-                data=batch_summary_excel,
-                file_name=f"{selected_sheet}_batch_forecasting_summary.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-        zip_state_key = f"batch_zip_bytes__{forecast_cache_key}"
-        if st.button("Excel + grafik ZIP paketini hazırla"):
-            with st.spinner("ZIP paketi hazırlanıyor..."):
-                st.session_state[zip_state_key] = build_batch_zip_bytes(export_payload, batch, selected_sheet, horizon)
-
-        if st.session_state.get(zip_state_key):
-            st.download_button(
-                "Tüm batch çıktıları indir (ZIP)",
-                data=st.session_state[zip_state_key],
-                file_name=f"{selected_sheet}_batch_full_outputs.zip",
-                mime="application/zip"
-            )
-
-        if target_col not in batch.get("batch_outputs", {}):
-            st.warning("Seçilen seri batch sonuçları içinde bulunamadı.")
-            return
-
-        outputs = batch["batch_outputs"][target_col]
-        profile = get_profile_row(export_payload, target_col)
-
-    else:
-        outputs = st.session_state.get("forecast_outputs")
-        if outputs is None or st.session_state.get("forecast_target") != target_col:
-            st.info("Model karşılaştırmasını görmek için butona bas.")
-            return
+    outputs = st.session_state.get("forecast_outputs")
+    if outputs is None or st.session_state.get("forecast_target") != target_col:
+        st.info("Model karşılaştırmasını görmek için butona bas.")
+        return
 
     st.subheader("Model karşılaştırma tablosu")
     metrics_df = style_metric_dataframe(outputs["metrics_df"])
-    st.dataframe(metrics_df, width="stretch")
+    st.dataframe(metrics_df, use_container_width=True)
     st.download_button("Karşılaştırma tablosunu indir (CSV)", data=dataframe_to_download_bytes(metrics_df), file_name=f"{selected_sheet}_{target_col}_model_karsilastirma.csv", mime="text/csv")
-
-    if isinstance(outputs.get("stage_timing_table"), pd.DataFrame) and len(outputs.get("stage_timing_table")):
-        with st.expander("Çalışma süresi / performans özeti", expanded=False):
-            st.dataframe(outputs["stage_timing_table"], width="stretch")
-            for note in outputs.get("metadata", {}).get("runtime_guardrails", []):
-                st.write(f"- {note}")
-
-    outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
-    readiness = assess_production_readiness(export_payload, outputs["metrics_df"], target_col, outputs=outputs)
-    prod_pack = outputs.get("production_governance", {}) or {}
-    prod_model = outputs.get("production_model", outputs.get("best_model"))
-    prod_status = outputs.get("production_status", "eligible")
-    if prod_status in ["eligible", "guarded_fallback"]:
-        st.success(f"Üretim önerisi: {prod_model} | Durum: {prod_status}")
-    else:
-        st.warning(f"Üretim önerisi: {prod_model} | Durum: {prod_status}")
-    with st.expander("Üretim kullanımı değerlendirmesi", expanded=False):
-        for note in readiness["notes"]:
-            st.write(f"- {note}")
-        gate_df = prod_pack.get("model_eligibility_gate", pd.DataFrame())
-        if isinstance(gate_df, pd.DataFrame) and len(gate_df) > 0:
-            st.markdown("**Otomatik model uygunluk kapısı**")
-            st.dataframe(style_metric_dataframe(gate_df), width="stretch")
 
     cc = outputs.get("champion_challenger", {})
     if cc.get("champion"):
-        st.success(f"Şampiyon model: {cc['champion']} | Meydan okuyan: {cc.get('challenger', '-')}")
-    st.markdown("**Karar kademelerine göre model liderleri**")
-    st.dataframe(style_metric_dataframe(build_model_liderleri(outputs)), width="stretch")
-    if outputs.get("model_errors"):
-        with st.expander("Model hata / fallback özeti"):
-            err_df = pd.DataFrame([{"model": k, "message": v} for k, v in outputs.get("model_errors", {}).items()])
-            if len(err_df):
-                st.dataframe(err_df, width="stretch")
+        st.success(f"Champion model: {cc['champion']} | Challenger: {cc.get('challenger', '-')}")
 
-    fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
+    fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin")
     if fig is not None:
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Şampiyon-Meydan Okuyan ve Ansambl", "Gerçek vs Tahmin", "Geri Test Panosu", "Üretim Yönetişimi", "Önişleme Denetimleri", "Akıllı Değerlendirmeler"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Champion-Challenger & Ensemble", "Gerçek vs Tahmin", "Önişleme Denetimleri", "Akıllı Yorumlar"])
 
     with tab1:
-        sarima = outputs.get("sarima")
-        if sarima is None:
-            st.warning(outputs.get("model_errors", {}).get("SARIMA/SARIMAX", "SARIMA/SARIMAX sonucu üretilemedi."))
-        else:
-            st.json({"order": sarima.get("order"), "seasonal_order": sarima.get("seasonal_order"), "trend": sarima.get("trend"), "AIC": sarima.get("aic"), "BIC": sarima.get("bic"), "Ljung-Box p-değeri": sarima.get("ljung_box_pvalue"), "d": sarima.get("d"), "D": sarima.get("D"), "transform": sarima.get("transform"), "white_noise_ok": sarima.get("residual_white_noise_ok"), "fallback_used": sarima.get("fallback_used"), "fallback_method": sarima.get("fallback_method")})
-            if "SARIMA/SARIMAX" in outputs["tables"]:
-                st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), width="stretch")
-                fig_sarima = plot_forecast_results(outputs["train"], outputs["test"], {"SARIMA/SARIMAX": outputs["predictions"]["SARIMA/SARIMAX"]}, f"{target_col} - SARIMA/SARIMAX", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
-                if fig_sarima is not None:
-                    st.plotly_chart(fig_sarima, width="stretch")
-            if isinstance(sarima.get("search_table"), pd.DataFrame) and len(sarima.get("search_table")):
-                st.dataframe(style_metric_dataframe(sarima["search_table"]), width="stretch")
+        sarima = outputs["sarima"]
+        st.write({"order": sarima["order"], "seasonal_order": sarima["seasonal_order"], "AIC": sarima["aic"], "BIC": sarima["bic"], "Ljung-Box p-value": sarima["ljung_box_pvalue"], "d": sarima["d"], "D": sarima["D"], "transform": sarima.get("transform"), "white_noise_ok": sarima.get("residual_white_noise_ok")})
+        st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(sarima["search_table"]), use_container_width=True)
 
     with tab2:
         if "prophet" in outputs:
-            st.markdown("**Prophet görünürlüğü (gerçek fit mi, fallback mi?)**")
-            st.dataframe(style_metric_dataframe(outputs.get("prophet_gorunurluk_ozeti", pd.DataFrame())), width="stretch")
-            if isinstance(outputs["prophet"].get("config"), dict):
-                st.json(outputs["prophet"]["config"])
-            if isinstance(outputs["prophet"].get("component_validation"), dict):
-                st.json(outputs["prophet"].get("component_validation", {}))
-            st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), width="stretch")
-            fig_prophet = plot_forecast_results(outputs["train"], outputs["test"], {"Prophet": outputs["predictions"]["Prophet"]}, f"{target_col} - Prophet", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
-            if fig_prophet is not None:
-                st.plotly_chart(fig_prophet, width="stretch")
-            st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), width="stretch")
+            st.write(outputs["prophet"]["config"])
+            st.write(outputs["prophet"].get("component_validation", {}))
+            st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), use_container_width=True)
+            st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), use_container_width=True)
         else:
             st.warning(outputs.get("prophet_error", "Prophet sonucu üretilemedi."))
 
     with tab3:
-        if "xgboost" not in outputs:
-            st.warning(outputs.get("model_errors", {}).get("XGBoost", "XGBoost sonucu üretilemedi."))
-        else:
-            st.json({"selected_strategy": outputs["xgboost"].get("strategy"), "shap_status": outputs["xgboost"].get("shap_status"), "fallback_used": outputs["xgboost"].get("fallback_used"), "fallback_method": outputs["xgboost"].get("fallback_method")})
-            if "XGBoost" in outputs["tables"]:
-                st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), width="stretch")
-                fig_xgb = plot_forecast_results(outputs["train"], outputs["test"], {"XGBoost": outputs["predictions"]["XGBoost"]}, f"{target_col} - XGBoost", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
-                if fig_xgb is not None:
-                    st.plotly_chart(fig_xgb, width="stretch")
-            st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), width="stretch")
-            if "strategy_comparison" in outputs["xgboost"]:
-                st.dataframe(style_metric_dataframe(outputs["xgboost"]["strategy_comparison"]), width="stretch")
-            if len(outputs["xgboost"].get("feature_importance", pd.DataFrame())):
-                st.dataframe(outputs["xgboost"]["feature_importance"], width="stretch")
+        st.write({"selected_strategy": outputs["xgboost"].get("strategy"), "shap_status": outputs["xgboost"].get("shap_status")})
+        st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), use_container_width=True)
+        if "strategy_comparison" in outputs["xgboost"]:
+            st.dataframe(style_metric_dataframe(outputs["xgboost"]["strategy_comparison"]), use_container_width=True)
+        if len(outputs["xgboost"].get("feature_importance", pd.DataFrame())):
+            st.dataframe(outputs["xgboost"]["feature_importance"], use_container_width=True)
 
     with tab4:
-        st.markdown("**Karar hiyerarşisi özeti**")
-        st.dataframe(style_metric_dataframe(outputs.get("karar_hiyerarsisi", pd.DataFrame())), width="stretch")
-        st.markdown("**Holdout sıralaması**")
-        st.dataframe(style_metric_dataframe(outputs["champion_challenger"]["ranking"]), width="stretch")
-        st.markdown("**Ansambl ağırlıkları (peak-aware + bias-aware)**")
-        st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), width="stretch")
-        st.markdown("**Ansambl gerçek ve tahmin**")
-        st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), width="stretch")
-        fig_ens = plot_forecast_results(outputs["train"], outputs["test"], {"Ensemble": outputs["predictions"]["Ensemble"]}, f"{target_col} - Ensemble", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
-        if fig_ens is not None:
-            st.plotly_chart(fig_ens, width="stretch")
+        st.dataframe(style_metric_dataframe(outputs["champion_challenger"]["ranking"]), use_container_width=True)
+        st.markdown("**Ensemble ağırlıkları**")
+        st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), use_container_width=True)
+        st.markdown("**Ensemble gerçek vs tahmin**")
+        st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), use_container_width=True)
 
     with tab5:
         combined = outputs["all_predictions_long"].copy()
-        st.dataframe(style_metric_dataframe(combined), width="stretch")
+        st.dataframe(style_metric_dataframe(combined), use_container_width=True)
         st.download_button("Gerçek vs tahmin tablosunu indir (CSV)", data=dataframe_to_download_bytes(combined), file_name=f"{selected_sheet}_{target_col}_actual_vs_forecast.csv", mime="text/csv")
 
     with tab6:
-        if "rolling_origin_backtest" in outputs and len(outputs["rolling_origin_backtest"]) > 0:
-            st.markdown("**Rolling-origin geri test (tam katman)**")
-            st.dataframe(style_metric_dataframe(outputs["rolling_origin_backtest"]), width="stretch")
-        if "validation_metrics_df" in outputs and len(outputs["validation_metrics_df"]) > 0:
-            st.markdown("**Doğrulama temelli model kalitesi**")
-            st.dataframe(style_metric_dataframe(outputs["validation_metrics_df"]), width="stretch")
-        if "proxy_backtest_report" in export_payload and len(export_payload["proxy_backtest_report"]) > 0:
-            st.markdown("**Proxy backtest raporu**")
-            st.dataframe(export_payload["proxy_backtest_report"], width="stretch")
-        else:
-            st.info("Proxy backtest raporu bulunamadı.")
-        if "raw_vs_clean_backtest_report" in export_payload and len(export_payload["raw_vs_clean_backtest_report"]) > 0:
-            st.markdown("**Raw vs Clean backtest karşılaştırması**")
-            st.dataframe(export_payload["raw_vs_clean_backtest_report"], width="stretch")
+        st.markdown("**Kalite raporu**")
+        st.dataframe(export_payload["quality_report"], use_container_width=True)
+        st.markdown("**Seri profil raporu**")
+        st.dataframe(export_payload["series_profile_report"], use_container_width=True)
+        st.markdown("**Anomali yönetişimi**")
+        st.dataframe(export_payload["anomaly_governance"], use_container_width=True)
+        st.markdown("**Review queue**")
+        st.dataframe(export_payload["review_queue"], use_container_width=True)
 
     with tab7:
-        prod_pack = outputs.get("production_governance", {}) or {}
-        live_pack = prod_pack.get("live_monitoring_pack", {}) or {}
-        st.markdown("**Karar hiyerarşisi**")
-        st.dataframe(style_metric_dataframe(outputs.get("karar_hiyerarsisi", pd.DataFrame())), width="stretch")
-        st.markdown("**Merkezî canlı izleme özeti**")
-        st.dataframe(style_metric_dataframe(live_pack.get("summary", pd.DataFrame())), width="stretch")
-        st.markdown("**Model sağlık tablosu (bias, kapsama, fallback, servis seviyesi)**")
-        st.dataframe(style_metric_dataframe(live_pack.get("model_health_table", pd.DataFrame())), width="stretch")
-        if isinstance(live_pack.get("alerts"), pd.DataFrame) and len(live_pack.get("alerts")) > 0:
-            st.markdown("**Üretim alarmları**")
-            st.dataframe(style_metric_dataframe(live_pack.get("alerts", pd.DataFrame())), width="stretch")
-        st.markdown("**Üretim sıralaması (holdout, doğrulama ve rolling-origin birlikte)**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("production_ranking", pd.DataFrame())), width="stretch")
-        st.markdown("**Tahmin katkı değeri (baseline'a göre)**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("forecast_value_add", pd.DataFrame())), width="stretch")
-        st.markdown("**Bias dashboard**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("bias_dashboard", pd.DataFrame())), width="stretch")
-        st.markdown("**Tepe olay yakalama skoru**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("peak_event_dashboard", pd.DataFrame())), width="stretch")
-        st.markdown("**Üretim özellik erişilebilirlik denetimi**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("feature_availability_audit", pd.DataFrame())), width="stretch")
-        st.markdown("**Üretim modeli için tahmin aralığı / quantile forecast**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("production_interval_table", pd.DataFrame())), width="stretch")
-        st.markdown("**Servis seviyesi / stok etkisi simülasyonu**")
-        st.dataframe(style_metric_dataframe(prod_pack.get("production_service_table", pd.DataFrame())), width="stretch")
-        st.markdown("**Benzersiz rapor kataloğu (yinelenen içerik temizliği)**")
-        st.dataframe(style_metric_dataframe(outputs.get("benzersiz_rapor_katalogu", pd.DataFrame())), width="stretch")
-
-    with tab8:
-        st.markdown("**Kalite raporu**")
-        st.dataframe(export_payload["quality_report"], width="stretch")
-        st.markdown("**Seri profil raporu**")
-        st.dataframe(export_payload["series_profile_report"], width="stretch")
-        st.markdown("**Anomali yönetişimi**")
-        st.dataframe(export_payload["anomaly_governance"], width="stretch")
-        st.markdown("**Review queue**")
-        st.dataframe(export_payload["review_queue"], width="stretch")
-
-    with tab9:
         suggestions = []
         if float(profile.get("seasonality_strength", 0) or 0) >= 0.35:
             suggestions.append("Seri sezonsal; auto seasonal (P,D,Q,m), Prophet custom seasonality ve ensemble kritik.")
@@ -11296,720 +6167,563 @@ def render_streamlit_app():
             st.write(f"- {s}")
 
 
-def _resolve_streamlit_entrypoint():
-    """Render fonksiyonunu güvenli biçimde bulur."""
-    direct = globals().get("render_streamlit_app")
-    if callable(direct):
-        return direct
 
-    candidates = []
-    for name, obj in globals().items():
-        if not callable(obj):
-            continue
-        lower = str(name).lower()
-        if lower.startswith("render_") and "streamlit" in lower:
-            candidates.append(obj)
-        elif lower.startswith("render") and "app" in lower:
-            candidates.append(obj)
+# =========================================================
+# PHARMA-SPECIFIC ENHANCEMENTS v3
+# stock-out / promo / epidemi calendar / OTC-RX-channel split
+# and hierarchical forecast reconciliation.
+# =========================================================
 
-    if candidates:
-        return candidates[0]
-
-    raise NameError(
-        "render_streamlit_app tanımı bulunamadı. Streamlit giriş noktası eksik veya bozuk."
-    )
+def _safe_numeric_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").astype(float)
 
 
-def _is_running_under_streamlit() -> bool:
-    try:
-        ensure_forecasting_runtime_dependencies(include_streamlit=True)
-    except Exception:
-        pass
-
-    if st is not None:
-        try:
-            from streamlit.runtime.scriptrunner import get_script_run_ctx
-            if get_script_run_ctx() is not None:
-                return True
-        except Exception:
-            pass
-
-    try:
-        argv_text = " ".join(str(x) for x in sys.argv)
-    except Exception:
-        argv_text = ""
-
-    env_markers = [
-        "STREAMLIT_SERVER_PORT",
-        "STREAMLIT_SERVER_HEADLESS",
-        "STREAMLIT_BROWSER_GATHER_USAGE_STATS",
-        "STREAMLIT_SHARING_MODE",
-        "STREAMLIT_RUNTIME",
-        "STREAMLIT_THEME_BASE",
-    ]
-    if any(os.environ.get(k) for k in env_markers):
-        return True
-    if "streamlit run" in argv_text.lower() or "streamlit.web.cli" in argv_text.lower():
-        return True
-    return False
-
-
-def _should_launch_streamlit_entrypoint(argv: Optional[List[str]] = None) -> bool:
-    argv = list(argv or [])
-
-    try:
-        ensure_forecasting_runtime_dependencies(include_streamlit=True)
-    except Exception:
-        pass
-
-    if _is_running_under_streamlit():
-        return True
-    if any(str(a).strip().lower() == "--streamlit" for a in argv):
-        return True
-
-    # Streamlit kurulu ve tkinter yoksa, parametresiz başlatma yerel diyalog
-    # akışına girmek yerine Streamlit UI'yi açmalıdır. Bu özellikle Streamlit Cloud
-    # ve headless Linux ortamlarda kritik davranıştır.
-    if not argv and st is not None and not HAS_TKINTER:
-        return True
-    return False
-
-
-def configure_local_runtime_stability() -> None:
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-    try:
-        FORECAST_RUNTIME_CONFIG.search_accelerator_enabled = False
-        FORECAST_RUNTIME_CONFIG.search_accelerator_model_parallel = False
-        FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_parallel = False
-        FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers = 1
-        FORECAST_RUNTIME_CONFIG.search_accelerator_candidate_workers = 1
-        FORECAST_RUNTIME_CONFIG.xgb_force_single_thread = True
-    except Exception:
-        pass
-    try:
-        SEARCH_ACCELERATOR.config.enabled = False
-        SEARCH_ACCELERATOR.config.model_parallelism = False
-        SEARCH_ACCELERATOR.config.candidate_parallelism = False
-        SEARCH_ACCELERATOR.config.max_workers = 1
-        SEARCH_ACCELERATOR.config.candidate_workers = 1
-        SEARCH_ACCELERATOR.config.cache_enabled = False
-        SEARCH_ACCELERATOR.config.result_cache_enabled = False
-    except Exception:
-        pass
-
-
-def _prepare_excel_source_from_path(input_path: str, archive_member: Optional[str] = None) -> Dict[str, Optional[str]]:
-    input_path = os.path.abspath(str(input_path))
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Girdi dosyası bulunamadı: {input_path}")
-    if os.path.isdir(input_path):
-        excel_files = sorted([
-            os.path.relpath(os.path.join(root, f), input_path)
-            for root, _, files in os.walk(input_path)
-            for f in files if f.lower().endswith((".xlsx", ".xls"))
-        ])
-        if not excel_files:
-            raise FileNotFoundError("Seçilen klasörde Excel dosyası bulunamadı.")
-        chosen_member = archive_member
-        if chosen_member is None:
-            if len(excel_files) != 1:
-                raise ValueError("Klasörde birden fazla Excel dosyası var. İlgili dosyayı seçmek için etkileşimli modu kullanın veya göreli dosya yolunu belirtin.")
-            chosen_member = excel_files[0]
-        chosen_member = str(chosen_member)
-        if chosen_member not in excel_files:
-            raise ValueError(f"Klasör içi Excel dosyası bulunamadı: {chosen_member}")
-        excel_path = os.path.join(input_path, chosen_member)
-        return {
-            "source_path": input_path,
-            "excel_path": excel_path,
-            "archive_member": None,
-            "temp_dir": None,
-            "source_type": "directory",
-            "selected_excel": chosen_member,
-        }
-    lower = input_path.lower()
-    if lower.endswith((".xlsx", ".xls")):
-        return {
-            "source_path": input_path,
-            "excel_path": input_path,
-            "archive_member": None,
-            "temp_dir": None,
-            "source_type": "excel",
-        }
-    if lower.endswith((".zip", ".rar")):
-        excel_files = _list_excel_files_in_archive(input_path)
-        chosen_member = archive_member
-        if chosen_member is None:
-            if len(excel_files) != 1:
-                raise ValueError("Arşiv içinde birden fazla Excel dosyası var. --archive-member parametresi verilmelidir.")
-            chosen_member = excel_files[0]
-        if chosen_member not in excel_files:
-            raise ValueError(f"Arşiv üyesi bulunamadı: {chosen_member}")
-        extracted_path, temp_dir = _extract_excel_from_archive(input_path, chosen_member)
-        return {
-            "source_path": input_path,
-            "excel_path": extracted_path,
-            "archive_member": chosen_member,
-            "temp_dir": temp_dir,
-            "source_type": "archive",
-        }
-    raise ValueError("Desteklenmeyen girdi türü. .xlsx, .xls, .zip, .rar veya bir klasör yolu bekleniyor.")
-
-
-def _resolve_sheet_name_for_cli(excel_path: str, requested_sheet: Optional[str]) -> str:
-    xls = safe_excel_file(excel_path)
-    sheet_names = list(xls.sheet_names)
-    if requested_sheet is None:
-        if len(sheet_names) == 1:
-            return sheet_names[0]
-        raise ValueError("Birden fazla sheet var. --sheet parametresi verilmelidir.")
-    if requested_sheet in sheet_names:
-        return requested_sheet
-    if str(requested_sheet).isdigit():
-        idx = int(requested_sheet) - 1
-        if 0 <= idx < len(sheet_names):
-            return sheet_names[idx]
-    lowered = {str(s).strip().lower(): s for s in sheet_names}
-    key = str(requested_sheet).strip().lower()
-    if key in lowered:
-        return lowered[key]
-    raise ValueError(f"Sheet bulunamadı: {requested_sheet}")
-
-
-def _parse_target_list(arg_value: Optional[str]) -> Optional[List[str]]:
-    if arg_value is None:
-        return None
-    raw = str(arg_value).strip()
-    if not raw or raw.lower() in {"all", "*"}:
-        return None
-    return [x.strip() for x in raw.split(",") if x.strip()]
-
-
-
-def _list_excel_files_in_directory(directory_path: str) -> List[str]:
-    directory_path = os.path.abspath(str(directory_path))
-    if not os.path.isdir(directory_path):
-        raise NotADirectoryError(f"Klasör bulunamadı: {directory_path}")
-    return sorted([
-        os.path.relpath(os.path.join(root, f), directory_path)
-        for root, _, filenames in os.walk(directory_path)
-        for f in filenames if f.lower().endswith((".xlsx", ".xls"))
-    ])
-
-
-def get_excel_sheet_names_fast(excel_path: str) -> List[str]:
-    """Return workbook sheet names with minimal overhead for local interactive flow."""
-    ext = os.path.splitext(str(excel_path))[1].lower()
-    ok, engine, msg = _check_optional_excel_dependency(ext)
-    if not ok:
-        raise ImportError(msg)
-
-    if ext == ".xlsx":
-        try:
-            from openpyxl import load_workbook
-            wb = load_workbook(excel_path, read_only=True, data_only=True)
-            try:
-                return [str(s) for s in wb.sheetnames]
-            finally:
-                try:
-                    wb.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    if ext == ".xls":
-        try:
-            import xlrd
-            wb = xlrd.open_workbook(excel_path, on_demand=True)
-            try:
-                return [str(s) for s in wb.sheet_names()]
-            finally:
-                try:
-                    wb.release_resources()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    xls = safe_excel_file(excel_path)
-    return [str(s) for s in xls.sheet_names]
-
-
-def read_excel_preview_fast(excel_path: str, sheet_name: str, preview_rows: int = 1200) -> pd.DataFrame:
-    ext = os.path.splitext(str(excel_path))[1].lower()
-    ok, engine, msg = _check_optional_excel_dependency(ext)
-    if not ok:
-        raise ImportError(msg)
-    try:
-        df_preview = pd.read_excel(excel_path, sheet_name=sheet_name, engine=engine, nrows=int(preview_rows))
-    except TypeError:
-        df_preview = pd.read_excel(excel_path, sheet_name=sheet_name, engine=engine)
-        if preview_rows and len(df_preview) > int(preview_rows):
-            df_preview = df_preview.head(int(preview_rows)).copy()
-    return df_preview
-
-
-def build_local_sheet_preview_payload(excel_path: str, sheet_name: str, preview_rows: int = 1200) -> Dict[str, Any]:
-    progress_log("Hızlı Önizleme", "Sheet önizlemesi okunuyor; seri listesi ve frekans tahmin ediliyor.", extra={"sheet": sheet_name, "preview_rows": int(preview_rows)})
-    try:
-        df_preview = read_excel_preview_fast(excel_path, sheet_name=sheet_name, preview_rows=int(preview_rows))
-    except Exception as e:
-        raise ImportError(f"Sheet önizlemesi okunamadı ({os.path.basename(excel_path)} / {sheet_name}): {e}")
-
-    cfg = PreprocessConfig()
-    date_col = detect_date_column(df_preview, cfg)
-    df_preview = df_preview.copy()
-    df_preview[date_col] = parse_datetime_series(df_preview[date_col])
-    df_preview = df_preview.dropna(subset=[date_col]).sort_values(date_col).reset_index(drop=True)
-    target_cols = detect_target_columns(df_preview, date_col, cfg)
-    freq_alias = infer_frequency_from_dates(pd.DatetimeIndex(df_preview[date_col].dropna())) if len(df_preview) >= 3 else "M"
-
-    profile_rows = []
-    for col in target_cols:
-        s = pd.to_numeric(df_preview[col], errors="coerce")
-        profile_rows.append({
-            "series": str(col),
-            "n_obs": int(s.notna().sum()),
-            "intermittency_ratio": safe_float(demand_intermittency_ratio(s)),
-            "mean": safe_float(s.mean()),
-            "median": safe_float(s.median()),
-        })
-
-    preview_payload = {
-        "series_profile_report": pd.DataFrame(profile_rows),
-        "clean_model_input": df_preview[[date_col] + [c for c in target_cols if c in df_preview.columns]].copy(),
-        "preview_date_col": date_col,
-        "preview_target_cols": list(target_cols),
-        "preview_freq_alias": freq_alias,
-        "preview_row_count": int(len(df_preview)),
-        "preview_sheet_name": str(sheet_name),
+def detect_pharma_column_groups(df: pd.DataFrame, date_col: str, target_col: Optional[str] = None) -> Dict[str, List[str]]:
+    groups = {
+        "price": [],
+        "promo": [],
+        "stock": [],
+        "otc_rx": [],
+        "channel": [],
+        "epidemi": []
     }
-    progress_log("Hızlı Önizleme", "Sheet önizlemesi tamamlandı.", level="SUCCESS", extra={"sheet": sheet_name, "targets": len(target_cols), "freq_alias": freq_alias, "preview_rows_used": int(len(df_preview))})
-    return preview_payload
+    price_kw = ["price", "fiyat", "net_price", "gross_price", "discount"]
+    promo_kw = ["promo", "promotion", "campaign", "kampanya", "discount_flag", "launch"]
+    stock_kw = ["stock", "inventory", "stok", "on_hand", "availability", "oos", "stockout", "fill_rate"]
+    otc_kw = ["otc", "rx", "prescription", "reçete", "recete", "reimb", "geri_odeme"]
+    channel_kw = ["channel", "eczane", "pharmacy", "hospital", "hastane", "depo", "warehouse", "region", "bolge", "doctor", "physician"]
+    epidemi_kw = ["epidemi", "epi", "flu", "grip", "allergy", "alerji", "temperature", "sicaklik", "weather", "humidity", "nem"]
 
-
-def choose_local_input_source_interactively() -> Tuple[str, Optional[str]]:
-    if not HAS_TKINTER:
-        raise RuntimeError("Etkileşimli masaüstü seçim ekranı için tkinter gereklidir.")
-
-    progress_log("Dosya Seçimi", "Doğrudan dosya gezgini açılıyor. Excel seçimi bekleniyor...")
-    try:
-        source_info = choose_excel_file(dialog_mode="excel_only")
-        source_path = str(source_info.get("source_path"))
-        archive_member = source_info.get("archive_member")
-        return source_path, archive_member
-    except FileNotFoundError:
-        progress_log("Dosya Seçimi", "İlk dosya seçimi iptal edildi; alternatif kaynak seçimi ekranı açılıyor.", level="WARNING")
-
-    source_kind = ask_choice_dialog(
-        title="Veri Kaynağı Seçimi",
-        prompt="Doğrudan dosya seçimi iptal edildi. Alternatif bir kaynak seçin.",
-        items=["Excel/ZIP/RAR dosyasını yeniden seç", "Klasör seç"],
-        default_index=0,
-    )
-    if source_kind == "Klasör seç":
-        root = _prepare_tk_root(hidden=True)
-        folder_path = filedialog.askdirectory(
-            title="Excel dosyalarının bulunduğu klasörü seçin",
-            initialdir=_best_local_initial_dir(),
-            parent=root,
-        )
-        try:
-            root.destroy()
-        except Exception:
-            pass
-        if not folder_path:
-            raise ValueError("Klasör seçimi yapılmadı.")
-        excel_files = _list_excel_files_in_directory(folder_path)
-        if not excel_files:
-            raise FileNotFoundError("Seçilen klasörde Excel dosyası bulunamadı.")
-        chosen_excel = choose_single_sheet(excel_files)
-        return os.path.abspath(folder_path), chosen_excel
-
-    source_info = choose_excel_file(dialog_mode="excel_or_archive")
-    source_path = str(source_info.get("source_path"))
-    archive_member = source_info.get("archive_member")
-    return source_path, archive_member
-
-
-
-def recommend_batch_target_subset(export_payload: Dict[str, pd.DataFrame], horizon: int) -> List[str]:
-    profile_df = export_payload.get("series_profile_report", pd.DataFrame())
-    if not isinstance(profile_df, pd.DataFrame) or len(profile_df) == 0 or "series" not in profile_df.columns:
-        return []
-    all_targets = list(profile_df["series"].astype(str).tolist())
-    min_obs = max(18, int(horizon) * 4)
-    recommended = set(all_targets)
-
-    keep = set()
-    for _, row in profile_df.iterrows():
-        series = str(row.get("series"))
-        n_obs = safe_float(row.get("n_obs"))
-        intermittency = safe_float(row.get("intermittency_ratio"))
-        if pd.notna(n_obs) and n_obs < min_obs:
+    for c in df.columns:
+        if c == date_col or c == target_col:
             continue
-        if pd.notna(intermittency) and intermittency > 0.98:
-            continue
-        keep.add(series)
-    if keep:
-        recommended &= keep
-
-    missing_df = export_payload.get("missing_strategy_audit", pd.DataFrame())
-    if isinstance(missing_df, pd.DataFrame) and len(missing_df) > 0 and "series" in missing_df.columns:
-        excluded_mask = pd.Series(False, index=missing_df.index)
-        if "series_excluded_from_modeling" in missing_df.columns:
-            excluded_mask = missing_df["series_excluded_from_modeling"].astype(bool)
-        excluded = set(missing_df.loc[excluded_mask, "series"].astype(str).tolist())
-        recommended -= excluded
-
-    review_queue = export_payload.get("review_queue", pd.DataFrame())
-    if isinstance(review_queue, pd.DataFrame) and len(review_queue) > 0 and "series" in review_queue.columns:
-        review_counts = review_queue["series"].astype(str).value_counts()
-        too_many_reviews = set(review_counts[review_counts >= max(5, int(horizon) * 2)].index.tolist())
-        if len(recommended - too_many_reviews) >= 2:
-            recommended -= too_many_reviews
-
-    ordered = [s for s in all_targets if s in recommended]
-    if len(ordered) >= 2:
-        return ordered
-    return all_targets
+        lc = str(c).lower()
+        if any(k in lc for k in price_kw):
+            groups["price"].append(c)
+        if any(k in lc for k in promo_kw):
+            groups["promo"].append(c)
+        if any(k in lc for k in stock_kw):
+            groups["stock"].append(c)
+        if any(k in lc for k in otc_kw):
+            groups["otc_rx"].append(c)
+        if any(k in lc for k in channel_kw):
+            groups["channel"].append(c)
+        if any(k in lc for k in epidemi_kw):
+            groups["epidemi"].append(c)
+    return groups
 
 
-def choose_local_forecast_plan_interactively(preview_payload: Dict[str, Any], default_horizon: int, freq_alias: str) -> Dict[str, Any]:
-    series_profile = preview_payload.get("series_profile_report", pd.DataFrame())
-    targets = list(series_profile["series"].astype(str).tolist()) if isinstance(series_profile, pd.DataFrame) and len(series_profile) > 0 and "series" in series_profile.columns else []
-    if not targets:
-        raise ValueError("Seri listesi belirlenemedi.")
-
-    progress_log("Tahminleme Modu", "Tahminleme modu seçim ekranı açılıyor.", extra={"targets": len(targets), "freq_alias": freq_alias})
-    mode = ask_choice_dialog(
-        title="Tahminleme Modu",
-        prompt="Tek serili veya çok serili batch forecasting modunu seçin.",
-        items=["Tek serili tahminleme", "Çok serili batch forecasting"],
-        default_index=1 if len(targets) > 1 else 0,
-    )
-    progress_log("Tahminleme Modu", "Tahminleme modu seçildi.", level="SUCCESS", extra={"mode": mode})
-
-    preview_rows = int(preview_payload.get("preview_row_count") or len(preview_payload.get("clean_model_input", pd.DataFrame())) or 0)
-    max_horizon = max(2, min(24, max(2, preview_rows // 3 if preview_rows else default_horizon)))
-    horizon_prompt = (
-        f"Frekans: {freq_alias}\n"
-        f"Önerilen test ufku: {default_horizon}\n"
-        f"Uygun aralık: 2 ile {max_horizon} arası.\n\n"
-        "Test / tahmin ufkunu girin."
-    )
-    progress_log("Test Ufku", "Test ufku giriş ekranı açılıyor.", extra={"default_horizon": int(default_horizon), "max_horizon": int(max_horizon)})
-    horizon = ask_integer_dialog("Test Ufku", horizon_prompt, initial=default_horizon, min_value=2, max_value=max_horizon)
-    progress_log("Test Ufku", "Test ufku seçildi.", level="SUCCESS", extra={"horizon": int(horizon)})
-
-    if mode == "Tek serili tahminleme":
-        progress_log("Seri Seçimi", "Tek serili seri seçim ekranı açılıyor.", extra={"target_count": len(targets)})
-        target = ask_choice_dialog(
-            title="Seri Seçimi",
-            prompt="Tek serili tahminleme için çalıştırılacak seriyi seçin.",
-            items=targets,
-            default_index=0,
-        )
-        progress_log("Seri Seçimi", "Tek serili seri seçimi tamamlandı.", level="SUCCESS", extra={"selected_target": target})
-        return {"mode": "single", "horizon": int(horizon), "selected_targets": [target]}
-
-    recommended_targets = recommend_batch_target_subset(preview_payload, horizon)
-    progress_log("Batch Seri Politikası", "Batch seri stratejisi seçim ekranı açılıyor.", extra={"recommended_count": len(recommended_targets), "all_targets": len(targets)})
-    batch_policy = ask_choice_dialog(
-        title="Batch Seri Seçimi",
-        prompt=(
-            "Gerçek iş kullanımında batch tahminleme genelde tüm portföy veya modellemeye en uygun alt portföy üzerinde çalıştırılır.\n\n"
-            "Bir seri seçim stratejisi belirleyin."
-        ),
-        items=["Önerilen üretim serileri", "Tüm seriler", "Manuel seri seçimi"],
-        default_index=0 if len(recommended_targets) >= 2 else 1,
-    )
-
-    if batch_policy == "Önerilen üretim serileri":
-        selected_targets = recommended_targets
-    elif batch_policy == "Tüm seriler":
-        selected_targets = targets
+def _epidemi_season_score(ds: pd.Series, target_col: str) -> pd.Series:
+    dates = pd.to_datetime(ds)
+    months = dates.dt.month
+    target_upper = str(target_col).upper()
+    if target_upper.startswith("R"):
+        score_map = {1: 1.00, 2: 0.95, 3: 0.80, 4: 0.60, 5: 0.45, 6: 0.25, 7: 0.20, 8: 0.25, 9: 0.40, 10: 0.65, 11: 0.85, 12: 1.00}
+    elif target_upper.startswith("N02"):
+        score_map = {1: 0.65, 2: 0.60, 3: 0.55, 4: 0.50, 5: 0.50, 6: 0.45, 7: 0.45, 8: 0.45, 9: 0.50, 10: 0.55, 11: 0.60, 12: 0.65}
     else:
-        progress_log("Batch Seri Seçimi", "Manuel batch seri seçim ekranı açılıyor.", extra={"default_count": len(recommended_targets)})
-        selected_targets = ask_multiselect_dialog(
-            title="Batch Seri Seçimi",
-            prompt="Batch tahminlemede yer alacak serileri seçin. Ctrl/Shift ile çoklu seçim yapabilirsiniz.",
-            items=targets,
-            default_items=recommended_targets,
-        )
+        score_map = {m: 0.50 for m in range(1, 13)}
+    return months.map(score_map).astype(float)
 
-    if not selected_targets:
-        raise ValueError("Çok serili tahminleme için en az bir seri seçilmelidir.")
 
-    progress_log("Batch Seri Seçimi", "Batch seri seçimi tamamlandı.", level="SUCCESS", extra={"policy": batch_policy, "selected_count": len(selected_targets)})
-    return {"mode": "batch", "horizon": int(horizon), "selected_targets": list(selected_targets)}
+def build_pharma_feature_frame(export_payload: Dict[str, pd.DataFrame], target_col: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    manifest = export_payload["manifest"]
+    date_col = manifest.loc[manifest["key"] == "date_column", "value"].iloc[0]
+    clean_df = export_payload["clean_model_input"].copy()
+    feat_df = export_payload["features"].copy()
+    date_series = pd.to_datetime(clean_df[date_col])
+    y = _safe_numeric_series(clean_df[target_col]) if target_col in clean_df.columns else pd.Series(np.nan, index=clean_df.index)
 
-def run_local_batch_forecasting_from_payload(
-    export_payload: Dict[str, pd.DataFrame],
-    sheet_name: str,
-    horizon: int,
-    output_dir: Optional[str] = None,
-    selected_targets: Optional[List[str]] = None,
-    use_exog_for_stat_models: bool = True,
-    use_exog_for_prophet: bool = True,
-    mode_label: str = "batch",
-    source_info: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    ensure_forecasting_runtime_dependencies(include_streamlit=False)
-    output_dir = os.path.abspath(output_dir or os.getcwd())
-    os.makedirs(output_dir, exist_ok=True)
-    mode_slug = "tek_seri" if str(mode_label).lower() in {"single", "tek", "tek_seri"} else "cok_serili_batch"
-    run_info = initialize_incremental_batch_output_root(output_dir, sheet_name, int(horizon), mode_slug)
-    run_root = run_info["run_root"]
-    batch_root = run_info["batch_root"]
-    progress_log("Batch Başlatma", "Forecasting batch çalışması başlatılıyor.", extra={"sheet": sheet_name, "horizon": int(horizon), "selected_targets": len(selected_targets) if selected_targets else 'all', "run_root": run_root})
-    try:
-        source_path = str((source_info or {}).get("source_path") or "").strip()
-        if source_path and os.path.exists(source_path):
-            _copy_optional_file_into_dir(Path(source_path), os.path.join(run_root, os.path.basename(source_path)))
-    except Exception as copy_exc:
-        progress_log("Disk Çıktısı", f"Orijinal girdi dosyası çıktı klasörüne kopyalanamadı: {copy_exc}", level="WARNING")
-    batch_result = run_batch_forecasting(
-        export_payload=export_payload,
-        horizon=int(horizon),
-        selected_sheet=sheet_name,
-        use_exog_for_stat_models=bool(use_exog_for_stat_models),
-        use_exog_for_prophet=bool(use_exog_for_prophet),
-        selected_targets=selected_targets,
-        persist_output_root=batch_root,
-        persist_after_each_series=True,
-        keep_batch_outputs_in_memory=False,
-    )
-    batch_result["run_root"] = run_root
-    batch_result["batch_root"] = batch_root
-    zip_name = f"{run_info['run_base']}.zip"
-    zip_path = os.path.join(output_dir, zip_name)
-    progress_log("ZIP Yazımı", f"Tüm seri klasörleri tamamlandı; ZIP dosyası diske yazılıyor: {zip_name}", extra={"output_dir": output_dir, "run_root": run_root})
-    create_zip_from_directory(run_root, zip_path)
-    progress_log("ZIP Yazımı", "ZIP dosyası başarıyla oluşturuldu.", level="SUCCESS", extra={"zip_path": zip_path})
+    pharma = pd.DataFrame({"ds": date_series})
+    pharma["pharma_epidemi_calendar_score"] = _epidemi_season_score(date_series, target_col)
+    pharma["pharma_respiratory_peak_flag"] = ((date_series.dt.month >= 10) | (date_series.dt.month <= 3)).astype(int)
+    pharma["pharma_allergy_peak_flag"] = date_series.dt.month.isin([4, 5, 6]).astype(int)
+    pharma["pharma_year_end_flag"] = date_series.dt.month.eq(12).astype(int)
+    pharma["pharma_quarter_start_flag"] = date_series.dt.month.isin([1, 4, 7, 10]).astype(int)
+    pharma["pharma_quarter_end_flag"] = date_series.dt.month.isin([3, 6, 9, 12]).astype(int)
+
+    prev = y.shift(1)
+    next_ = y.shift(-1)
+    drop_ratio = y / prev.replace(0, np.nan)
+    rebound_ratio = next_ / y.replace(0, np.nan)
+    rise_ratio = y / prev.replace(0, np.nan)
+    pharma["pharma_stockout_flag"] = ((drop_ratio <= 0.35) & (rebound_ratio >= 1.30)).fillna(False).astype(int)
+    pharma["pharma_promo_flag"] = ((rise_ratio >= 1.60) & (y > y.rolling(3, min_periods=1).median())).fillna(False).astype(int)
+    pharma["pharma_low_availability_proxy"] = ((y <= y.rolling(6, min_periods=3).quantile(0.15)) & (rebound_ratio >= 1.20)).fillna(False).astype(int)
+
+    if "anomaly_governance" in export_payload and len(export_payload["anomaly_governance"]) > 0:
+        ag = export_payload["anomaly_governance"].copy()
+        ag["date"] = pd.to_datetime(ag["date"])
+        ag = ag[ag["series"] == target_col]
+        stock_dates = set(ag.loc[ag["anomaly_type"].isin(["structural_event", "incomplete_last_period"]), "date"].tolist())
+        pharma["pharma_stockout_flag"] = np.where(pharma["ds"].isin(stock_dates), 1, pharma["pharma_stockout_flag"])
+
+    groups = detect_pharma_column_groups(feat_df, date_col, target_col)
+    aligned = feat_df.copy()
+    aligned[date_col] = pd.to_datetime(aligned[date_col])
+    aligned = aligned.sort_values(date_col).reset_index(drop=True)
+    pharma = pharma.sort_values("ds").reset_index(drop=True)
+
+    used_columns = []
+    for family, cols in groups.items():
+        for col in cols:
+            series = aligned[col]
+            if pd.api.types.is_numeric_dtype(series):
+                pharma[f"pharma_{family}_{col}"] = _safe_numeric_series(series).values[:len(pharma)]
+            else:
+                cat = series.astype(str).fillna("unknown")
+                if family == "channel":
+                    dummies = pd.get_dummies(cat, prefix=f"pharma_channel_{col}", dtype=int)
+                    dummies = dummies.iloc[:len(pharma)].reset_index(drop=True)
+                    pharma = pd.concat([pharma, dummies], axis=1)
+                else:
+                    pharma[f"pharma_{family}_{col}_code"] = pd.factorize(cat)[0][:len(pharma)]
+            used_columns.append(col)
+
+    if groups["otc_rx"]:
+        pharma["pharma_otc_flag"] = 0
+        pharma["pharma_rx_flag"] = 0
+        for col in groups["otc_rx"]:
+            s = aligned[col].astype(str).str.lower().fillna("")
+            pharma["pharma_otc_flag"] = np.maximum(pharma["pharma_otc_flag"], s.str.contains("otc").astype(int).values[:len(pharma)])
+            pharma["pharma_rx_flag"] = np.maximum(pharma["pharma_rx_flag"], (s.str.contains("rx|reç|recet|prescription")).astype(int).values[:len(pharma)])
+    else:
+        # no explicit OTC/Rx columns; keep neutral but present for model interface stability
+        pharma["pharma_otc_flag"] = 0
+        pharma["pharma_rx_flag"] = 0
+
+    pharma = pharma.replace([np.inf, -np.inf], np.nan)
+    for c in pharma.columns:
+        if c != "ds" and pd.api.types.is_numeric_dtype(pharma[c]):
+            pharma[c] = pd.to_numeric(pharma[c], errors="coerce").fillna(method="ffill").fillna(method="bfill").fillna(0.0)
+
+    summary = {
+        "detected_groups": {k: len(v) for k, v in groups.items()},
+        "source_columns": groups,
+        "used_feature_count": int(len([c for c in pharma.columns if c != "ds"])),
+        "stockout_flag_count": int(pharma["pharma_stockout_flag"].sum()) if "pharma_stockout_flag" in pharma.columns else 0,
+        "promo_flag_count": int(pharma["pharma_promo_flag"].sum()) if "pharma_promo_flag" in pharma.columns else 0,
+        "availability": "explicit_channel_split_found" if groups["channel"] or groups["otc_rx"] else "inferred_domain_features_only"
+    }
+    return pharma, summary
+
+
+def build_portfolio_total_payload(export_payload: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], str]:
+    payload = {k: (v.copy() if isinstance(v, pd.DataFrame) else v) for k, v in export_payload.items()}
+    manifest = payload["manifest"]
+    date_col = manifest.loc[manifest["key"] == "date_column", "value"].iloc[0]
+    target_cols = payload["series_profile_report"]["series"].tolist()
+    portfolio_col = "__PORTFOLIO_TOTAL__"
+    payload["clean_model_input"][portfolio_col] = payload["clean_model_input"][target_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+    payload["features"][portfolio_col] = payload["features"][target_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+    freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
+    prof = build_series_profile(payload["clean_model_input"][portfolio_col], freq_alias, PreprocessConfig())
+    prof["series"] = portfolio_col
+    payload["series_profile_report"] = pd.concat([payload["series_profile_report"], pd.DataFrame([prof])], ignore_index=True)
+    return payload, portfolio_col
+
+
+def perform_hierarchical_reconciliation(export_payload: Dict[str, pd.DataFrame], batch_outputs: Dict[str, Any]) -> Dict[str, Any]:
+    series_outputs = batch_outputs.get("batch_outputs", {})
+    if len(series_outputs) == 0:
+        return {"reconciled_bottom": pd.DataFrame(), "portfolio_summary": pd.DataFrame(), "portfolio_model": None}
+
+    portfolio_payload, portfolio_col = build_portfolio_total_payload(export_payload)
+    example = next(iter(series_outputs.values()))
+    horizon = int(example["metadata"]["horizon"])
+    portfolio_out = run_full_forecasting_pipeline(portfolio_payload, portfolio_col, horizon, True, True)
+    portfolio_model = portfolio_out.get("best_model", "Ensemble")
+    portfolio_forecast = np.asarray(portfolio_out["predictions"][portfolio_model], dtype=float)
+
+    rows = []
+    reconciled_tables = []
+    base_total = np.zeros_like(portfolio_forecast, dtype=float)
+    base_store = {}
+    test_dates = None
+    actual_total = None
+
+    for target, out in series_outputs.items():
+        champion = out.get("best_model", "Ensemble")
+        pred = np.asarray(out["predictions"][champion], dtype=float)
+        base_store[target] = pred.copy()
+        base_total += pred
+        if test_dates is None:
+            test_dates = out["test"]["ds"].tolist()
+            actual_total = np.asarray(out["test"]["y"].values, dtype=float) * 0.0
+        actual_total += np.asarray(out["test"]["y"].values, dtype=float)
+
+    base_total_safe = np.where(base_total <= 0, 1e-9, base_total)
+    for target, out in series_outputs.items():
+        champion = out.get("best_model", "Ensemble")
+        base_pred = base_store[target]
+        share = base_pred / base_total_safe
+        share = np.where(~np.isfinite(share), 0.0, share)
+        if share.sum() <= 0:
+            share = np.repeat(1.0 / len(series_outputs), len(portfolio_forecast))
+        reconciled = np.maximum(portfolio_forecast * share, 0.0)
+        tbl = build_actual_vs_pred_df(out["test"], reconciled, f"Reconciled::{champion}")
+        tbl["target_col"] = target
+        reconciled_tables.append(tbl)
+        metric_row = build_model_metrics("Reconciled", out["train"]["y"].values, out["test"]["y"].values, reconciled)
+        metric_row["target_col"] = target
+        metric_row["base_model"] = champion
+        rows.append(metric_row)
+
+    portfolio_summary = pd.DataFrame([build_model_metrics("PortfolioReconciled", actual_total, actual_total, portfolio_forecast)])
+    portfolio_summary["portfolio_model"] = portfolio_model
+    portfolio_summary["test_start"] = str(min(test_dates)) if test_dates else None
+    portfolio_summary["test_end"] = str(max(test_dates)) if test_dates else None
+
     return {
-        "zip_path": zip_path,
-        "run_root": run_root,
-        "batch_root": batch_root,
-        "sheet_name": sheet_name,
-        "targets": selected_targets if selected_targets else export_payload.get("series_profile_report", pd.DataFrame()).get("series", pd.Series(dtype=object)).astype(str).tolist(),
-        "batch_result": batch_result,
-        "export_payload": export_payload,
-        "source_info": source_info or {},
-        "mode": mode_slug,
+        "portfolio_output": portfolio_out,
+        "portfolio_model": portfolio_model,
+        "portfolio_forecast": portfolio_forecast,
+        "reconciled_bottom": pd.DataFrame(rows),
+        "reconciled_predictions_long": pd.concat(reconciled_tables, ignore_index=True) if reconciled_tables else pd.DataFrame(),
+        "portfolio_summary": portfolio_summary
     }
 
-def run_local_interactive_workflow() -> Dict[str, Any]:
-    if not HAS_TKINTER:
-        raise RuntimeError("Etkileşimli yerel kullanım için tkinter gereklidir. Alternatif olarak komut satırı parametrelerini kullanın.")
 
-    output_dir = os.path.abspath(os.getcwd())
-    reporter = activate_local_progress_reporter("talep_tahminleme_interactive", output_dir=output_dir, heartbeat_seconds=60)
-    source_info: Dict[str, Any] = {}
-    configure_local_runtime_stability()
-    progress_log("Yerel Hazırlık", "Yerel çalışma kararlılık ayarları uygulandı.", level="SUCCESS")
-    input_path, archive_member = choose_local_input_source_interactively()
-    progress_log("Dosya Seçimi", "Girdi kaynağı seçildi.", level="SUCCESS", extra={"input_path": input_path, "archive_member": archive_member})
-    source_info = _prepare_excel_source_from_path(input_path, archive_member=archive_member)
-    excel_path = str(source_info["excel_path"])
-    preprocess_dir = tempfile.mkdtemp(prefix="talep_tahminleme_local_preprocess_")
-    progress_log("Dosya Hazırlığı", "Excel kaynağı işlenmek üzere hazırlandı.", level="SUCCESS", extra={"excel_path": excel_path, "source_type": source_info.get('source_type')})
-    try:
-        progress_log("Sheet Seçimi", "Sheet listesi hızlı modda okunuyor; sheet seçim ekranı hazırlanıyor.", extra={"excel_path": excel_path})
-        sheet_names = get_excel_sheet_names_fast(excel_path)
-        progress_log("Sheet Seçimi", "Sheet listesi alındı; seçim ekranı açılıyor.", level="SUCCESS", extra={"sheet_count": len(sheet_names)})
-        resolved_sheet = choose_single_sheet(sheet_names, always_prompt=True)
-        progress_log("Sheet Seçimi", "Sheet seçimi tamamlandı.", level="SUCCESS", extra={"sheet": resolved_sheet, "sheet_count": len(sheet_names)})
+def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
+    manifest = export_payload["manifest"]
+    date_col = manifest.loc[manifest["key"] == "date_column", "value"].iloc[0]
+    freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
+    df_series = make_series_analysis_frame(export_payload, target_col)
+    train_df, test_df = train_test_split_series(df_series, horizon=horizon)
+    df_features = export_payload["features"].copy()
+    df_features[date_col] = pd.to_datetime(df_features[date_col])
+    df_features = df_features.sort_values(date_col).reset_index(drop=True)
 
-        preview_rows = 1200
-        progress_log("Hızlı Önizleme", "Tahminleme planı için hafif önizleme hazırlanıyor.", extra={"sheet": resolved_sheet, "preview_rows": int(preview_rows)})
-        preview_payload = build_local_sheet_preview_payload(excel_path, resolved_sheet, preview_rows=preview_rows)
-        preview_freq_alias = str(preview_payload.get("preview_freq_alias") or "M")
-        preview_rows = int(preview_payload.get("preview_row_count") or 0)
-        default_horizon = min(infer_default_horizon(preview_freq_alias), max(2, preview_rows // 5 if preview_rows else infer_default_horizon(preview_freq_alias)))
+    pharma_feat, pharma_summary = build_pharma_feature_frame(export_payload, target_col)
+    pharma_feat = pharma_feat.rename(columns={"ds": date_col})
+    df_features = df_features.merge(pharma_feat, on=date_col, how="left")
 
-        plan = choose_local_forecast_plan_interactively(preview_payload, default_horizon, preview_freq_alias)
-        progress_log("Planlama", "Tahminleme planı belirlendi.", level="SUCCESS", extra={"mode": plan.get('mode'), "horizon": plan.get('horizon'), "selected_targets": len(plan.get('selected_targets') or [])})
+    usable_dates = pd.concat([train_df[["ds"]], test_df[["ds"]]], axis=0)["ds"]
+    feature_subset = df_features[df_features[date_col].isin(usable_dates)].copy().sort_values(date_col).reset_index(drop=True)
+    train_feat = feature_subset.iloc[:len(train_df)].copy().reset_index(drop=True)
+    test_feat = feature_subset.iloc[len(train_df):len(train_df)+len(test_df)].copy().reset_index(drop=True)
 
-        progress_log("Önişleme", "Tüm kullanıcı seçimleri tamamlandı; şimdi tam önişleme başlatılıyor.", extra={"sheet": resolved_sheet, "selected_targets": len(plan.get('selected_targets') or [])})
-        export_payload = run_preprocessing_for_sheet(excel_path, resolved_sheet, preprocess_dir)
-        progress_log("Önişleme", "Önişleme tamamlandı.", level="SUCCESS")
+    profile = get_profile_row(export_payload, target_col)
+    seg = infer_advanced_segment(profile)
+    stat_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_stat_models else []
+    prophet_exog_cols = detect_optional_exog_columns(df_features, target_col, date_col) if use_exog_for_prophet else []
+    ml_feature_cols = detect_ml_feature_columns(df_features, target_col, date_col)
 
-        result = run_local_batch_forecasting_from_payload(
-            export_payload=export_payload,
-            sheet_name=resolved_sheet,
-            horizon=int(plan["horizon"]),
-            output_dir=output_dir,
-            selected_targets=plan.get("selected_targets"),
-            use_exog_for_stat_models=True,
-            use_exog_for_prophet=True,
-            mode_label=str(plan.get("mode", "batch")),
-            source_info=source_info,
-        )
+    pharma_cols = [c for c in df_features.columns if str(c).startswith("pharma_") and pd.api.types.is_numeric_dtype(df_features[c])]
+    stat_exog_cols = sorted(set(stat_exog_cols + pharma_cols))
+    prophet_exog_cols = sorted(set(prophet_exog_cols + pharma_cols))
+    ml_feature_cols = sorted(set(ml_feature_cols + pharma_cols))
+
+    stat_exog_train = train_feat[stat_exog_cols] if stat_exog_cols else None
+    stat_exog_test = test_feat[stat_exog_cols] if stat_exog_cols else None
+    prophet_exog_train = train_feat[prophet_exog_cols] if prophet_exog_cols else None
+    prophet_exog_test = test_feat[prophet_exog_cols] if prophet_exog_cols else None
+    ml_train_X = train_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=train_feat.index)
+    ml_test_X = test_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=test_feat.index)
+
+    outputs = {
+        "metadata": {
+            "target_col": target_col,
+            "freq_alias": freq_alias,
+            "horizon": horizon,
+            "profile": profile,
+            "segment": seg["label"],
+            "abc_xyz": seg["abc_xyz"],
+            "priority": recommend_model_priority(profile),
+            "candidate_models": recommend_candidate_models(profile),
+            "stat_exog_cols": stat_exog_cols,
+            "prophet_exog_cols": prophet_exog_cols,
+            "ml_feature_cols": ml_feature_cols,
+            "pharma_summary": pharma_summary,
+        },
+        "train": train_df,
+        "test": test_df,
+        "metrics": [],
+        "predictions": {},
+        "tables": {}
+    }
+
+    sarima_res = fit_best_sarimax(train_df, test_df, freq_alias, profile, stat_exog_train, stat_exog_test)
+    outputs["sarima"] = sarima_res
+    outputs["predictions"]["SARIMA/SARIMAX"] = sarima_res["forecast"]
+    outputs["metrics"].append(build_model_metrics("SARIMA/SARIMAX", train_df["y"].values, test_df["y"].values, sarima_res["forecast"]))
+    outputs["tables"]["SARIMA/SARIMAX"] = build_actual_vs_pred_df(test_df, sarima_res["forecast"], "SARIMA/SARIMAX")
+
+    if HAS_PROPHET:
+        prophet_res = fit_best_prophet(train_df, test_df, freq_alias, profile, prophet_exog_train, prophet_exog_test)
+        outputs["prophet"] = prophet_res
+        outputs["predictions"]["Prophet"] = prophet_res["forecast"]
+        outputs["metrics"].append(build_model_metrics("Prophet", train_df["y"].values, test_df["y"].values, prophet_res["forecast"]))
+        outputs["tables"]["Prophet"] = build_actual_vs_pred_df(test_df, prophet_res["forecast"], "Prophet")
+    else:
+        outputs["prophet_error"] = "prophet paketi yüklü değil. 'pip install prophet' gerekli olabilir."
+
+    xgb_res = fit_xgboost_forecast(train_df, test_df, ml_train_X, ml_test_X, freq_alias=freq_alias)
+    outputs["xgboost"] = xgb_res
+    outputs["predictions"]["XGBoost"] = xgb_res["forecast"]
+    outputs["metrics"].append(build_model_metrics("XGBoost", train_df["y"].values, test_df["y"].values, xgb_res["forecast"]))
+    outputs["tables"]["XGBoost"] = build_actual_vs_pred_df(test_df, xgb_res["forecast"], "XGBoost")
+
+    metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
+    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df)
+    outputs["predictions"]["Ensemble"] = ensemble_pred
+    outputs["metrics"].append(build_model_metrics("Ensemble", train_df["y"].values, test_df["y"].values, ensemble_pred))
+    outputs["tables"]["Ensemble"] = build_actual_vs_pred_df(test_df, ensemble_pred, "Ensemble")
+
+    metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
+    cc = build_champion_challenger(metrics_df)
+    outputs["metrics_df"] = metrics_df
+    outputs["champion_challenger"] = cc
+    outputs["best_model"] = cc["champion"]
+    outputs["ensemble_weights"] = ensemble_weights
+    outputs["all_predictions_long"] = pd.concat(list(outputs["tables"].values()), axis=0, ignore_index=True) if outputs["tables"] else pd.DataFrame()
+    return outputs
+
+
+def run_batch_forecasting(export_payload: Dict[str, pd.DataFrame], horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
+    targets = export_payload["series_profile_report"]["series"].tolist()
+    rows = []
+    champion_rows = []
+    batch_outputs = {}
+    for target in targets:
         try:
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showinfo(
-                "Talep Tahminleme Tamamlandı",
-                f"Çalışma tamamlandı.\n\nÇıktı klasörü:\n{result['run_root']}\n\nZIP çıktı yolu:\n{result['zip_path']}\n\nSeri sayısı: {len(result['targets'])}\n\nGünlük dosyası:\n{reporter.log_path}"
-            )
-        except Exception:
-            pass
-        deactivate_local_progress_reporter(success=True, final_message=f"Yerel etkileşimli çalışma tamamlandı. Klasör: {result['run_root']} | ZIP: {result['zip_path']}")
-        return result
-    except Exception as e:
-        progress_log("Yerel Çalışma", f"Yerel etkileşimli akış hata verdi: {e}", level="ERROR")
-        deactivate_local_progress_reporter(success=False, final_message=f"Yerel etkileşimli çalışma hata ile bitti: {e}")
-        raise
-    finally:
-        shutil.rmtree(preprocess_dir, ignore_errors=True)
-        temp_dir = source_info.get("temp_dir") if isinstance(source_info, dict) else None
-        if temp_dir:
-            shutil.rmtree(str(temp_dir), ignore_errors=True)
-
-def run_local_batch_forecasting_job(
-    input_path: str,
-    sheet_name: Optional[str],
-    horizon: int,
-    output_dir: Optional[str] = None,
-    selected_targets: Optional[List[str]] = None,
-    use_exog_for_stat_models: bool = True,
-    use_exog_for_prophet: bool = True,
-    archive_member: Optional[str] = None,
-) -> Dict[str, Any]:
-    output_dir = os.path.abspath(output_dir or os.getcwd())
-    activate_local_progress_reporter("talep_tahminleme_cli", output_dir=output_dir, heartbeat_seconds=60)
-    progress_log("CLI Başlatma", "Komut satırı çalışması başlatıldı.", extra={"input_path": input_path, "sheet": sheet_name, "horizon": int(horizon)})
-    configure_local_runtime_stability()
-    source_info = _prepare_excel_source_from_path(input_path, archive_member=archive_member)
-    excel_path = str(source_info["excel_path"])
-    resolved_sheet = _resolve_sheet_name_for_cli(excel_path, sheet_name)
-    progress_log("CLI Hazırlık", "Kaynak dosya ve sheet çözümlendi.", level="SUCCESS", extra={"excel_path": excel_path, "resolved_sheet": resolved_sheet})
-
-    preprocess_dir = tempfile.mkdtemp(prefix="talep_tahminleme_local_preprocess_")
+            out = run_full_forecasting_pipeline(export_payload, target, horizon, use_exog_for_stat_models, use_exog_for_prophet)
+            batch_outputs[target] = out
+            mdf = out["metrics_df"].copy()
+            best_row = mdf.iloc[0].to_dict()
+            best_row["target_col"] = target
+            best_row["segment"] = out["metadata"]["segment"]
+            best_row["abc_xyz"] = out["metadata"]["abc_xyz"]
+            best_row["pharma_feature_count"] = out["metadata"]["pharma_summary"]["used_feature_count"]
+            rows.append(best_row)
+            champion_rows.append({
+                "target_col": target,
+                "champion": out["champion_challenger"]["champion"],
+                "challenger": out["champion_challenger"]["challenger"],
+                "segment": out["metadata"]["segment"],
+                "abc_xyz": out["metadata"]["abc_xyz"],
+                "pharma_mode": out["metadata"]["pharma_summary"]["availability"]
+            })
+        except Exception as e:
+            rows.append({"target_col": target, "model": "ERROR", "MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "MASE": np.nan, "error": str(e)})
+    out = {
+        "best_summary": pd.DataFrame(rows),
+        "champion_table": pd.DataFrame(champion_rows),
+        "batch_outputs": batch_outputs
+    }
     try:
-        progress_log("Önişleme", "Önişleme başlatıldı.")
-        export_payload = run_preprocessing_for_sheet(excel_path, resolved_sheet, preprocess_dir)
-        progress_log("Önişleme", "Önişleme tamamlandı.", level="SUCCESS")
-        mode_label = "single" if selected_targets is not None and len(selected_targets) == 1 else "batch"
-        result = run_local_batch_forecasting_from_payload(
-            export_payload=export_payload,
-            sheet_name=resolved_sheet,
-            horizon=int(horizon),
-            output_dir=output_dir,
-            selected_targets=selected_targets,
-            use_exog_for_stat_models=bool(use_exog_for_stat_models),
-            use_exog_for_prophet=bool(use_exog_for_prophet),
-            mode_label=mode_label,
-            source_info=source_info,
-        )
-        deactivate_local_progress_reporter(success=True, final_message=f"CLI çalışması tamamlandı. Klasör: {result['run_root']} | ZIP: {result['zip_path']}")
-        return result
+        out["hierarchical"] = perform_hierarchical_reconciliation(export_payload, out)
     except Exception as e:
-        progress_log("CLI Çalışma", f"CLI akışı hata verdi: {e}", level="ERROR")
-        deactivate_local_progress_reporter(success=False, final_message=f"CLI çalışması hata ile bitti: {e}")
-        raise
-    finally:
-        shutil.rmtree(preprocess_dir, ignore_errors=True)
-        temp_dir = source_info.get("temp_dir") if isinstance(source_info, dict) else None
-        if temp_dir:
-            shutil.rmtree(str(temp_dir), ignore_errors=True)
-
-def build_cli_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Talep tahminleme hibrit çalıştırıcı: Streamlit veya yerel batch ZIP üretimi"
-    )
-    parser.add_argument("--input", help="Excel dosyası veya ZIP/RAR arşivi yolu")
-    parser.add_argument("--sheet", help="Sheet adı veya 1-bazlı sheet numarası")
-    parser.add_argument("--archive-member", help="ZIP/RAR içindeki Excel üyesi")
-    parser.add_argument("--horizon", type=int, default=3, help="Test ufku / tahmin ufku")
-    parser.add_argument("--targets", help="Virgülle ayrılmış seri listesi. Tümü için 'all'.", default="all")
-    parser.add_argument("--output-dir", help="ZIP çıktısının yazılacağı klasör. Varsayılan: mevcut çalışma klasörü")
-    parser.add_argument("--no-stat-exog", action="store_true", help="SARIMA/SARIMAX için exog kullanımını kapat")
-    parser.add_argument("--no-prophet-exog", action="store_true", help="Prophet için exog kullanımını kapat")
-    parser.add_argument("--streamlit", action="store_true", help="CLI yerine Streamlit arayüzünü zorla aç")
-    return parser
+        out["hierarchical_error"] = str(e)
+    return out
 
 
-def run_cli_main(argv: Optional[List[str]] = None) -> int:
+def render_streamlit_app():
+    st.set_page_config(page_title="Talep Tahminleme Studio", layout="wide")
+    st.title("Talep Tahminleme Studio")
+    st.caption("Production-grade veri önişleme + ileri seviye champion-challenger + ensemble + batch forecasting + pharma domain katmanı")
+
+    with st.sidebar:
+        st.subheader("Girdi")
+        uploaded_excel = st.file_uploader("Excel dosyası yükle", type=["xlsx", "xls"])
+        st.markdown("Bu uygulama mevcut production-grade veri önişleme mantığını korur; üstüne SARIMA/SARIMAX, Prophet, XGBoost, ensemble, ABC/XYZ, batch forecasting, stok-out/promosyon/epidemi ve reconciliation katmanı ekler.")
+
+    if uploaded_excel is None:
+        st.info("Başlamak için Excel dosyanı yükle.")
+        return
+
+    excel_path = save_uploaded_file(uploaded_excel)
+    xls = pd.ExcelFile(excel_path)
+    selected_sheet = st.sidebar.selectbox("Sheet seç", xls.sheet_names)
+    output_base_dir = os.path.join(os.path.dirname(excel_path), "streamlit_outputs")
+    os.makedirs(output_base_dir, exist_ok=True)
+
+    cache_key = f"{uploaded_excel.name}::{selected_sheet}"
+    if "preprocess_cache" not in st.session_state:
+        st.session_state["preprocess_cache"] = {}
+
+    if st.sidebar.button("Önişleme + Tahminleme için hazırla", type="primary") or cache_key not in st.session_state["preprocess_cache"]:
+        with st.spinner("Veri önişleme ve yönetişim çalışıyor..."):
+            export_payload = run_preprocessing_for_sheet(excel_path, selected_sheet, output_base_dir)
+            st.session_state["preprocess_cache"][cache_key] = export_payload
+    export_payload = st.session_state["preprocess_cache"][cache_key]
+
+    manifest = export_payload["manifest"]
+    freq_alias = manifest.loc[manifest["key"] == "frequency_inferred", "value"].iloc[0]
+    target_cols = export_payload["series_profile_report"]["series"].tolist()
+
+    top1, top2, top3, top4 = st.columns(4)
+    with top1: st.metric("Frekans", str(freq_alias))
+    with top2: st.metric("Hedef seri", len(target_cols))
+    with top3: st.metric("Regularized satır", int(len(export_payload["raw_regular"])))
+    with top4: st.metric("Anomali kaydı", int(len(export_payload["anomaly_governance"])))
+
+    mode = st.radio("Çalışma modu", ["Tek seri", "Çok serili batch forecasting"], horizontal=True)
+    default_target = target_cols[0] if target_cols else None
+    target_col = st.selectbox("Tahminlenecek seri", target_cols, index=0 if default_target else None) if mode == "Tek seri" else default_target
+
+    default_horizon = min(infer_default_horizon(freq_alias), max(2, len(export_payload["clean_model_input"]) // 5))
+    horizon = st.slider("Test ufku", min_value=2, max_value=min(24, max(2, len(export_payload["clean_model_input"]) // 3)), value=default_horizon)
+    use_exog_stat = st.checkbox("SARIMAX için açıklayıcı değişkenleri kullan", value=True)
+    use_exog_prophet = st.checkbox("Prophet için ek regressors kullan", value=True)
+
+    profile = get_profile_row(export_payload, target_col)
+    seg = infer_advanced_segment(profile)
+    priority = recommend_model_priority(profile)
+    st.subheader("Seri profili")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Segment", seg["label"])
+    c2.metric("ABC/XYZ", seg["abc_xyz"])
+    c3.metric("Önerilen öncelik", priority)
+    c4.metric("CV", round(float(profile.get("cv", np.nan)), 3) if profile else np.nan)
+    c5.metric("Trend gücü", round(float(profile.get("trend_strength", np.nan)), 3) if profile else np.nan)
+    c6.metric("Sezonsallık", round(float(profile.get("seasonality_strength", np.nan)), 3) if profile else np.nan)
+
     try:
-        ensure_forecasting_runtime_dependencies(include_streamlit=True)
+        df_series = make_series_analysis_frame(export_payload, target_col)
+        train_df_preview, _ = train_test_split_series(df_series, horizon)
+        acf_pacf_fig = build_acf_pacf_figure(train_df_preview, target_col)
+        if acf_pacf_fig is not None:
+            st.pyplot(acf_pacf_fig, clear_figure=True)
     except Exception:
         pass
 
-    parser = build_cli_arg_parser()
-    args = parser.parse_args(argv)
+    run_label = "Batch forecasting çalıştır" if mode == "Çok serili batch forecasting" else "Modelleri çalıştır ve karşılaştır"
+    if st.button(run_label, type="primary"):
+        with st.spinner("Gelişmiş tahminleme katmanı çalışıyor..."):
+            if mode == "Tek seri":
+                outputs = run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
+                st.session_state["forecast_outputs"] = outputs
+                st.session_state["forecast_target"] = target_col
+            else:
+                batch = run_batch_forecasting(export_payload, horizon, use_exog_stat, use_exog_prophet)
+                st.session_state["batch_outputs_full"] = batch
+                st.session_state["batch_mode"] = True
 
-    if _should_launch_streamlit_entrypoint(argv):
-        if st is None:
-            raise ImportError("Streamlit kurulu değil. 'streamlit run <dosya>.py' ile veya streamlit paketi kurulu halde çalıştırın.")
-        entrypoint = _resolve_streamlit_entrypoint()
-        entrypoint()
-        return 0
+    if mode == "Çok serili batch forecasting":
+        batch = st.session_state.get("batch_outputs_full")
+        if batch is None:
+            st.info("Batch sonucu görmek için butona bas.")
+            return
+        tabs = st.tabs(["Batch özeti", "Champion-Challenger", "Hierarchical Reconciliation", "İndirme"]) 
+        with tabs[0]:
+            st.subheader("Batch forecasting özeti")
+            st.dataframe(style_metric_dataframe(batch["best_summary"]), use_container_width=True)
+        with tabs[1]:
+            st.subheader("Champion - Challenger tablosu")
+            st.dataframe(batch["champion_table"], use_container_width=True)
+        with tabs[2]:
+            if "hierarchical" in batch:
+                hier = batch["hierarchical"]
+                st.write({"portfolio_model": hier.get("portfolio_model")})
+                st.dataframe(style_metric_dataframe(hier.get("portfolio_summary", pd.DataFrame())), use_container_width=True)
+                st.dataframe(style_metric_dataframe(hier.get("reconciled_bottom", pd.DataFrame())), use_container_width=True)
+            else:
+                st.warning(batch.get("hierarchical_error", "Hierarchical reconciliation üretilemedi."))
+        with tabs[3]:
+            st.download_button("Batch özetini indir (CSV)", data=dataframe_to_download_bytes(batch["best_summary"]), file_name=f"{selected_sheet}_batch_forecasting_summary.csv", mime="text/csv")
+            if "hierarchical" in batch:
+                st.download_button("Reconciled bottom-level indir (CSV)", data=dataframe_to_download_bytes(batch["hierarchical"].get("reconciled_bottom", pd.DataFrame())), file_name=f"{selected_sheet}_reconciled_bottom.csv", mime="text/csv")
+        return
 
-    if not args.input:
-        print("[INFO] Yerel etkileşimli mod başlatılıyor... Dosya seçme ekranı hazırlanıyor.")
-        result = run_local_interactive_workflow()
-        print("\n[SUCCESS] Yerel etkileşimli tahminleme tamamlandı.")
-        print(f"Sheet: {result['sheet_name']}")
-        print(f"Seri sayısı: {len(result['targets'])}")
-        print(f"ZIP çıktı yolu: {result['zip_path']}")
-        return 0
+    outputs = st.session_state.get("forecast_outputs")
+    if outputs is None or st.session_state.get("forecast_target") != target_col:
+        st.info("Model karşılaştırmasını görmek için butona bas.")
+        return
 
-    selected_targets = _parse_target_list(args.targets)
-    result = run_local_batch_forecasting_job(
-        input_path=args.input,
-        sheet_name=args.sheet,
-        horizon=args.horizon,
-        output_dir=args.output_dir,
-        selected_targets=selected_targets,
-        use_exog_for_stat_models=not args.no_stat_exog,
-        use_exog_for_prophet=not args.no_prophet_exog,
-        archive_member=args.archive_member,
-    )
+    st.subheader("Model karşılaştırma tablosu")
+    metrics_df = style_metric_dataframe(outputs["metrics_df"])
+    st.dataframe(metrics_df, use_container_width=True)
+    st.download_button("Karşılaştırma tablosunu indir (CSV)", data=dataframe_to_download_bytes(metrics_df), file_name=f"{selected_sheet}_{target_col}_model_karsilastirma.csv", mime="text/csv")
 
-    print("\n[SUCCESS] Çok serili batch forecasting tamamlandı.")
-    print(f"Sheet: {result['sheet_name']}")
-    print(f"Seri sayısı: {len(result['targets'])}")
-    print(f"ZIP çıktı yolu: {result['zip_path']}")
-    return 0
+    cc = outputs.get("champion_challenger", {})
+    if cc.get("champion"):
+        st.success(f"Champion model: {cc['champion']} | Challenger: {cc.get('challenger', '-')}")
 
+    fig = plot_forecast_results(outputs["train"], outputs["test"], outputs["predictions"], f"{target_col} - Gerçek vs Tahmin")
+    if fig is not None:
+        st.plotly_chart(fig, use_container_width=True)
 
-def main():
-    ensure_forecasting_runtime_dependencies(include_streamlit=True)
-    if st is None:
-        raise ImportError(
-            "Bu dosya Streamlit uygulamasıdır. Çalıştırmak için: streamlit run <dosya_adı>.py veya python <dosya_adı>.py --input ..."
-        )
-    entrypoint = _resolve_streamlit_entrypoint()
-    return entrypoint()
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Champion-Challenger & Ensemble", "Pharma Katmanı", "Gerçek vs Tahmin", "Önişleme Denetimleri", "Akıllı Yorumlar"])
 
+    with tab1:
+        sarima = outputs["sarima"]
+        st.write({"order": sarima["order"], "seasonal_order": sarima["seasonal_order"], "AIC": sarima["aic"], "BIC": sarima["bic"], "Ljung-Box p-value": sarima["ljung_box_pvalue"], "d": sarima["d"], "D": sarima["D"], "transform": sarima.get("transform"), "white_noise_ok": sarima.get("residual_white_noise_ok")})
+        st.dataframe(style_metric_dataframe(outputs["tables"]["SARIMA/SARIMAX"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(sarima["search_table"]), use_container_width=True)
+
+    with tab2:
+        if "prophet" in outputs:
+            st.write(outputs["prophet"]["config"])
+            st.write(outputs["prophet"].get("component_validation", {}))
+            st.dataframe(style_metric_dataframe(outputs["tables"]["Prophet"]), use_container_width=True)
+            st.dataframe(style_metric_dataframe(outputs["prophet"]["search_table"]), use_container_width=True)
+        else:
+            st.warning(outputs.get("prophet_error", "Prophet sonucu üretilemedi."))
+
+    with tab3:
+        st.write({"selected_strategy": outputs["xgboost"].get("strategy"), "shap_status": outputs["xgboost"].get("shap_status")})
+        st.dataframe(style_metric_dataframe(outputs["tables"]["XGBoost"]), use_container_width=True)
+        st.dataframe(style_metric_dataframe(outputs["xgboost"]["search_table"]), use_container_width=True)
+        if "strategy_comparison" in outputs["xgboost"]:
+            st.dataframe(style_metric_dataframe(outputs["xgboost"]["strategy_comparison"]), use_container_width=True)
+        if len(outputs["xgboost"].get("feature_importance", pd.DataFrame())):
+            st.dataframe(outputs["xgboost"]["feature_importance"], use_container_width=True)
+
+    with tab4:
+        st.dataframe(style_metric_dataframe(outputs["champion_challenger"]["ranking"]), use_container_width=True)
+        st.markdown("**Ensemble ağırlıkları**")
+        st.dataframe(style_metric_dataframe(outputs["ensemble_weights"]), use_container_width=True)
+        st.markdown("**Ensemble gerçek vs tahmin**")
+        st.dataframe(style_metric_dataframe(outputs["tables"]["Ensemble"]), use_container_width=True)
+
+    with tab5:
+        pharma = outputs["metadata"]["pharma_summary"]
+        st.write(pharma)
+        st.caption("Bu katman explicit stok/promo/kanal alanları varsa onları kullanır; yoksa seri davranışından domain-proxy feature üretir.")
+        pharma_feat, _ = build_pharma_feature_frame(export_payload, target_col)
+        st.dataframe(pharma_feat.tail(min(len(pharma_feat), 24)), use_container_width=True)
+
+    with tab6:
+        combined = outputs["all_predictions_long"].copy()
+        st.dataframe(style_metric_dataframe(combined), use_container_width=True)
+        st.download_button("Gerçek vs tahmin tablosunu indir (CSV)", data=dataframe_to_download_bytes(combined), file_name=f"{selected_sheet}_{target_col}_actual_vs_forecast.csv", mime="text/csv")
+
+    with tab7:
+        st.markdown("**Kalite raporu**")
+        st.dataframe(export_payload["quality_report"], use_container_width=True)
+        st.markdown("**Seri profil raporu**")
+        st.dataframe(export_payload["series_profile_report"], use_container_width=True)
+        st.markdown("**Anomali yönetişimi**")
+        st.dataframe(export_payload["anomaly_governance"], use_container_width=True)
+        st.markdown("**Review queue**")
+        st.dataframe(export_payload["review_queue"], use_container_width=True)
+
+    with tab8:
+        suggestions = []
+        pharma = outputs["metadata"]["pharma_summary"]
+        if float(profile.get("seasonality_strength", 0) or 0) >= 0.35:
+            suggestions.append("Seri sezonsal; auto seasonal (P,D,Q,m), Prophet custom seasonality ve ensemble kritik.")
+        if float(profile.get("cv", 0) or 0) >= 0.45:
+            suggestions.append("Oynaklık yüksek; log/Box-Cox dönüşümü, XGBoost rolling istatistikleri ve challenger modeli zorunlu izlenmeli.")
+        if float(profile.get("intermittency_ratio", 0) or 0) >= 0.25:
+            suggestions.append("Intermittent yapı var; stok-out ayrımı ve model çıktılarını iş kuralı ile doğrulamak gerekir.")
+        if pharma.get("stockout_flag_count", 0) > 0:
+            suggestions.append("Stock-out proxy tespit edildi; bu dönemlerde gerçek talep ile erişilebilir satış ayrımı operasyon ekibiyle doğrulanmalı.")
+        if pharma.get("promo_flag_count", 0) > 0:
+            suggestions.append("Promosyon benzeri sıçramalar var; promo flag exog olarak kullanıldığı için challenger modelde özellikle XGBoost/Prophet izlenmeli.")
+        if pharma.get("availability") == "inferred_domain_features_only":
+            suggestions.append("OTC/reçeteli ve kanal kırılımı explicit verilmediği için uygulama domain-proxy feature üretti; bu alanlar eklenirse doğruluk daha da artar.")
+        if outputs.get("sarima", {}).get("residual_white_noise_ok") is False:
+            suggestions.append("SARIMA residual white-noise testi zayıf; challenger olarak Prophet veya XGBoost önceliklendirilmeli.")
+        if outputs.get("best_model") == "Ensemble":
+            suggestions.append("Bu seride tek champion yerine ensemble daha iyi; operasyonel kullanımda champion-challenger izleme önerilir.")
+        if not suggestions:
+            suggestions.append("Seri dengeli; champion-challenger, pharma proxy feature’lar ve ensemble izlemesi yeterli görünüyor.")
+        for s in suggestions:
+            st.write(f"- {s}")
 
 if __name__ == "__main__":
-    try:
-        if _should_launch_streamlit_entrypoint(sys.argv[1:]):
-            main()
-        else:
-            raise SystemExit(run_cli_main(sys.argv[1:]))
-    except KeyboardInterrupt:
-        try:
-            progress_log("Kullanıcı İptali", "Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.", level="WARNING")
-            deactivate_local_progress_reporter(success=False, final_message="Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.")
-        except Exception:
-            pass
-        print("[WARNING] Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.")
-        raise SystemExit(130)
-    except SystemExit:
-        raise
-    except Exception as e:
-        if _is_running_under_streamlit() and st is not None:
-            st.error(f"Beklenmeyen uygulama hatası: {e}")
-            st.exception(e)
-        else:
-            print(f"[ERROR] {e}")
-            traceback.print_exc()
-            raise SystemExit(1)
+    if st is None:
+        raise ImportError("Bu dosya Streamlit uygulamasıdır. Çalıştırmak için: streamlit run <dosya_adı>.py")
+    render_streamlit_app()
