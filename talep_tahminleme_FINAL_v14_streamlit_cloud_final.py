@@ -5197,6 +5197,12 @@ KerasEarlyStopping = None
 KerasAdam = None
 HAS_TF = False
 
+torch = None
+TorchNN = None
+TorchOptim = None
+TorchReduceLROnPlateau = None
+HAS_TORCH = False
+
 try:
     from sklearn.ensemble import HistGradientBoostingRegressor as SKHistGradientBoostingRegressor
 except Exception:
@@ -5261,6 +5267,7 @@ def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> 
     global Prophet, HAS_PROPHET
     global XGBRegressor, HAS_XGBOOST
     global tf, Sequential, KerasLSTM, KerasGRU, KerasSimpleRNN, KerasDense, KerasDropout, KerasEarlyStopping, KerasAdam, HAS_TF
+    global torch, TorchNN, TorchOptim, TorchReduceLROnPlateau, HAS_TORCH
 
     if include_streamlit and st is None:
         try:
@@ -5364,6 +5371,33 @@ def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> 
             KerasEarlyStopping = None
             KerasAdam = None
             HAS_TF = False
+
+    if torch is None:
+        try:
+            import torch as _torch
+            import torch.nn as _TorchNN
+            import torch.optim as _TorchOptim
+            from torch.optim.lr_scheduler import ReduceLROnPlateau as _TorchReduceLROnPlateau
+            try:
+                _torch.set_num_threads(1)
+                _torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+            try:
+                _torch.manual_seed(42)
+            except Exception:
+                pass
+            torch = _torch
+            TorchNN = _TorchNN
+            TorchOptim = _TorchOptim
+            TorchReduceLROnPlateau = _TorchReduceLROnPlateau
+            HAS_TORCH = True
+        except Exception:
+            torch = None
+            TorchNN = None
+            TorchOptim = None
+            TorchReduceLROnPlateau = None
+            HAS_TORCH = False
 
 if XGBRegressor is None and SKHistGradientBoostingRegressor is not None:
     XGBRegressor = SKHistGradientBoostingRegressor
@@ -9538,12 +9572,343 @@ def build_dl_loss_curve(history_df: pd.DataFrame, title: str):
     return fig
 
 
+def _make_torch_sequence_model(input_size: int, hidden_size: int, layers: int, dropout: float, output_dim: int, model_family: str):
+    if TorchNN is None:
+        raise ImportError("PyTorch bulunamadı.")
+    family = str(model_family).upper()
+    recurrent_cls = TorchNN.LSTM if family == "LSTM" else TorchNN.GRU if family == "GRU" else TorchNN.RNN
+
+    class _TorchSequenceForecaster(TorchNN.Module):
+        def __init__(self):
+            super().__init__()
+            self.recurrent = recurrent_cls(
+                input_size=int(input_size),
+                hidden_size=int(hidden_size),
+                num_layers=max(1, int(layers)),
+                dropout=float(dropout) if int(layers) > 1 else 0.0,
+                batch_first=True,
+            )
+            self.norm = TorchNN.LayerNorm(int(hidden_size))
+            mid_dim = max(8, int(hidden_size) // 2)
+            self.head = TorchNN.Sequential(
+                TorchNN.Linear(int(hidden_size), mid_dim),
+                TorchNN.ReLU(),
+                TorchNN.Dropout(float(dropout)),
+                TorchNN.Linear(mid_dim, int(output_dim)),
+            )
+
+        def forward(self, x):
+            out, hidden = self.recurrent(x)
+            if isinstance(hidden, tuple):
+                hidden_state = hidden[0][-1]
+            else:
+                hidden_state = hidden[-1]
+            hidden_state = self.norm(hidden_state)
+            return self.head(hidden_state)
+
+    return _TorchSequenceForecaster()
+
+
+def _torch_history_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["epoch", "loss", "val_loss"])
+    df = pd.DataFrame(rows)
+    if "epoch" not in df.columns:
+        df.insert(0, "epoch", np.arange(1, len(df) + 1))
+    return df
+
+
+def _torch_train_sequence_model(X_seq: np.ndarray, y_seq: np.ndarray, cfg: Dict[str, Any], model_family: str, sample_weight: Optional[np.ndarray] = None) -> Tuple[Any, pd.DataFrame]:
+    if not HAS_TORCH or torch is None or TorchNN is None or TorchOptim is None:
+        raise ImportError("PyTorch bulunamadı.")
+    torch.manual_seed(42)
+    X_np = np.asarray(X_seq, dtype=np.float32)
+    y_np = np.asarray(y_seq, dtype=np.float32)
+    if y_np.ndim == 1:
+        y_np = y_np.reshape(-1, 1)
+    n_samples = int(len(X_np))
+    val_size = min(max(4, int(round(n_samples * 0.18))), max(1, n_samples - 4)) if n_samples >= 10 else max(1, n_samples // 5)
+    use_val = (n_samples - val_size) >= max(4, min(8, n_samples - 1)) and val_size >= 1
+    if use_val:
+        X_train_np, X_val_np = X_np[:-val_size], X_np[-val_size:]
+        y_train_np, y_val_np = y_np[:-val_size], y_np[-val_size:]
+        sw_train = np.asarray(sample_weight[:len(X_train_np)], dtype=np.float32) if sample_weight is not None and len(sample_weight) >= len(X_train_np) else np.ones((len(X_train_np),), dtype=np.float32)
+    else:
+        X_train_np, y_train_np = X_np, y_np
+        X_val_np = np.zeros((0, X_np.shape[1], X_np.shape[2]), dtype=np.float32)
+        y_val_np = np.zeros((0, y_np.shape[1]), dtype=np.float32)
+        sw_train = np.asarray(sample_weight[:len(X_train_np)], dtype=np.float32) if sample_weight is not None and len(sample_weight) >= len(X_train_np) else np.ones((len(X_train_np),), dtype=np.float32)
+
+    model = _make_torch_sequence_model(
+        input_size=int(X_np.shape[2]),
+        hidden_size=int(cfg["units"]),
+        layers=int(cfg["layers"]),
+        dropout=float(cfg["dropout"]),
+        output_dim=int(y_np.shape[1]),
+        model_family=model_family,
+    )
+    optimizer = TorchOptim.AdamW(model.parameters(), lr=float(cfg.get("learning_rate", 0.001)), weight_decay=1e-4)
+    scheduler = TorchReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=max(4, int(FORECAST_RUNTIME_CONFIG.dl_patience) // 5), min_lr=1e-5) if TorchReduceLROnPlateau is not None else None
+    loss_fn = TorchNN.SmoothL1Loss(reduction="none")
+
+    X_train = torch.tensor(X_train_np, dtype=torch.float32)
+    y_train = torch.tensor(y_train_np, dtype=torch.float32)
+    sw_train_t = torch.tensor(sw_train.reshape(-1, 1), dtype=torch.float32)
+    X_val = torch.tensor(X_val_np, dtype=torch.float32) if len(X_val_np) else None
+    y_val = torch.tensor(y_val_np, dtype=torch.float32) if len(y_val_np) else None
+
+    best_state = None
+    best_val = np.inf
+    patience_left = int(max(8, FORECAST_RUNTIME_CONFIG.dl_patience))
+    history_rows: List[Dict[str, Any]] = []
+    batch_size = int(min(max(4, FORECAST_RUNTIME_CONFIG.dl_batch_size), max(4, len(X_train_np))))
+
+    for epoch in range(1, int(FORECAST_RUNTIME_CONFIG.dl_max_epochs) + 1):
+        model.train()
+        permutation = torch.randperm(X_train.shape[0])
+        batch_losses = []
+        for start in range(0, X_train.shape[0], batch_size):
+            idx = permutation[start:start + batch_size]
+            xb = X_train[idx]
+            yb = y_train[idx]
+            wb = sw_train_t[idx]
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss_raw = loss_fn(pred, yb)
+            loss = (loss_raw.mean(dim=1, keepdim=True) * wb).sum() / wb.sum().clamp_min(1.0)
+            loss.backward()
+            try:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            except Exception:
+                pass
+            optimizer.step()
+            batch_losses.append(float(loss.detach().cpu().item()))
+        train_loss = float(np.mean(batch_losses)) if batch_losses else np.nan
+
+        model.eval()
+        with torch.no_grad():
+            if X_val is not None and y_val is not None and len(X_val_np):
+                val_pred = model(X_val)
+                val_loss = float(loss_fn(val_pred, y_val).mean().detach().cpu().item())
+            else:
+                val_loss = train_loss
+        if scheduler is not None and np.isfinite(val_loss):
+            scheduler.step(val_loss)
+        history_rows.append({"epoch": epoch, "loss": train_loss, "val_loss": val_loss})
+        if np.isfinite(val_loss) and (val_loss + 1e-6) < best_val:
+            best_val = float(val_loss)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            patience_left = int(max(8, FORECAST_RUNTIME_CONFIG.dl_patience))
+        else:
+            patience_left -= 1
+            if patience_left <= 0:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, _torch_history_to_df(history_rows)
+
+
+def _torch_model_predict(model: Any, X: np.ndarray) -> np.ndarray:
+    model.eval()
+    with torch.no_grad():
+        X_t = torch.tensor(np.asarray(X, dtype=np.float32), dtype=torch.float32)
+        pred = model(X_t).detach().cpu().numpy()
+    return np.asarray(pred, dtype=float)
+
+
+def _torch_recursive_forecast(model: Any, history_y_scaled: np.ndarray, history_cov_scaled: np.ndarray, future_cov_scaled: np.ndarray, window: int) -> np.ndarray:
+    hist_y = list(np.asarray(history_y_scaled, dtype=float).reshape(-1))
+    if np.asarray(history_cov_scaled).size:
+        hist_cov = [np.asarray(r, dtype=float) for r in np.asarray(history_cov_scaled, dtype=float)]
+    else:
+        hist_cov = [np.zeros((0,), dtype=float) for _ in hist_y]
+    future_cov_scaled = np.asarray(future_cov_scaled, dtype=float) if future_cov_scaled is not None else np.zeros((0, 0), dtype=float)
+    preds: List[float] = []
+    for i in range(len(future_cov_scaled)):
+        yw = np.asarray(hist_y[-int(window):], dtype=float).reshape(int(window), 1)
+        xw = np.asarray(hist_cov[-int(window):], dtype=float) if hist_cov else np.zeros((int(window), 0), dtype=float)
+        X = np.concatenate([yw, xw], axis=1)[None, :, :]
+        pred_scaled = float(_torch_model_predict(model, X).reshape(-1)[0])
+        preds.append(pred_scaled)
+        hist_y.append(pred_scaled)
+        hist_cov.append(np.asarray(future_cov_scaled[i], dtype=float))
+    return np.asarray(preds, dtype=float)
+
+
+def _torch_direct_forecast(model: Any, history_y_scaled: np.ndarray, history_cov_scaled: np.ndarray, window: int, horizon: int) -> np.ndarray:
+    hist_y = np.asarray(history_y_scaled, dtype=float).reshape(-1)
+    hist_cov = np.asarray(history_cov_scaled, dtype=float) if history_cov_scaled is not None else np.zeros((len(hist_y), 0), dtype=float)
+    yw = hist_y[-int(window):].reshape(int(window), 1)
+    xw = hist_cov[-int(window):] if hist_cov.size else np.zeros((int(window), 0), dtype=float)
+    X = np.concatenate([yw, xw], axis=1)[None, :, :]
+    pred = _torch_model_predict(model, X).reshape(-1)
+    if len(pred) < int(horizon):
+        pad = np.repeat(pred[-1] if len(pred) else 0.0, int(horizon) - len(pred))
+        pred = np.concatenate([pred, pad])
+    return np.asarray(pred[:int(horizon)], dtype=float)
+
+
+def _fit_torch_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
+    if not HAS_TORCH:
+        return _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason="PyTorch bulunamadı")
+    if len(train_df) < 24:
+        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz.")
+
+    model_family = str(model_family).upper()
+    cache_key = build_search_signature(
+        f"dl_torch_{model_family.lower()}",
+        freq_alias,
+        train_df,
+        test_df,
+        exog_train=pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_train, pd.DataFrame) else None,
+        extra={"app_version": APP_VERSION, "dl_rev": "torch_lstm_gru_v1"},
+    )
+    cached = SEARCH_ACCELERATOR.get_result(cache_key)
+    if cached is not None:
+        cached["search_accelerator_cache_hit"] = True
+        return cached
+
+    selected_cols = _select_dl_feature_columns(feature_train, feature_test, train_df["y"], FORECAST_RUNTIME_CONFIG.dl_sequence_max_exog_cols)
+    cov_train_df = feature_train[selected_cols].copy() if selected_cols and isinstance(feature_train, pd.DataFrame) else pd.DataFrame(index=train_df.index)
+    cov_test_df = feature_test[selected_cols].copy() if selected_cols and isinstance(feature_test, pd.DataFrame) else pd.DataFrame(index=test_df.index)
+    cov_train_df = cov_train_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    cov_test_df = cov_test_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    tr_inner, val_inner = make_inner_train_val_split(train_df, val_ratio=FORECAST_RUNTIME_CONFIG.dl_validation_ratio, min_val=max(3, len(test_df)))
+    split_ix = len(tr_inner)
+    cov_tr_inner = cov_train_df.iloc[:split_ix].reset_index(drop=True)
+    cov_val_inner = cov_train_df.iloc[split_ix:].reset_index(drop=True)
+    season_length = infer_season_length_from_freq(freq_alias)
+
+    search_rows = []
+    best = None
+    best_score = np.inf
+    configs = []
+    strategies = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_strategies", ("recursive",)))
+    learning_rates = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_learning_rates", (0.001,)))
+    for window in infer_dl_window_candidates(freq_alias, len(tr_inner)):
+        for units in FORECAST_RUNTIME_CONFIG.dl_hidden_units:
+            for dropout in FORECAST_RUNTIME_CONFIG.dl_dropout_values:
+                for learning_rate in learning_rates:
+                    for strategy in strategies:
+                        if str(strategy).lower() == "direct" and len(val_inner) < 2:
+                            continue
+                        layers = 2 if int(units) >= 32 and int(window) >= 6 else 1
+                        configs.append({
+                            "window": int(window),
+                            "units": int(units),
+                            "dropout": float(dropout),
+                            "layers": int(layers),
+                            "learning_rate": float(learning_rate),
+                            "strategy": str(strategy).lower(),
+                        })
+    configs = _select_diverse_dl_configs(configs, max(1, int(FORECAST_RUNTIME_CONFIG.dl_max_configs_per_family)))
+
+    for cfg in configs:
+        try:
+            y_transform = choose_target_transform(tr_inner["y"])
+            tr_y_t = apply_target_transform(tr_inner["y"], y_transform)[0].values.astype(float)
+            y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(tr_y_t, cov_tr_inner.values.astype(float) if len(cov_tr_inner) else np.zeros((len(tr_inner), 0), dtype=float))
+            strategy = str(cfg.get("strategy", "recursive")).lower()
+            if strategy == "direct":
+                X_seq, y_seq = _make_dl_sequences_direct(tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
+            else:
+                X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
+            if len(X_seq) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
+                raise ValueError("Yeterli sliding-window eğitim örneği üretilemedi.")
+            sample_weight = _make_recent_sample_weights(len(y_seq), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
+            model, hist_df = _torch_train_sequence_model(X_seq, y_seq, cfg, model_family=model_family, sample_weight=sample_weight)
+            if strategy == "direct":
+                pred_val_scaled = _torch_direct_forecast(model, tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
+            else:
+                val_cov_scaled = _transform_dl_covariates(x_scaler, cov_val_inner) if len(cov_val_inner) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim == 2 else 0), dtype=float)
+                pred_val_scaled = _torch_recursive_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
+            pred_val_t = y_scaler.inverse_transform(pred_val_scaled.reshape(-1, 1)).reshape(-1)
+            pred_val = inverse_target_transform(pred_val_t, y_transform)
+            pred_val = np.maximum(np.asarray(pred_val, dtype=float), 0.0)
+            corrected, post_cfg = compute_validation_postprocess_candidates(val_inner["y"].values, pred_val, tr_inner["y"], season_length)
+            val_w = wape(val_inner["y"].values, corrected)
+            val_s = smape(val_inner["y"].values, corrected)
+            asym = compute_asymmetric_validation_penalty(val_inner["y"].values, corrected, tr_inner["y"].values, severity=1.0)
+            min_loss = safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
+            min_val_loss = safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
+            overfit_gap = safe_float((min_val_loss - min_loss) / max(abs(min_loss), 1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
+            direction_pen = 0.0 if abs(float(asym.get("bias_pct", 0.0) or 0.0)) <= 10 else 0.12
+            strategy_bonus = -0.08 if strategy == "recursive" and len(val_inner) > 1 else 0.0
+            score = float(val_w + 0.28 * val_s + 0.85 * asym["penalty"] + 2.2 * max(overfit_gap, 0.0) + direction_pen + strategy_bonus)
+            search_rows.append({**cfg, "model": model_family, "backend": "PyTorch", "transform": y_transform.get("name", "none"), "val_wape": val_w, "val_smape": val_s, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "min_train_loss": min_loss, "min_val_loss": min_val_loss, "overfit_gap_ratio": overfit_gap, "epochs_ran": int(len(hist_df)), "selected_exog_cols": ", ".join(selected_cols), "composite_score": score})
+            if score < best_score:
+                best_score = score
+                best = {"cfg": dict(cfg), "transform_cfg": dict(y_transform), "postprocess_cfg": dict(post_cfg), "validation_wape": safe_float(val_w), "validation_smape": safe_float(val_s), "selected_cols": list(selected_cols), "history_df": hist_df.copy()}
+        except Exception as e:
+            search_rows.append({**cfg, "model": model_family, "backend": "PyTorch", "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
+
+    if best is None:
+        result = _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason=f"{model_family} PyTorch modeli kurulamadı")
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+
+    full_y_t = apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
+    y_scaler, x_scaler, full_y_scaled, full_cov_scaled = _fit_dl_scalers(full_y_t, cov_train_df[best["selected_cols"]].values.astype(float) if best["selected_cols"] else np.zeros((len(train_df), 0), dtype=float))
+    strategy = str(best["cfg"].get("strategy", "recursive")).lower()
+    if strategy == "direct":
+        X_full, y_full = _make_dl_sequences_direct(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]), int(len(test_df)))
+    else:
+        X_full, y_full = _make_dl_sequences(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]))
+    if len(X_full) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
+        result = _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason=f"{model_family} için final training sequence sayısı yetersiz.")
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+    sample_weight_full = _make_recent_sample_weights(len(y_full), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
+    final_model, hist_df = _torch_train_sequence_model(X_full, y_full, best["cfg"], model_family=model_family, sample_weight=sample_weight_full)
+    if strategy == "direct":
+        pred_scaled = _torch_direct_forecast(final_model, full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]), int(len(test_df)))
+    else:
+        future_cov_scaled = _transform_dl_covariates(x_scaler, cov_test_df[best["selected_cols"]]) if best["selected_cols"] else np.zeros((len(test_df), 0), dtype=float)
+        pred_scaled = _torch_recursive_forecast(final_model, full_y_scaled, full_cov_scaled, future_cov_scaled, int(best["cfg"]["window"]))
+    pred_t = y_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).reshape(-1)
+    pred = inverse_target_transform(pred_t, best["transform_cfg"])
+    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    pred = apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
+    overfit_summary = {
+        "epochs_ran": int(len(hist_df)),
+        "min_train_loss": safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan,
+        "min_val_loss": safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan,
+        "final_train_loss": safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").iloc[-1]) if len(hist_df) else np.nan,
+        "final_val_loss": safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").iloc[-1]) if len(hist_df) and "val_loss" in hist_df.columns else np.nan,
+    }
+    overfit_summary["overfit_gap_ratio"] = safe_float((overfit_summary.get("min_val_loss", np.nan) - overfit_summary.get("min_train_loss", np.nan)) / max(abs(overfit_summary.get("min_train_loss", np.nan)), 1e-8)) if pd.notna(overfit_summary.get("min_val_loss", np.nan)) and pd.notna(overfit_summary.get("min_train_loss", np.nan)) else np.nan
+    result = {
+        "forecast": pred,
+        "search_table": pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
+        "history_df": hist_df,
+        "overfit_summary": overfit_summary,
+        "selected_config": dict(best["cfg"]),
+        "transform": best["transform_cfg"].get("name", "none"),
+        "used_exog_cols": list(best["selected_cols"]),
+        "validation_wape": safe_float(best.get("validation_wape", np.nan)),
+        "validation_smape": safe_float(best.get("validation_smape", np.nan)),
+        "fallback_used": False,
+        "fallback_method": None,
+        "fit_mode": f"deep_learning_{model_family.lower()}_torch",
+        "search_accelerator_cache_hit": False,
+        "surrogate_used": False,
+    }
+    SEARCH_ACCELERATOR.put_result(cache_key, result)
+    return result
+
+
 def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
     ensure_forecasting_runtime_dependencies(include_streamlit=False)
     if not FORECAST_RUNTIME_CONFIG.dl_enabled:
         return build_model_level_fallback(model_family, train_df, test_df, freq_alias, "DL katmanı runtime yapılandırmasında kapalı.")
+    if not HAS_TF and HAS_TORCH:
+        return _fit_torch_deep_learning_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family)
     if not HAS_TF:
-        return _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason="TensorFlow/Keras bulunamadı")
+        return _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason="TensorFlow/Keras ve PyTorch bulunamadı")
     if len(train_df) < 24:
         return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz.")
 
@@ -10882,6 +11247,12 @@ def build_dl_model_analysis(outputs: Dict[str, Any], profile: Dict[str, Any]) ->
         overfit_gap=safe_float(((outputs.get(model_name.lower()) or {}).get("overfit_summary") or {}).get("overfit_gap_ratio", np.nan))
         if pd.notna(hold_wape) and pd.notna(best_hold):
             notes.append("Holdout performansı lider modellere çok yakın veya daha iyi." if hold_wape <= best_hold + 0.5 else "Holdout performansı klasik/ML lider modellere göre daha zayıf.")
+        dl_pack = (outputs.get(model_name.lower()) or {})
+        fit_mode = str(dl_pack.get("fit_mode", ""))
+        if fit_mode.endswith("_torch"):
+            notes.append("Model gerçek PyTorch tabanlı derin öğrenme eğitimi ile çalıştırıldı.")
+        elif bool(dl_pack.get("fallback_used", False)):
+            notes.append("Model gerçek DL eğitimi yerine fallback/surrogate yol ile tamamlandı; bu nedenle sonuç sınırlı yorumlanmalıdır.")
         if pd.notna(val_wape) and pd.notna(hold_wape):
             notes.append("İç doğrulama ile holdout arasında ciddi ayrışma yok; genelleme kabul edilebilir." if val_wape <= hold_wape + 1.0 else "Validation-holdout farkı yüksek; yapı daha kırılgan olabilir.")
         if pd.notna(overfit_gap):
