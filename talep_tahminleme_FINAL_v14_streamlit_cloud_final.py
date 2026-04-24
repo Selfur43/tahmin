@@ -236,7 +236,7 @@ def progress_log(stage: str, message: str, level: str = "INFO", target: Optional
 PIPELINE_NAME = "demand_forecast_preprocessing"
 PIPELINE_VERSION = "2.0.0"
 OUTPUT_SCHEMA_VERSION = "2.0.0"
-CODE_VERSION = "production_governance_rewrite_2_0_0"
+CODE_VERSION = "production_governance_rewrite_2_0_0_dl_identity_registry_hard_gate"
 
 
 # =========================================================
@@ -5420,7 +5420,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.5.8_dl_residual_rolling_status_gate"
+APP_VERSION = "3.5.9_dl_identity_registry_hard_gate"
 
 
 
@@ -6659,7 +6659,13 @@ def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str,
         "Model hata özeti": style_metric_dataframe(error_df),
         "Fallback özeti": style_metric_dataframe(_df_or_empty(outputs.get("fallback_summary"))),
         "DL şeffaflık ve kimlik doğrulama tablosu": style_metric_dataframe(_df_or_empty(outputs.get("dl_transparency_table"))),
+        "Merkezî model kimlik registry": style_metric_dataframe(_df_or_empty(prod_pack.get("model_identity_registry", outputs.get("model_identity_registry")))),
         "Otomatik model uygunluk kapısı": style_metric_dataframe(_df_or_empty(prod_pack.get("model_eligibility_gate"))),
+        "Üretim adayları - sadece production eligible": style_metric_dataframe(_df_or_empty(prod_pack.get("production_candidates"))),
+        "Research ve challenger modelleri": style_metric_dataframe(_df_or_empty(prod_pack.get("research_models"))),
+        "Audit fallback ve surrogate modelleri": style_metric_dataframe(_df_or_empty(prod_pack.get("audit_models"))),
+        "Model kimliği kalite assert sonuçları": style_metric_dataframe(_df_or_empty(prod_pack.get("model_identity_quality_assertions"))),
+        "Deployment safety manifest - üretime çıkış kapısı": style_metric_dataframe(_df_or_empty(prod_pack.get("deployment_safety_manifest"))),
         "Karar kademelerine göre model liderleri": style_metric_dataframe(_df_or_empty(build_model_liderleri(outputs))),
         "SARIMA-SARIMAX - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("SARIMA/SARIMAX"))),
         "SARIMA-SARIMAX - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("sarima") or {}).get("search_table"))),
@@ -6677,6 +6683,7 @@ def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str,
         "GRU - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("GRU (real)", outputs.get("tables", {}).get("GRU")))),
         "GRU - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("gru") or {}).get("search_table"))),
         "GRU - Epoch Loss Geçmişi": style_metric_dataframe(_df_or_empty((outputs.get("gru") or {}).get("history_df"))),
+        "GRU - Eğitim Durumu Tablosu": style_metric_dataframe(_df_or_empty((outputs.get("gru") or {}).get("dl_training_status_table"))),
         "Karar hiyerarşisi özeti": style_metric_dataframe(_df_or_empty(outputs.get("karar_hiyerarsisi"))),
         "Holdout sıralaması": style_metric_dataframe(_df_or_empty((outputs.get("champion_challenger") or {}).get("ranking"))),
         "Ansambl ağırlıkları (peak-aware + bias-aware)": style_metric_dataframe(_df_or_empty(outputs.get("ensemble_weights"))),
@@ -15474,6 +15481,1049 @@ def run_local_batch_forecasting_job(
         temp_dir = source_info.get("temp_dir") if isinstance(source_info, dict) else None
         if temp_dir:
             shutil.rmtree(str(temp_dir), ignore_errors=True)
+
+
+# =========================================================
+# CENTRAL MODEL IDENTITY REGISTRY / HARD PRODUCTION GATE PATCH
+# =========================================================
+# This section intentionally overrides the earlier production-governance helpers.
+# Goal: every report table uses the same identity contract and the same hard gate:
+# real models can be production candidates; surrogate/fallback/research outputs cannot
+# masquerade as champion, production, ensemble, or normal ranking candidates.
+
+MODEL_IDENTITY_REGISTRY_VERSION = "dl_identity_registry_hard_gate_1_0_0"
+
+# Preserve legacy scorers so the patch can reuse the existing production-risk logic,
+# then apply hard identity gates on top of it.
+_LEGACY_build_model_eligibility_gate = build_model_eligibility_gate
+_LEGACY_build_production_governance_pack = build_production_governance_pack
+_LEGACY_derive_production_ranking = _derive_production_ranking
+_LEGACY_ensure_production_reporting_tables = ensure_production_reporting_tables
+
+
+def _identity_bool(value: Any, default: bool = False) -> bool:
+    if pd.isna(value) if not isinstance(value, (list, tuple, dict, pd.Series, pd.DataFrame, np.ndarray)) else False:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "evet", "y", "t"}
+    try:
+        return bool(value)
+    except Exception:
+        return default
+
+
+def _identity_metric_row(outputs: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+    metrics_df = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) and "model" in metrics_df.columns:
+        hit = metrics_df.loc[metrics_df["model"].astype(str) == str(model_name)].head(1)
+        if len(hit):
+            return hit.iloc[0].to_dict()
+    return {}
+
+
+def _identity_validation_row(outputs: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+    val_df = outputs.get("validation_metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if isinstance(val_df, pd.DataFrame) and len(val_df) and "model" in val_df.columns:
+        hit = val_df.loc[val_df["model"].astype(str) == str(model_name)].head(1)
+        if len(hit):
+            return hit.iloc[0].to_dict()
+    return {}
+
+
+def _identity_rolling_row(outputs: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+    try:
+        ro = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    except Exception:
+        ro = pd.DataFrame()
+    if isinstance(ro, pd.DataFrame) and len(ro) and "model" in ro.columns:
+        hit = ro.loc[ro["model"].astype(str) == str(model_name)].head(1)
+        if len(hit):
+            return hit.iloc[0].to_dict()
+    return {}
+
+
+def _identity_model_family_and_class(model_name: str) -> Tuple[str, str]:
+    name = str(model_name)
+    fam = normalize_dl_family_label(name)
+    if name == "Ensemble":
+        return "Ensemble", "ensemble"
+    if fam == "DL-FALLBACK":
+        return "DL", "fallback"
+    if fam in {"LSTM", "GRU"} and "SURROGATE" in name.upper():
+        return fam, "surrogate"
+    if fam in {"LSTM", "GRU"}:
+        return fam, "real"
+    return name, "real"
+
+
+def _identity_dl_pack(outputs: Dict[str, Any], family: str) -> Dict[str, Any]:
+    key = normalize_dl_family_label(family).lower()
+    pack = outputs.get(key, {}) if isinstance(outputs, dict) else {}
+    return pack if isinstance(pack, dict) else {}
+
+
+def _identity_public_model_list(outputs: Dict[str, Any]) -> List[str]:
+    defaults = ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "LSTM (real)", "GRU (real)", "LSTM-surrogate", "GRU-surrogate", "DL-fallback", "Intermittent", "Ensemble"]
+    names: List[str] = []
+    for source in [
+        (outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()),
+        (outputs.get("validation_metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()),
+        (outputs.get("fallback_summary", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()),
+    ]:
+        if isinstance(source, pd.DataFrame) and len(source) and "model" in source.columns:
+            names.extend(source["model"].dropna().astype(str).tolist())
+    pred_map = outputs.get("predictions", {}) if isinstance(outputs, dict) else {}
+    if isinstance(pred_map, dict):
+        names.extend([str(k) for k in pred_map.keys()])
+    ordered: List[str] = []
+    for n in defaults + names:
+        if n not in ordered:
+            ordered.append(n)
+    return ordered
+
+
+def ensure_dl_training_status_tables(outputs: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    horizon = int((outputs.get("metadata") or {}).get("horizon", len(outputs.get("test", pd.DataFrame())) if isinstance(outputs.get("test"), pd.DataFrame) else 0) or 0)
+    for fam, key in [("LSTM", "lstm"), ("GRU", "gru")]:
+        pack = outputs.get(key, {})
+        if not isinstance(pack, dict):
+            pack = {}
+        tbl = pack.get("dl_training_status_table")
+        if not isinstance(tbl, pd.DataFrame) or len(tbl) == 0:
+            try:
+                pack["dl_training_status_table"] = _dl_training_status_summary(pack, fam, horizon)
+            except Exception:
+                pack["dl_training_status_table"] = pd.DataFrame([{
+                    "model": dl_public_real_name(fam),
+                    "trained_with_tensorflow": False,
+                    "surrogate_used": bool(pack.get("surrogate_used", False)),
+                    "fallback_used": bool(pack.get("fallback_used", False) or pack.get("operational_fallback_forecast") is not None),
+                    "epochs_ran": 0,
+                    "min_train_loss": np.nan,
+                    "min_val_loss": np.nan,
+                    "overfit_gap": np.nan,
+                    "n_sequences": np.nan,
+                    "selected_window": None,
+                    "selected_strategy": None,
+                    "eligible_for_model_ranking": False,
+                    "champion_eligible": False,
+                    "ranking_exclusion_reason": pack.get("strict_dl_rejection_reason") or "DL eğitim durum tablosu güvenli fallback ile oluşturuldu.",
+                }])
+        outputs[key] = pack
+    return outputs
+
+
+def build_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
+    outputs = outputs if isinstance(outputs, dict) else {}
+    meta = outputs.get("metadata", {}) or {}
+    freq_alias = str(meta.get("freq_alias", "")).upper()
+    train_n = int(meta.get("train_n", 0) or 0)
+    rows: List[Dict[str, Any]] = []
+    for model_name in _identity_public_model_list(outputs):
+        family, identity_class = _identity_model_family_and_class(model_name)
+        metric_row = _identity_metric_row(outputs, model_name)
+        val_row = _identity_validation_row(outputs, model_name)
+        ro_row = _identity_rolling_row(outputs, model_name)
+        dl_pack = _identity_dl_pack(outputs, family) if family in {"LSTM", "GRU"} else {}
+        is_dl_real_family = family in {"LSTM", "GRU"}
+        metric_wape = safe_float(metric_row.get("WAPE", np.nan))
+        metric_finite = bool(pd.notna(metric_wape) and np.isfinite(metric_wape))
+        original_metric_eligible = _identity_bool(metric_row.get("eligible_for_model_ranking", True), True)
+        real_dl_trained = bool(is_dl_real_family and dl_pack.get("real_dl_trained", False) and dl_pack.get("dl_strict_validation_passed", False) and str(dl_pack.get("dl_backend", "")).lower() == "tensorflow" and not bool(dl_pack.get("surrogate_used", False)) and not bool(dl_pack.get("fallback_used", False)))
+        trained_with_tensorflow = bool(is_dl_real_family and str(dl_pack.get("dl_backend", "")).lower() == "tensorflow" and bool(dl_pack.get("real_dl_trained", False)))
+        fallback_forecast_generated = False
+        fallback_method = None
+        if is_dl_real_family:
+            fallback_forecast_generated = bool(dl_pack.get("fallback_used", False) or dl_pack.get("operational_fallback_forecast") is not None)
+            fallback_method = dl_pack.get("fallback_method")
+        elif identity_class == "fallback":
+            # DL-fallback represents a separate operational fallback channel derived from LSTM/GRU packs.
+            lstm_pack = _identity_dl_pack(outputs, "LSTM")
+            gru_pack = _identity_dl_pack(outputs, "GRU")
+            fallback_forecast_generated = bool(lstm_pack.get("fallback_used", False) or lstm_pack.get("operational_fallback_forecast") is not None or gru_pack.get("fallback_used", False) or gru_pack.get("operational_fallback_forecast") is not None or model_name in (outputs.get("predictions", {}) or {}))
+            methods = [str(p.get("fallback_method")) for p in [lstm_pack, gru_pack] if p.get("fallback_method")]
+            fallback_method = " | ".join(sorted(set(methods))) if methods else "dl_operational_fallback"
+        else:
+            std_key = str(model_name).lower().replace("/", "_").replace("-", "_").replace(" ", "_")
+            std_pack = outputs.get(std_key, {}) if isinstance(outputs.get(std_key, {}), dict) else {}
+            fallback_forecast_generated = bool(std_pack.get("fallback_used", False))
+            fallback_method = std_pack.get("fallback_method")
+
+        surrogate_used = bool((is_dl_real_family and dl_pack.get("surrogate_used", False)) or identity_class == "surrogate")
+        fallback_used_as_real_model_output = bool(fallback_forecast_generated and identity_class == "real" and not is_dl_real_family)
+        fallback_reported_as_separate_model = bool(identity_class == "fallback" or (is_dl_real_family and fallback_forecast_generated))
+        hard_reasons: List[str] = []
+        production_scope = "production"
+        ranking_eligible = bool(original_metric_eligible and metric_finite)
+        champion_eligible = bool(ranking_eligible)
+        research_only = False
+        audit_only = False
+        if identity_class in {"surrogate", "fallback"}:
+            ranking_eligible = False
+            champion_eligible = False
+            audit_only = True
+            production_scope = "audit_only"
+            hard_reasons.append("Surrogate/fallback modeli üretim lideri, champion veya normal sıralama adayı olamaz.")
+        elif is_dl_real_family:
+            if not real_dl_trained:
+                ranking_eligible = False
+                champion_eligible = False
+                audit_only = True
+                production_scope = "audit_only"
+                hard_reasons.append("Gerçek TensorFlow/Keras recurrent DL eğitimi doğrulanmadı.")
+            elif freq_alias == "M" and train_n < 72:
+                ranking_eligible = False
+                champion_eligible = False
+                audit_only = True
+                production_scope = "audit_only"
+                hard_reasons.append("Aylık train_n < 72; gerçek LSTM/GRU public sıralama dışıdır.")
+            elif freq_alias == "M" and train_n < 96:
+                ranking_eligible = False
+                champion_eligible = False
+                research_only = True
+                production_scope = "research_only"
+                hard_reasons.append("Aylık train_n < 96; LSTM/GRU yalnız challenger/research modunda raporlanır.")
+            folds = int(dl_pack.get("rolling_validation_folds", 0) or 0)
+            if production_scope == "production" and folds < int(getattr(FORECAST_RUNTIME_CONFIG, "dl_rolling_validation_min_folds", 2)):
+                ranking_eligible = False
+                champion_eligible = False
+                research_only = True
+                production_scope = "research_only"
+                hard_reasons.append("DL rolling-origin fold sayısı üretim kapısı için yetersiz.")
+        else:
+            if not metric_finite and model_name not in {"LSTM (real)", "GRU (real)", "LSTM-surrogate", "GRU-surrogate", "DL-fallback"}:
+                ranking_eligible = False
+                champion_eligible = False
+                hard_reasons.append("Holdout metriği yok veya sonlu değil.")
+        rows.append({
+            "model": model_name,
+            "display_model_name": model_name,
+            "model_family": family,
+            "model_identity_class": identity_class,
+            "identity_registry_version": MODEL_IDENTITY_REGISTRY_VERSION,
+            "trained_real_model": bool(real_dl_trained if is_dl_real_family else identity_class in {"real", "ensemble"}),
+            "trained_with_tensorflow": bool(trained_with_tensorflow),
+            "real_dl_trained": bool(real_dl_trained),
+            "surrogate_used": bool(surrogate_used),
+            "fallback_forecast_generated": bool(fallback_forecast_generated),
+            "fallback_used_as_real_model_output": bool(fallback_used_as_real_model_output),
+            "fallback_reported_as_separate_model": bool(fallback_reported_as_separate_model),
+            "fallback_method": fallback_method,
+            "fallback_owner_family": family if is_dl_real_family else ("DL" if identity_class == "fallback" else None),
+            "ranking_eligible": bool(ranking_eligible),
+            "eligible_for_model_ranking": bool(ranking_eligible),
+            "champion_eligible": bool(champion_eligible),
+            "production_eligible": bool(ranking_eligible and champion_eligible and production_scope == "production"),
+            "research_only": bool(research_only),
+            "audit_only": bool(audit_only),
+            "production_scope": production_scope,
+            "hard_gate_passed": bool(ranking_eligible and champion_eligible and production_scope == "production"),
+            "hard_gate_reason": " | ".join(dict.fromkeys([str(r) for r in hard_reasons if r])) if hard_reasons else "hard gate passed",
+            "WAPE": metric_wape,
+            "sMAPE": safe_float(metric_row.get("sMAPE", np.nan)),
+            "RMSE": safe_float(metric_row.get("RMSE", np.nan)),
+            "val_WAPE": safe_float(val_row.get("val_WAPE", np.nan)),
+            "rolling_WAPE": safe_float(ro_row.get("WAPE", np.nan)),
+            "metric_available": bool(metric_finite),
+            "freq_alias": freq_alias,
+            "train_n": train_n,
+        })
+    return pd.DataFrame(rows)
+
+
+def enrich_model_df_with_identity_registry(df: pd.DataFrame, registry: pd.DataFrame, override_eligibility: bool = True) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    if not len(df) or "model" not in df.columns or not isinstance(registry, pd.DataFrame) or not len(registry):
+        return df.copy()
+    reg_cols = [
+        "model", "display_model_name", "model_family", "model_identity_class", "trained_real_model",
+        "trained_with_tensorflow", "real_dl_trained", "surrogate_used", "fallback_forecast_generated",
+        "fallback_used_as_real_model_output", "fallback_reported_as_separate_model", "fallback_method",
+        "ranking_eligible", "eligible_for_model_ranking", "champion_eligible", "production_eligible",
+        "research_only", "audit_only", "production_scope", "hard_gate_passed", "hard_gate_reason",
+    ]
+    reg = registry[[c for c in reg_cols if c in registry.columns]].drop_duplicates(subset=["model"])
+    base = df.drop(columns=[c for c in reg.columns if c != "model" and c in df.columns], errors="ignore").merge(reg, on="model", how="left")
+    if override_eligibility and "eligible_for_model_ranking" in base.columns and "ranking_eligible" in base.columns:
+        base["eligible_for_model_ranking"] = base["ranking_eligible"].fillna(base["eligible_for_model_ranking"]).astype(bool)
+    return base
+
+
+def standardize_fallback_summary(outputs: Dict[str, Any], registry: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    outputs = outputs if isinstance(outputs, dict) else {}
+    registry = registry if isinstance(registry, pd.DataFrame) and len(registry) else build_model_identity_registry(outputs)
+    old = outputs.get("fallback_summary", pd.DataFrame())
+    if not isinstance(old, pd.DataFrame):
+        old = pd.DataFrame()
+    base = old.copy()
+    if "model" not in base.columns:
+        base = pd.DataFrame({"model": registry["model"].astype(str).tolist() if "model" in registry.columns else []})
+    out = enrich_model_df_with_identity_registry(base, registry, override_eligibility=False)
+    if "fallback_used" not in out.columns:
+        out["fallback_used"] = out.get("fallback_forecast_generated", False)
+    out["fallback_forecast_generated"] = out.get("fallback_forecast_generated", out["fallback_used"]).fillna(False).astype(bool)
+    out["fallback_used_as_real_model_output"] = out.get("fallback_used_as_real_model_output", False).fillna(False).astype(bool)
+    out["fallback_reported_as_separate_model"] = out.get("fallback_reported_as_separate_model", False).fillna(False).astype(bool)
+    if "fallback_method" not in out.columns:
+        out["fallback_method"] = None
+    if "fallback_reason" not in out.columns:
+        out["fallback_reason"] = out.get("hard_gate_reason")
+    preferred = [
+        "model", "model_family", "model_identity_class", "fallback_used", "fallback_forecast_generated",
+        "fallback_used_as_real_model_output", "fallback_reported_as_separate_model", "fallback_method",
+        "fallback_owner_family", "ranking_eligible", "champion_eligible", "production_scope", "hard_gate_reason",
+        "fallback_reason", "ranking_exclusion_reason", "surrogate_used", "real_dl_trained", "trained_with_tensorflow",
+    ]
+    return out[[c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]].reset_index(drop=True)
+
+
+def _status_rank_value(status: Any) -> int:
+    return {
+        "eligible": 0,
+        "guarded_fallback": 1,
+        "challenger_only": 2,
+        "research_only": 3,
+        "audit_only": 4,
+        "blocked": 5,
+        "reject": 6,
+    }.get(str(status).lower(), 9)
+
+
+def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.DataFrame) -> pd.DataFrame:
+    legacy = pd.DataFrame()
+    try:
+        legacy = _LEGACY_build_model_eligibility_gate(outputs, feature_audit_df)
+    except Exception:
+        legacy = pd.DataFrame(columns=["model", "eligibility_score", "status", "reasons"])
+    registry = build_model_identity_registry(outputs)
+    if not isinstance(legacy, pd.DataFrame) or len(legacy) == 0:
+        legacy = registry[["model"]].copy()
+        legacy["eligibility_score"] = np.nan
+        legacy["status"] = "eligible"
+        legacy["reasons"] = ""
+    # Make sure every registry model appears in the gate table.
+    missing_models = [m for m in registry["model"].astype(str).tolist() if m not in set(legacy.get("model", pd.Series(dtype=str)).astype(str))]
+    if missing_models:
+        legacy = pd.concat([legacy, pd.DataFrame({"model": missing_models, "eligibility_score": np.nan, "status": "eligible", "reasons": ""})], ignore_index=True)
+    gate = enrich_model_df_with_identity_registry(legacy, registry, override_eligibility=False)
+    for idx, row in gate.iterrows():
+        scope = str(row.get("production_scope", "production"))
+        hard_reason = str(row.get("hard_gate_reason", ""))
+        old_reasons = str(row.get("reasons", "")) if pd.notna(row.get("reasons", "")) else ""
+        merged_reason = " | ".join(dict.fromkeys([r for r in [hard_reason if hard_reason != "hard gate passed" else "", old_reasons if old_reasons and old_reasons != "Uygunluk açısından belirgin kırmızı bayrak yok." else ""] if r]))
+        if scope == "audit_only":
+            gate.at[idx, "status"] = "audit_only"
+            gate.at[idx, "eligibility_score"] = np.nan
+            gate.at[idx, "reasons"] = merged_reason or "Audit-only: üretim lideri/champion olamaz."
+        elif scope == "research_only":
+            gate.at[idx, "status"] = "research_only"
+            gate.at[idx, "eligibility_score"] = np.nan
+            gate.at[idx, "reasons"] = merged_reason or "Research/challenger-only: üretim lideri/champion olamaz."
+        elif not bool(row.get("production_eligible", False)) and normalize_dl_family_label(row.get("model")) in {"LSTM", "GRU", "DL-FALLBACK"}:
+            gate.at[idx, "status"] = "blocked"
+            gate.at[idx, "eligibility_score"] = np.nan
+            gate.at[idx, "reasons"] = merged_reason or "DL hard gate başarısız."
+        else:
+            if not old_reasons or old_reasons == "nan":
+                gate.at[idx, "reasons"] = "Uygunluk açısından belirgin kırmızı bayrak yok."
+    gate["status_rank"] = gate["status"].map(_status_rank_value).fillna(9).astype(int)
+    gate = gate.sort_values(["status_rank", "eligibility_score"], ascending=[True, False], na_position="last").drop(columns=["status_rank"], errors="ignore").reset_index(drop=True)
+    return gate
+
+
+def apply_model_identity_hardening_to_outputs(outputs: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    ensure_dl_training_status_tables(outputs)
+    registry = build_model_identity_registry(outputs)
+    outputs["model_identity_registry"] = registry
+    if isinstance(outputs.get("metrics_df"), pd.DataFrame):
+        outputs["metrics_df"] = enrich_model_df_with_identity_registry(outputs["metrics_df"], registry, override_eligibility=True)
+    if isinstance(outputs.get("validation_metrics_df"), pd.DataFrame):
+        outputs["validation_metrics_df"] = enrich_model_df_with_identity_registry(outputs["validation_metrics_df"], registry, override_eligibility=True)
+    if isinstance(outputs.get("ranking_metrics_df"), pd.DataFrame):
+        outputs["ranking_metrics_df"] = enrich_model_df_with_identity_registry(outputs["ranking_metrics_df"], registry, override_eligibility=True)
+    if isinstance(outputs.get("metrics_df"), pd.DataFrame) and len(outputs["metrics_df"]):
+        prod_metric = outputs["metrics_df"].copy()
+        if "production_eligible" in prod_metric.columns:
+            prod_metric = prod_metric.loc[prod_metric["production_eligible"].fillna(False).astype(bool)].copy()
+        if "WAPE" in prod_metric.columns:
+            prod_metric = prod_metric.loc[pd.to_numeric(prod_metric["WAPE"], errors="coerce").notna()].copy()
+        outputs["ranking_metrics_df"] = prod_metric.reset_index(drop=True)
+        cc = build_champion_challenger(prod_metric if len(prod_metric) else outputs["metrics_df"])
+        outputs["champion_challenger"] = cc
+        outputs["best_model"] = cc.get("champion")
+    outputs["fallback_summary"] = standardize_fallback_summary(outputs, registry)
+    return outputs
+
+
+def build_hardened_production_ranking(outputs: Dict[str, Any], production_pack: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    outputs = apply_model_identity_hardening_to_outputs(outputs)
+    production_pack = production_pack or {}
+    metrics_df = outputs.get("metrics_df", pd.DataFrame())
+    registry = outputs.get("model_identity_registry", pd.DataFrame())
+    gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(production_pack, dict) else pd.DataFrame()
+    if not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
+        return pd.DataFrame(columns=["model", "status", "eligibility_score", "WAPE", "sMAPE", "MAE", "production_eligible", "production_scope"])
+    ranked = enrich_model_df_with_identity_registry(metrics_df, registry, override_eligibility=True)
+    if isinstance(gate_df, pd.DataFrame) and len(gate_df) and "model" in gate_df.columns:
+        gate_cols = [c for c in ["model", "status", "eligibility_score", "reasons"] if c in gate_df.columns]
+        ranked = ranked.drop(columns=[c for c in gate_cols if c != "model" and c in ranked.columns], errors="ignore").merge(gate_df[gate_cols].drop_duplicates(subset=["model"]), on="model", how="left")
+    if "status" not in ranked.columns:
+        ranked["status"] = "eligible"
+    if "eligibility_score" not in ranked.columns:
+        ranked["eligibility_score"] = np.nan
+    mask = ranked.get("production_eligible", False)
+    if not isinstance(mask, pd.Series):
+        mask = pd.Series(False, index=ranked.index)
+    ranked = ranked.loc[mask.fillna(False).astype(bool)].copy()
+    ranked = ranked.loc[~ranked["status"].astype(str).str.lower().isin(["audit_only", "research_only", "challenger_only", "blocked", "reject"])].copy()
+    if "WAPE" in ranked.columns:
+        ranked = ranked.loc[pd.to_numeric(ranked["WAPE"], errors="coerce").notna()].copy()
+    if len(ranked) == 0:
+        return ranked.reset_index(drop=True)
+    status_rank = ranked["status"].map(_status_rank_value).fillna(9)
+    ranked["status_rank"] = status_rank
+    if "operasyonel_skor" not in ranked.columns:
+        ro = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+        if isinstance(ro, pd.DataFrame) and len(ro) and "model" in ro.columns:
+            ranked = ranked.merge(ro[["model", "WAPE"]].rename(columns={"WAPE": "ro_WAPE"}), on="model", how="left")
+        ranked["ro_WAPE_norm"] = pd.to_numeric(ranked.get("ro_WAPE"), errors="coerce")
+        ranked["hold_WAPE_norm"] = pd.to_numeric(ranked.get("WAPE"), errors="coerce")
+        ranked["operasyonel_skor"] = (
+            ranked["status_rank"].fillna(9.0) * 1000.0
+            + ranked["ro_WAPE_norm"].fillna(ranked["hold_WAPE_norm"].fillna(99.0)) * 0.80
+            + ranked["hold_WAPE_norm"].fillna(99.0) * 0.20
+            - pd.to_numeric(ranked.get("eligibility_score"), errors="coerce").fillna(0.0) * 0.03
+        )
+    sort_cols = [c for c in ["operasyonel_skor", "status_rank", "ro_WAPE", "WAPE", "sMAPE", "MAE", "eligibility_score"] if c in ranked.columns]
+    asc = [False if c == "eligibility_score" else True for c in sort_cols]
+    ranked = ranked.sort_values(sort_cols, ascending=asc, na_position="last").drop(columns=["status_rank"], errors="ignore").reset_index(drop=True)
+    return ranked
+
+
+def split_identity_governance_tables(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    registry = outputs.get("model_identity_registry", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    gate_df = production_pack.get("model_eligibility_gate", pd.DataFrame()) if isinstance(production_pack, dict) else pd.DataFrame()
+    metrics = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    base = registry.copy() if isinstance(registry, pd.DataFrame) else pd.DataFrame()
+    if isinstance(metrics, pd.DataFrame) and len(metrics) and "model" in metrics.columns:
+        metric_cols = [c for c in ["model", "WAPE", "sMAPE", "RMSE", "MAE", "BiasPct"] if c in metrics.columns]
+        base = base.drop(columns=[c for c in metric_cols if c != "model" and c in base.columns], errors="ignore").merge(metrics[metric_cols].drop_duplicates(subset=["model"]), on="model", how="left") if len(base) else metrics[metric_cols].copy()
+    if isinstance(gate_df, pd.DataFrame) and len(gate_df) and "model" in gate_df.columns:
+        gate_cols = [c for c in ["model", "status", "eligibility_score", "reasons"] if c in gate_df.columns]
+        base = base.drop(columns=[c for c in gate_cols if c != "model" and c in base.columns], errors="ignore").merge(gate_df[gate_cols].drop_duplicates(subset=["model"]), on="model", how="left") if len(base) else gate_df[gate_cols].copy()
+    if len(base):
+        status_s = base.get("status", pd.Series("", index=base.index)).astype(str).str.lower()
+        scope_s = base.get("production_scope", pd.Series("", index=base.index)).astype(str)
+        production_mask = base.get("production_eligible", pd.Series(False, index=base.index)).fillna(False).astype(bool)
+        prod = base.loc[production_mask & ~status_s.isin(["audit_only", "research_only", "challenger_only", "blocked", "reject"])].copy()
+        research_mask = scope_s.eq("research_only") | base.get("research_only", pd.Series(False, index=base.index)).fillna(False).astype(bool) | status_s.isin(["research_only", "challenger_only"])
+        audit_mask = scope_s.eq("audit_only") | base.get("audit_only", pd.Series(False, index=base.index)).fillna(False).astype(bool) | base.get("model_identity_class", pd.Series("", index=base.index)).astype(str).isin(["surrogate", "fallback"]) | status_s.isin(["audit_only", "blocked", "reject"])
+        research = base.loc[research_mask].copy()
+        audit = base.loc[audit_mask].copy()
+    else:
+        prod, research, audit = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    return prod.reset_index(drop=True), research.reset_index(drop=True), audit.reset_index(drop=True)
+
+
+def run_model_identity_quality_assertions(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    registry = outputs.get("model_identity_registry", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    prod_rank = production_pack.get("production_ranking", pd.DataFrame()) if isinstance(production_pack, dict) else pd.DataFrame()
+    ens_weights = outputs.get("ensemble_weights", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+
+    def _record(assertion_name: str, condition: bool, detail: str):
+        rows.append({"assertion": assertion_name, "passed": bool(condition), "severity": "PASS" if condition else "FAIL", "detail": detail})
+
+    if isinstance(registry, pd.DataFrame) and len(registry):
+        bad_champ = registry.loc[registry.get("model_identity_class", pd.Series(dtype=str)).astype(str).isin(["surrogate", "fallback"]) & registry.get("champion_eligible", pd.Series(False, index=registry.index)).fillna(False).astype(bool)]
+        _record("surrogate_fallback_never_champion", len(bad_champ) == 0, "Surrogate/fallback champion_eligible olamaz.")
+        bad_real = registry.loc[registry.get("model_family", pd.Series(dtype=str)).astype(str).isin(["LSTM", "GRU"]) & registry.get("model_identity_class", pd.Series(dtype=str)).astype(str).eq("real") & (~registry.get("real_dl_trained", pd.Series(False, index=registry.index)).fillna(False).astype(bool)) & registry.get("ranking_eligible", pd.Series(False, index=registry.index)).fillna(False).astype(bool)]
+        _record("untrained_real_dl_never_ranked", len(bad_real) == 0, "Gerçek eğitimi doğrulanmamış LSTM/GRU ranking_eligible olamaz.")
+        bad_prod_scope = registry.loc[registry.get("production_eligible", pd.Series(False, index=registry.index)).fillna(False).astype(bool) & registry.get("production_scope", pd.Series("", index=registry.index)).astype(str).ne("production")]
+        _record("production_eligible_scope_is_production", len(bad_prod_scope) == 0, "Production eligible satırların scope değeri production olmalı.")
+    else:
+        _record("registry_exists", False, "Model identity registry boş veya yok.")
+    if isinstance(prod_rank, pd.DataFrame) and len(prod_rank):
+        bad_rank = prod_rank.loc[~prod_rank.get("production_eligible", pd.Series(True, index=prod_rank.index)).fillna(False).astype(bool)] if "production_eligible" in prod_rank.columns else pd.DataFrame()
+        _record("production_ranking_only_eligible", len(bad_rank) == 0, "Üretim sıralaması production_eligible=False satır içeremez.")
+        bad_dl_fb = prod_rank.loc[prod_rank.get("model", pd.Series(dtype=str)).astype(str).isin(["DL-fallback", "LSTM-surrogate", "GRU-surrogate"])] if "model" in prod_rank.columns else pd.DataFrame()
+        _record("production_ranking_excludes_dl_fallback_surrogates", len(bad_dl_fb) == 0, "DL-fallback ve surrogate modeller üretim sıralamasına giremez.")
+    else:
+        _record("production_ranking_exists_or_no_candidate", True, "Üretim sıralaması boş olabilir; bu durumda üretim modeli güvenli fallback ile seçilir.")
+    if isinstance(ens_weights, pd.DataFrame) and len(ens_weights) and "model" in ens_weights.columns and isinstance(registry, pd.DataFrame) and len(registry):
+        joined = ens_weights.merge(registry[["model", "model_identity_class", "production_eligible"]], on="model", how="left")
+        bad_ens = joined.loc[joined.get("model_identity_class", pd.Series(dtype=str)).astype(str).isin(["surrogate", "fallback"]) | (~joined.get("production_eligible", pd.Series(True, index=joined.index)).fillna(True).astype(bool))]
+        _record("ensemble_excludes_audit_models", len(bad_ens) == 0, "Ensemble surrogate/fallback/audit model ağırlığı içeremez.")
+    else:
+        _record("ensemble_weights_checked", True, "Ensemble ağırlıkları yoksa veya model kolonu yoksa kontrol pas geçildi.")
+    for fam_key, fam in [("lstm", "LSTM"), ("gru", "GRU")]:
+        pack = outputs.get(fam_key, {}) if isinstance(outputs, dict) else {}
+        tbl = pack.get("dl_training_status_table") if isinstance(pack, dict) else None
+        _record(f"{fam.lower()}_training_status_table_exists", isinstance(tbl, pd.DataFrame) and len(tbl) > 0, f"{fam} için eğitim durumu tablosu zorunlu.")
+    return pd.DataFrame(rows)
+
+
+def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
+    outputs = apply_model_identity_hardening_to_outputs(outputs)
+    try:
+        pack = _LEGACY_build_production_governance_pack(outputs, export_payload, target_col, freq_alias) or {}
+    except Exception:
+        pack = {}
+    if not isinstance(pack, dict):
+        pack = {}
+    feature_audit_df = pack.get("feature_availability_audit")
+    if not isinstance(feature_audit_df, pd.DataFrame):
+        feature_audit_df = build_feature_availability_audit(export_payload.get("features", pd.DataFrame()), export_payload.get("metadata", {}).get("date_col", "ds"), target_col, outputs.get("metadata", {}).get("stat_exog_cols", []) or [], outputs.get("metadata", {}).get("prophet_exog_cols", []) or [], outputs.get("metadata", {}).get("ml_feature_cols", []) or [])
+        pack["feature_availability_audit"] = feature_audit_df
+    registry = build_model_identity_registry(outputs)
+    outputs["model_identity_registry"] = registry
+    pack["model_identity_registry"] = registry
+    pack["model_eligibility_gate"] = build_model_eligibility_gate(outputs, feature_audit_df)
+    ranked = build_hardened_production_ranking(outputs, pack)
+    pack["production_ranking"] = ranked
+    prod_candidates, research_models, audit_models = split_identity_governance_tables(outputs, pack)
+    pack["production_candidates"] = prod_candidates
+    pack["research_models"] = research_models
+    pack["audit_models"] = audit_models
+    if isinstance(ranked, pd.DataFrame) and len(ranked):
+        pack["production_model"] = ranked.iloc[0].get("model")
+        pack["production_status"] = ranked.iloc[0].get("status", "eligible")
+    else:
+        # Safe non-DL fallback preference when all candidates are blocked.
+        preferred = [m for m in ["Ensemble", "XGBoost", "SARIMA/SARIMAX", "ARIMA", "Prophet", "Intermittent", outputs.get("best_model")] if m]
+        available = set((outputs.get("predictions", {}) or {}).keys())
+        safe_model = None
+        for cand in preferred:
+            reg_row = registry.loc[registry["model"].astype(str).eq(str(cand))] if isinstance(registry, pd.DataFrame) and len(registry) and "model" in registry.columns else pd.DataFrame()
+            if cand in available and (not len(reg_row) or bool(reg_row.iloc[0].get("production_eligible", False))):
+                safe_model = cand
+                break
+        pack["production_model"] = safe_model or outputs.get("best_model")
+        pack["production_status"] = "guarded_fallback"
+    qtables = pack.get("quantile_forecasts", {}) if isinstance(pack.get("quantile_forecasts", {}), dict) else {}
+    stables = pack.get("service_level_simulation", {}) if isinstance(pack.get("service_level_simulation", {}), dict) else {}
+    pack["production_interval_table"] = qtables.get(pack.get("production_model"), pd.DataFrame())
+    pack["production_service_table"] = stables.get(pack.get("production_model"), pd.DataFrame())
+    pack["production_decision_explanation"] = build_production_decision_explanation(pack.get("production_ranking", pd.DataFrame()), pack.get("production_model"))
+    try:
+        pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, pack)
+    except Exception:
+        pack["live_monitoring_pack"] = pack.get("live_monitoring_pack", {}) or {}
+    pack["model_identity_quality_assertions"] = run_model_identity_quality_assertions(outputs, pack)
+    return pack
+
+
+def _derive_production_ranking(outputs: Dict[str, Any]) -> pd.DataFrame:
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs, dict) else {}
+    existing = prod_pack.get("production_ranking", pd.DataFrame()) if isinstance(prod_pack, dict) else pd.DataFrame()
+    if isinstance(existing, pd.DataFrame) and len(existing) > 0:
+        if "production_eligible" in existing.columns:
+            return existing.loc[existing["production_eligible"].fillna(False).astype(bool)].copy().reset_index(drop=True)
+        return existing.copy()
+    return build_hardened_production_ranking(outputs, prod_pack if isinstance(prod_pack, dict) else {})
+
+
+def ensure_production_reporting_tables(outputs: Dict[str, Any], export_payload: Optional[Dict[str, pd.DataFrame]] = None, target_col: Optional[str] = None, freq_alias: Optional[str] = None) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    outputs = apply_model_identity_hardening_to_outputs(outputs)
+    prod_pack = outputs.get("production_governance", {}) or {}
+    if not isinstance(prod_pack, dict):
+        prod_pack = {}
+    if export_payload is not None and target_col is not None and freq_alias is not None:
+        try:
+            prod_pack = build_production_governance_pack(outputs, export_payload, target_col, freq_alias) or prod_pack
+        except Exception:
+            pass
+    registry = outputs.get("model_identity_registry", build_model_identity_registry(outputs))
+    prod_pack["model_identity_registry"] = registry
+    if not isinstance(prod_pack.get("model_eligibility_gate"), pd.DataFrame) or len(prod_pack.get("model_eligibility_gate", pd.DataFrame())) == 0:
+        feature_audit = prod_pack.get("feature_availability_audit", pd.DataFrame())
+        prod_pack["model_eligibility_gate"] = build_model_eligibility_gate(outputs, feature_audit if isinstance(feature_audit, pd.DataFrame) else pd.DataFrame())
+    prod_pack["production_ranking"] = build_hardened_production_ranking(outputs, prod_pack)
+    prod_candidates, research_models, audit_models = split_identity_governance_tables(outputs, prod_pack)
+    prod_pack["production_candidates"] = prod_candidates
+    prod_pack["research_models"] = research_models
+    prod_pack["audit_models"] = audit_models
+    if isinstance(prod_pack["production_ranking"], pd.DataFrame) and len(prod_pack["production_ranking"]):
+        prod_pack["production_model"] = prod_pack["production_ranking"].iloc[0].get("model")
+        prod_pack["production_status"] = prod_pack["production_ranking"].iloc[0].get("status", "eligible")
+    else:
+        prod_pack.setdefault("production_model", outputs.get("best_model"))
+        prod_pack["production_status"] = prod_pack.get("production_status") or "guarded_fallback"
+    try:
+        prod_pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, prod_pack)
+    except Exception:
+        prod_pack["live_monitoring_pack"] = prod_pack.get("live_monitoring_pack", {}) or {}
+    prod_pack["model_identity_quality_assertions"] = run_model_identity_quality_assertions(outputs, prod_pack)
+    prod_pack["production_decision_explanation"] = build_production_decision_explanation(prod_pack.get("production_ranking", pd.DataFrame()), prod_pack.get("production_model"))
+    outputs["production_governance"] = prod_pack
+    outputs["production_model"] = prod_pack.get("production_model", outputs.get("best_model"))
+    outputs["production_status"] = prod_pack.get("production_status", outputs.get("production_status", "eligible"))
+    return outputs
+
+
+
+# =========================================================
+# PRODUCTION-GRADE MODEL IDENTITY SAFETY GATE
+# =========================================================
+
+MODEL_IDENTITY_DEPLOYMENT_VERSION = "2026_04_24_production_grade_identity_safety_gate"
+
+
+def _model_name_series(df: pd.DataFrame) -> pd.Series:
+    if isinstance(df, pd.DataFrame) and "model" in df.columns:
+        return df["model"].astype(str)
+    return pd.Series(dtype=str)
+
+
+def _production_blocked_model_name_set() -> set:
+    return {"DL-fallback", "LSTM-surrogate", "GRU-surrogate"}
+
+
+def _safe_bool_series(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series:
+    if isinstance(df, pd.DataFrame) and col in df.columns:
+        return df[col].fillna(default).astype(bool)
+    return pd.Series(default, index=df.index if isinstance(df, pd.DataFrame) else None, dtype=bool)
+
+
+def _safe_text_series(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+    if isinstance(df, pd.DataFrame) and col in df.columns:
+        return df[col].fillna(default).astype(str)
+    return pd.Series(default, index=df.index if isinstance(df, pd.DataFrame) else None, dtype=str)
+
+
+def _registry_safe_view(registry: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(registry, pd.DataFrame) or len(registry) == 0:
+        return pd.DataFrame(columns=[
+            "model", "model_family", "model_identity_class", "production_eligible",
+            "ranking_eligible", "champion_eligible", "production_scope", "hard_gate_reason"
+        ])
+    out = registry.copy()
+    required_defaults = {
+        "model": "",
+        "model_family": "UNKNOWN",
+        "model_identity_class": "unknown",
+        "production_eligible": False,
+        "ranking_eligible": False,
+        "champion_eligible": False,
+        "production_scope": "audit_only",
+        "hard_gate_reason": "registry value missing; default-safe blocked",
+    }
+    for col, default in required_defaults.items():
+        if col not in out.columns:
+            out[col] = default
+    return out
+
+
+def _has_unsafe_ensemble_weights(outputs: Dict[str, Any], registry: pd.DataFrame) -> Tuple[bool, str, pd.DataFrame]:
+    weights = outputs.get("ensemble_weights", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(weights, pd.DataFrame) or len(weights) == 0 or "model" not in weights.columns:
+        return False, "ensemble weights absent or not model-indexed", pd.DataFrame()
+    reg = _registry_safe_view(registry)
+    joined = weights.merge(reg[["model", "model_identity_class", "production_eligible", "production_scope", "hard_gate_reason"]].drop_duplicates("model"), on="model", how="left")
+    joined["model_identity_class"] = joined["model_identity_class"].fillna("unknown")
+    joined["production_eligible"] = joined["production_eligible"].fillna(False).astype(bool)
+    bad = joined.loc[
+        joined["model_identity_class"].astype(str).isin(["surrogate", "fallback"])
+        | (~joined["production_eligible"].astype(bool))
+        | joined["model"].astype(str).isin(_production_blocked_model_name_set())
+    ].copy()
+    if len(bad):
+        bad_models = ", ".join(bad["model"].astype(str).drop_duplicates().tolist())
+        return True, f"Ensemble ağırlıkları production dışı/audit model içeriyor: {bad_models}", bad
+    return False, "ensemble weights production gate passed", bad
+
+
+def harden_registry_for_ensemble_contract(outputs: Dict[str, Any], registry: pd.DataFrame) -> pd.DataFrame:
+    """If Ensemble is built from blocked/audit members, block Ensemble too."""
+    reg = _registry_safe_view(registry).copy()
+    unsafe, reason, bad = _has_unsafe_ensemble_weights(outputs, reg)
+    if unsafe and "model" in reg.columns:
+        mask = reg["model"].astype(str).eq("Ensemble")
+        if mask.any():
+            for col in ["ranking_eligible", "eligible_for_model_ranking", "champion_eligible", "production_eligible", "hard_gate_passed"]:
+                if col in reg.columns:
+                    reg.loc[mask, col] = False
+            reg.loc[mask, "audit_only"] = True
+            reg.loc[mask, "research_only"] = False
+            reg.loc[mask, "production_scope"] = "audit_only"
+            old = reg.loc[mask, "hard_gate_reason"].fillna("").astype(str)
+            reg.loc[mask, "hard_gate_reason"] = old.where(old.eq("") | old.eq("hard gate passed"), old + " | ") + reason
+            reg.loc[mask, "ensemble_contract_violation"] = True
+        else:
+            extra = {
+                "model": "Ensemble",
+                "display_model_name": "Ensemble",
+                "model_family": "ENSEMBLE",
+                "model_identity_class": "ensemble",
+                "identity_registry_version": MODEL_IDENTITY_REGISTRY_VERSION,
+                "trained_real_model": True,
+                "ranking_eligible": False,
+                "eligible_for_model_ranking": False,
+                "champion_eligible": False,
+                "production_eligible": False,
+                "research_only": False,
+                "audit_only": True,
+                "production_scope": "audit_only",
+                "hard_gate_passed": False,
+                "hard_gate_reason": reason,
+                "ensemble_contract_violation": True,
+            }
+            reg = pd.concat([reg, pd.DataFrame([extra])], ignore_index=True)
+    return reg.reset_index(drop=True)
+
+
+_ORIGINAL_PRODUCTION_GRADE_build_model_identity_registry = build_model_identity_registry
+
+
+def build_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
+    """Production-grade registry: one source of truth for every model's deployability."""
+    registry = _ORIGINAL_PRODUCTION_GRADE_build_model_identity_registry(outputs)
+    registry = _registry_safe_view(registry)
+    registry = harden_registry_for_ensemble_contract(outputs if isinstance(outputs, dict) else {}, registry)
+
+    # Absolute fail-safe: these labels can never be production/champion candidates.
+    blocked_names = _production_blocked_model_name_set()
+    blocked_mask = registry["model"].astype(str).isin(blocked_names) | registry["model_identity_class"].astype(str).isin(["surrogate", "fallback"])
+    if blocked_mask.any():
+        for col in ["ranking_eligible", "eligible_for_model_ranking", "champion_eligible", "production_eligible", "hard_gate_passed"]:
+            if col in registry.columns:
+                registry.loc[blocked_mask, col] = False
+        registry.loc[blocked_mask, "audit_only"] = True
+        registry.loc[blocked_mask, "research_only"] = False
+        registry.loc[blocked_mask, "production_scope"] = "audit_only"
+        reason = "Production hard gate: surrogate/fallback/DL-fallback audit-only; üretim lideri veya champion olamaz."
+        old = registry.loc[blocked_mask, "hard_gate_reason"].fillna("").astype(str)
+        registry.loc[blocked_mask, "hard_gate_reason"] = np.where((old == "") | (old == "hard gate passed"), reason, old + " | " + reason)
+
+    # Absolute fail-safe: LSTM/GRU real labels must have confirmed real training.
+    dl_real_mask = registry["model_family"].astype(str).isin(["LSTM", "GRU"]) & registry["model_identity_class"].astype(str).eq("real")
+    untrained_dl_mask = dl_real_mask & (~registry.get("real_dl_trained", pd.Series(False, index=registry.index)).fillna(False).astype(bool))
+    if untrained_dl_mask.any():
+        for col in ["ranking_eligible", "eligible_for_model_ranking", "champion_eligible", "production_eligible", "hard_gate_passed"]:
+            if col in registry.columns:
+                registry.loc[untrained_dl_mask, col] = False
+        registry.loc[untrained_dl_mask, "audit_only"] = True
+        registry.loc[untrained_dl_mask, "research_only"] = False
+        registry.loc[untrained_dl_mask, "production_scope"] = "audit_only"
+        reason = "Production hard gate: gerçek DL eğitimi doğrulanmadı; LSTM/GRU real etiketi audit-only."
+        old = registry.loc[untrained_dl_mask, "hard_gate_reason"].fillna("").astype(str)
+        registry.loc[untrained_dl_mask, "hard_gate_reason"] = np.where((old == "") | (old == "hard gate passed"), reason, old + " | " + reason)
+
+    registry["deployment_identity_gate_version"] = MODEL_IDENTITY_DEPLOYMENT_VERSION
+    registry["deployment_gate_passed"] = registry.get("production_eligible", pd.Series(False, index=registry.index)).fillna(False).astype(bool)
+    return registry.reset_index(drop=True)
+
+
+_ORIGINAL_PRODUCTION_GRADE_build_model_eligibility_gate = build_model_eligibility_gate
+
+
+def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.DataFrame) -> pd.DataFrame:
+    """Eligibility table with hard model identity gates applied before scoring."""
+    try:
+        gate = _ORIGINAL_PRODUCTION_GRADE_build_model_eligibility_gate(outputs, feature_audit_df)
+    except Exception:
+        gate = pd.DataFrame(columns=["model", "eligibility_score", "status", "reasons"])
+    registry = build_model_identity_registry(outputs)
+    if not isinstance(gate, pd.DataFrame) or len(gate) == 0:
+        gate = registry[["model"]].copy()
+        gate["eligibility_score"] = np.nan
+        gate["status"] = "blocked"
+        gate["reasons"] = "Eligibility table rebuilt from production identity registry."
+    # Ensure all registry rows appear and registry overrides status/eligibility.
+    missing = [m for m in registry["model"].astype(str).tolist() if m not in set(gate.get("model", pd.Series(dtype=str)).astype(str))]
+    if missing:
+        gate = pd.concat([gate, pd.DataFrame({"model": missing, "eligibility_score": np.nan, "status": "blocked", "reasons": "Registry-only row"})], ignore_index=True)
+    gate = enrich_model_df_with_identity_registry(gate, registry, override_eligibility=False)
+    for idx, row in gate.iterrows():
+        scope = str(row.get("production_scope", "audit_only"))
+        prod_ok = bool(row.get("production_eligible", False))
+        hard_reason = str(row.get("hard_gate_reason", "") or "")
+        old_reason = str(row.get("reasons", "") or "")
+        reason_parts = []
+        if hard_reason and hard_reason != "hard gate passed":
+            reason_parts.append(hard_reason)
+        if old_reason and old_reason not in {"nan", "Uygunluk açısından belirgin kırmızı bayrak yok."}:
+            reason_parts.append(old_reason)
+        merged_reason = " | ".join(dict.fromkeys(reason_parts))
+        if scope == "audit_only":
+            gate.at[idx, "status"] = "audit_only"
+            gate.at[idx, "eligibility_score"] = np.nan
+            gate.at[idx, "reasons"] = merged_reason or "Audit-only model: production/champion/ranking dışı."
+        elif scope == "research_only":
+            gate.at[idx, "status"] = "research_only"
+            gate.at[idx, "eligibility_score"] = np.nan
+            gate.at[idx, "reasons"] = merged_reason or "Research/challenger-only model: champion olamaz."
+        elif not prod_ok:
+            gate.at[idx, "status"] = "blocked"
+            gate.at[idx, "eligibility_score"] = np.nan
+            gate.at[idx, "reasons"] = merged_reason or "Production hard gate başarısız."
+        else:
+            if str(row.get("status", "")).lower() in {"audit_only", "research_only", "blocked", "reject"}:
+                gate.at[idx, "status"] = "eligible"
+            if not merged_reason:
+                gate.at[idx, "reasons"] = "Production identity gate passed."
+    gate["status_rank"] = gate["status"].map(_status_rank_value).fillna(9).astype(int)
+    sort_cols = [c for c in ["status_rank", "eligibility_score", "WAPE"] if c in gate.columns]
+    asc = [True] + ([False] if "eligibility_score" in sort_cols else []) + ([True] if "WAPE" in sort_cols else [])
+    if sort_cols:
+        gate = gate.sort_values(sort_cols, ascending=asc[:len(sort_cols)], na_position="last")
+    return gate.drop(columns=["status_rank"], errors="ignore").reset_index(drop=True)
+
+
+def _production_grade_assert_rows(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    registry = build_model_identity_registry(outputs)
+    prod_rank = production_pack.get("production_ranking", pd.DataFrame()) if isinstance(production_pack, dict) else pd.DataFrame()
+    prod_model = production_pack.get("production_model") if isinstance(production_pack, dict) else None
+    ens_weights = outputs.get("ensemble_weights", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+
+    def rec(name: str, condition: bool, detail: str, blocking: bool = True):
+        rows.append({
+            "assertion": name,
+            "passed": bool(condition),
+            "severity": "PASS" if condition else ("BLOCKER" if blocking else "WARNING"),
+            "blocking": bool(blocking),
+            "detail": detail,
+            "deployment_gate_version": MODEL_IDENTITY_DEPLOYMENT_VERSION,
+        })
+
+    reg = _registry_safe_view(registry)
+    rec("registry_exists", isinstance(reg, pd.DataFrame) and len(reg) > 0, "Model identity registry must exist and be non-empty.")
+    bad_sf = reg.loc[reg["model_identity_class"].astype(str).isin(["surrogate", "fallback"]) & reg.get("champion_eligible", pd.Series(False, index=reg.index)).fillna(False).astype(bool)]
+    rec("surrogate_fallback_never_champion", len(bad_sf) == 0, "Surrogate/fallback rows must never be champion_eligible.")
+    bad_sf_prod = reg.loc[reg["model_identity_class"].astype(str).isin(["surrogate", "fallback"]) & reg.get("production_eligible", pd.Series(False, index=reg.index)).fillna(False).astype(bool)]
+    rec("surrogate_fallback_never_production", len(bad_sf_prod) == 0, "Surrogate/fallback rows must never be production_eligible.")
+    bad_untrained = reg.loc[reg["model_family"].astype(str).isin(["LSTM", "GRU"]) & reg["model_identity_class"].astype(str).eq("real") & (~reg.get("real_dl_trained", pd.Series(False, index=reg.index)).fillna(False).astype(bool)) & reg.get("ranking_eligible", pd.Series(False, index=reg.index)).fillna(False).astype(bool)]
+    rec("untrained_lstm_gru_never_ranked", len(bad_untrained) == 0, "Untrained real LSTM/GRU rows must not be rank eligible.")
+    bad_scope = reg.loc[reg.get("production_eligible", pd.Series(False, index=reg.index)).fillna(False).astype(bool) & reg.get("production_scope", pd.Series("", index=reg.index)).astype(str).ne("production")]
+    rec("production_eligible_scope_is_production", len(bad_scope) == 0, "Every production_eligible row must have production_scope='production'.")
+
+    if isinstance(prod_rank, pd.DataFrame) and len(prod_rank) > 0:
+        bad_rank_prod = prod_rank.loc[~prod_rank.get("production_eligible", pd.Series(False, index=prod_rank.index)).fillna(False).astype(bool)] if "production_eligible" in prod_rank.columns else prod_rank
+        rec("production_ranking_only_contains_production_eligible", len(bad_rank_prod) == 0, "Production ranking must contain only production_eligible rows.")
+        bad_rank_name = prod_rank.loc[_model_name_series(prod_rank).isin(_production_blocked_model_name_set())]
+        rec("production_ranking_excludes_dl_fallback_and_surrogates", len(bad_rank_name) == 0, "DL-fallback and surrogate labels cannot enter production ranking.")
+    else:
+        rec("production_ranking_exists", True, "Production ranking may be empty when no model passes hard gate; selection must then be guarded.", blocking=False)
+
+    if prod_model:
+        prow = reg.loc[reg["model"].astype(str).eq(str(prod_model))]
+        prod_ok = bool(len(prow) and bool(prow.iloc[0].get("production_eligible", False)))
+        rec("selected_production_model_is_production_eligible", prod_ok, f"Selected production_model={prod_model} must be production_eligible.")
+        rec("selected_production_model_not_audit_label", str(prod_model) not in _production_blocked_model_name_set(), f"Selected production_model={prod_model} cannot be DL fallback/surrogate.")
+    else:
+        rec("selected_production_model_exists", False, "A production model must be selected or the package must be blocked.")
+
+    unsafe_ens, ens_reason, bad_ens = _has_unsafe_ensemble_weights(outputs, reg)
+    rec("ensemble_weights_exclude_nonproduction_members", not unsafe_ens, ens_reason)
+
+    for fam_key, fam in [("lstm", "LSTM"), ("gru", "GRU")]:
+        pack = outputs.get(fam_key, {}) if isinstance(outputs, dict) else {}
+        tbl = pack.get("dl_training_status_table") if isinstance(pack, dict) else None
+        rec(f"{fam.lower()}_training_status_table_exists", isinstance(tbl, pd.DataFrame) and len(tbl) > 0, f"{fam} training status table is mandatory.")
+        if isinstance(tbl, pd.DataFrame) and len(tbl):
+            needed = {"trained_with_tensorflow", "surrogate_used", "fallback_used", "epochs_ran", "min_train_loss", "min_val_loss", "overfit_gap", "n_sequences", "selected_window", "selected_strategy"}
+            missing = sorted([c for c in needed if c not in tbl.columns])
+            rec(f"{fam.lower()}_training_status_required_columns", len(missing) == 0, f"Missing DL status columns for {fam}: {missing}")
+    return pd.DataFrame(rows)
+
+
+def run_model_identity_quality_assertions(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> pd.DataFrame:
+    return _production_grade_assert_rows(outputs, production_pack)
+
+
+def _select_safe_production_model(outputs: Dict[str, Any], pack: Dict[str, Any], registry: pd.DataFrame) -> Tuple[Optional[str], str, str]:
+    reg = _registry_safe_view(registry)
+    predictions = outputs.get("predictions", {}) if isinstance(outputs, dict) else {}
+    available = set(str(k) for k in predictions.keys()) if isinstance(predictions, dict) else set()
+    rank = pack.get("production_ranking", pd.DataFrame()) if isinstance(pack, dict) else pd.DataFrame()
+    if isinstance(rank, pd.DataFrame) and len(rank) and "model" in rank.columns:
+        for _, row in rank.iterrows():
+            name = str(row.get("model"))
+            if name in available or name == "Ensemble":
+                reg_row = reg.loc[reg["model"].astype(str).eq(name)]
+                if len(reg_row) and bool(reg_row.iloc[0].get("production_eligible", False)) and name not in _production_blocked_model_name_set():
+                    return name, str(row.get("status", "eligible") or "eligible"), "selected from hardened production ranking"
+    # Fallback only to non-DL, production-eligible candidates with predictions.
+    metrics = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    candidates = reg.loc[reg.get("production_eligible", pd.Series(False, index=reg.index)).fillna(False).astype(bool)].copy()
+    candidates = candidates.loc[~candidates["model"].astype(str).isin(_production_blocked_model_name_set())].copy()
+    if isinstance(metrics, pd.DataFrame) and len(metrics) and "model" in metrics.columns:
+        metric_cols = [c for c in ["model", "WAPE", "sMAPE", "MAE"] if c in metrics.columns]
+        candidates = candidates.merge(metrics[metric_cols].drop_duplicates("model"), on="model", how="left")
+        if "WAPE" in candidates.columns:
+            candidates["WAPE_sort"] = pd.to_numeric(candidates["WAPE"], errors="coerce")
+            candidates = candidates.sort_values(["WAPE_sort"], ascending=True, na_position="last")
+    preferred_order = ["Ensemble", "XGBoost", "SARIMA/SARIMAX", "ARIMA", "Prophet", "Intermittent"]
+    for _, row in candidates.iterrows():
+        name = str(row.get("model"))
+        if name in available or name == "Ensemble":
+            return name, "eligible", "selected from production-eligible registry candidates"
+    for name in preferred_order:
+        row = reg.loc[reg["model"].astype(str).eq(name)]
+        if len(row) and bool(row.iloc[0].get("production_eligible", False)) and (name in available or name == "Ensemble"):
+            return name, "eligible", "selected by safe preferred order"
+    return None, "blocked_no_eligible_model", "no production-eligible model with available prediction"
+
+
+def build_deployment_safety_manifest(outputs: Dict[str, Any], pack: Dict[str, Any]) -> pd.DataFrame:
+    assertions = pack.get("model_identity_quality_assertions", pd.DataFrame()) if isinstance(pack, dict) else pd.DataFrame()
+    if not isinstance(assertions, pd.DataFrame) or len(assertions) == 0:
+        assertions = run_model_identity_quality_assertions(outputs, pack)
+    blockers = assertions.loc[(assertions.get("blocking", pd.Series(True, index=assertions.index)).fillna(True).astype(bool)) & (~assertions.get("passed", pd.Series(False, index=assertions.index)).fillna(False).astype(bool))]
+    rows = [{
+        "deployment_ready": bool(len(blockers) == 0 and pack.get("production_status") not in {"blocked_no_eligible_model", "blocked_identity_quality_failed"}),
+        "blocking_failure_count": int(len(blockers)),
+        "production_model": pack.get("production_model"),
+        "production_status": pack.get("production_status"),
+        "safety_gate_version": MODEL_IDENTITY_DEPLOYMENT_VERSION,
+        "blocking_failures": " | ".join(blockers.get("assertion", pd.Series(dtype=str)).astype(str).tolist()) if len(blockers) else "",
+    }]
+    return pd.DataFrame(rows)
+
+
+def finalize_production_governance_safety(outputs: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(pack, dict):
+        pack = {}
+    outputs = ensure_dl_training_status_tables(outputs if isinstance(outputs, dict) else {})
+    registry = build_model_identity_registry(outputs)
+    outputs["model_identity_registry"] = registry
+    pack["model_identity_registry"] = registry
+
+    feature_audit_df = pack.get("feature_availability_audit", pd.DataFrame())
+    if not isinstance(feature_audit_df, pd.DataFrame):
+        feature_audit_df = pd.DataFrame()
+    pack["model_eligibility_gate"] = build_model_eligibility_gate(outputs, feature_audit_df)
+    pack["production_ranking"] = build_hardened_production_ranking(outputs, pack)
+    prod_candidates, research_models, audit_models = split_identity_governance_tables(outputs, pack)
+    pack["production_candidates"] = prod_candidates
+    pack["research_models"] = research_models
+    pack["audit_models"] = audit_models
+
+    selected, status, reason = _select_safe_production_model(outputs, pack, registry)
+    pack["production_model"] = selected
+    pack["production_status"] = status
+    pack["production_selection_reason"] = reason
+    qtables = pack.get("quantile_forecasts", {}) if isinstance(pack.get("quantile_forecasts", {}), dict) else {}
+    stables = pack.get("service_level_simulation", {}) if isinstance(pack.get("service_level_simulation", {}), dict) else {}
+    pack["production_interval_table"] = qtables.get(selected, pd.DataFrame()) if selected else pd.DataFrame()
+    pack["production_service_table"] = stables.get(selected, pd.DataFrame()) if selected else pd.DataFrame()
+
+    assertions = run_model_identity_quality_assertions(outputs, pack)
+    # If selected model is blocked after assertions, force blocked status.
+    blocking_fail = assertions.loc[(assertions.get("blocking", pd.Series(True, index=assertions.index)).fillna(True).astype(bool)) & (~assertions.get("passed", pd.Series(False, index=assertions.index)).fillna(False).astype(bool))]
+    if len(blocking_fail):
+        # Do not pretend the package is deployment-ready; keep selected model for analyst review only.
+        pack["production_status"] = "blocked_identity_quality_failed" if selected else "blocked_no_eligible_model"
+    pack["model_identity_quality_assertions"] = assertions
+    pack["deployment_safety_manifest"] = build_deployment_safety_manifest(outputs, pack)
+    try:
+        pack["production_decision_explanation"] = build_production_decision_explanation(pack.get("production_ranking", pd.DataFrame()), pack.get("production_model"))
+    except Exception:
+        pack["production_decision_explanation"] = pack.get("production_selection_reason", "")
+    try:
+        pack["live_monitoring_pack"] = build_live_monitoring_pack(outputs, pack)
+    except Exception:
+        pack["live_monitoring_pack"] = pack.get("live_monitoring_pack", {}) or {}
+    return pack
+
+
+_ORIGINAL_PRODUCTION_GRADE_apply_model_identity_hardening_to_outputs = apply_model_identity_hardening_to_outputs
+
+
+def apply_model_identity_hardening_to_outputs(outputs: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    # Production robustness: legacy champion logic expects these metric columns.
+    # Add them safely before calling the previous hardening layer so sparse/minimal
+    # batch runs cannot crash the production safety gate.
+    for _metric_key in ["metrics_df", "validation_metrics_df", "ranking_metrics_df"]:
+        if isinstance(outputs.get(_metric_key), pd.DataFrame):
+            _df = outputs[_metric_key].copy()
+            for _col in ["WAPE", "sMAPE", "RMSE", "MAE"]:
+                if _col not in _df.columns:
+                    _df[_col] = np.nan
+            outputs[_metric_key] = _df
+    try:
+        outputs = _ORIGINAL_PRODUCTION_GRADE_apply_model_identity_hardening_to_outputs(outputs)
+    except Exception as _identity_hardening_error:
+        outputs.setdefault("model_identity_hardening_errors", []).append(str(_identity_hardening_error))
+    if not isinstance(outputs, dict):
+        return outputs
+    registry = build_model_identity_registry(outputs)
+    outputs["model_identity_registry"] = registry
+    for key in ["metrics_df", "validation_metrics_df", "ranking_metrics_df"]:
+        if isinstance(outputs.get(key), pd.DataFrame):
+            outputs[key] = enrich_model_df_with_identity_registry(outputs[key], registry, override_eligibility=True)
+    if isinstance(outputs.get("metrics_df"), pd.DataFrame):
+        prod_metric = outputs["metrics_df"].copy()
+        if "production_eligible" in prod_metric.columns:
+            prod_metric = prod_metric.loc[prod_metric["production_eligible"].fillna(False).astype(bool)].copy()
+        if "WAPE" in prod_metric.columns:
+            prod_metric = prod_metric.loc[pd.to_numeric(prod_metric["WAPE"], errors="coerce").notna()].copy()
+        outputs["ranking_metrics_df"] = prod_metric.reset_index(drop=True)
+        if len(prod_metric):
+            cc = build_champion_challenger(prod_metric)
+            outputs["champion_challenger"] = cc
+            outputs["best_model"] = cc.get("champion")
+    outputs["fallback_summary"] = standardize_fallback_summary(outputs, registry)
+    return outputs
+
+
+_ORIGINAL_PRODUCTION_GRADE_build_production_governance_pack = build_production_governance_pack
+
+
+def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
+    outputs = apply_model_identity_hardening_to_outputs(outputs)
+    try:
+        pack = _ORIGINAL_PRODUCTION_GRADE_build_production_governance_pack(outputs, export_payload, target_col, freq_alias) or {}
+    except Exception:
+        pack = {}
+    if not isinstance(pack, dict):
+        pack = {}
+    # Rebuild/override all deployability-sensitive tables after the legacy pack.
+    if "feature_availability_audit" not in pack or not isinstance(pack.get("feature_availability_audit"), pd.DataFrame):
+        try:
+            pack["feature_availability_audit"] = build_feature_availability_audit(
+                export_payload.get("features", pd.DataFrame()),
+                export_payload.get("metadata", {}).get("date_col", "ds"),
+                target_col,
+                outputs.get("metadata", {}).get("stat_exog_cols", []) or [],
+                outputs.get("metadata", {}).get("prophet_exog_cols", []) or [],
+                outputs.get("metadata", {}).get("ml_feature_cols", []) or [],
+            )
+        except Exception:
+            pack["feature_availability_audit"] = pd.DataFrame()
+    return finalize_production_governance_safety(outputs, pack)
+
+
+_ORIGINAL_PRODUCTION_GRADE_ensure_production_reporting_tables = ensure_production_reporting_tables
+
+
+def ensure_production_reporting_tables(outputs: Dict[str, Any], export_payload: Optional[Dict[str, pd.DataFrame]] = None, target_col: Optional[str] = None, freq_alias: Optional[str] = None) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    outputs = apply_model_identity_hardening_to_outputs(outputs)
+    pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+    if export_payload is not None and target_col is not None and freq_alias is not None:
+        try:
+            pack = build_production_governance_pack(outputs, export_payload, target_col, freq_alias)
+        except Exception:
+            pack = finalize_production_governance_safety(outputs, pack)
+    else:
+        pack = finalize_production_governance_safety(outputs, pack)
+    outputs["production_governance"] = pack
+    outputs["production_model"] = pack.get("production_model")
+    outputs["production_status"] = pack.get("production_status")
+    return outputs
+
 
 def build_cli_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
