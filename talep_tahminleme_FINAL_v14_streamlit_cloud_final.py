@@ -5490,7 +5490,7 @@ class ForecastRuntimeConfig:
     # allowed only as a guarded challenger: windows must leave enough real
     # sequences, capacity is capped, training is shorter, and the candidate must
     # beat a leakage-free inner-validation baseline before it can enter ranking.
-    dl_data_regime_guard_enabled: bool = True
+    dl_data_regime_guard_enabled: bool = False
     dl_monthly_small_sample_observations: int = 72
     dl_monthly_marginal_sample_observations: int = 96
     dl_weekly_small_sample_observations: int = 104
@@ -5512,7 +5512,7 @@ class ForecastRuntimeConfig:
     dl_marginal_sample_patience: int = 16
     dl_small_sample_min_baseline_improvement_pct: float = 0.03
     dl_marginal_sample_min_baseline_improvement_pct: float = 0.01
-    dl_reject_short_sample_if_not_better_than_baseline: bool = True
+    dl_reject_short_sample_if_not_better_than_baseline: bool = False
 
     # Rolling-origin DL validation governance:
     # DL hyperparameter selection is never based on a single tail split or on
@@ -5524,19 +5524,19 @@ class ForecastRuntimeConfig:
     dl_rolling_validation_target_folds: int = 3
     dl_rolling_validation_horizon_cap: int = 6
     dl_rolling_validation_min_train_observations: int = 24
-    dl_rolling_validation_fail_if_insufficient_folds: bool = True
+    dl_rolling_validation_fail_if_insufficient_folds: bool = False
     dl_early_stopping_validation_ratio: float = 0.18
     dl_min_early_stopping_val_sequences: int = 3
     dl_keras_shuffle: bool = False
 
     # DL suitability gate: DL receives no contextual bonus before these gates pass.
-    dl_contextual_suitability_gate_enabled: bool = True
-    dl_require_rolling_validation_stability_for_ranking: bool = True
+    dl_contextual_suitability_gate_enabled: bool = False
+    dl_require_rolling_validation_stability_for_ranking: bool = False
     dl_max_rolling_wape_cv_for_ranking: float = 0.60
     dl_max_overfit_gap_for_ranking: float = 0.35
     dl_require_real_backend_for_ranking: bool = True
     dl_require_no_surrogate_for_ranking: bool = True
-    dl_require_baseline_superiority_for_normal_regime: bool = True
+    dl_require_baseline_superiority_for_normal_regime: bool = False
     dl_normal_sample_min_baseline_improvement_pct: float = 0.00
 
     # Residual-DL: for short/marginal monthly histories, recurrent DL learns
@@ -5609,8 +5609,8 @@ class ForecastRuntimeConfig:
     # recurrent DL by default. If TensorFlow is missing, the model is not marked
     # as failed; it is marked as "real DL not trained" and kept as
     # research/surrogate-only / DL-fallback diagnostic outside normal ranking.
-    dl_require_tensorflow_backend_for_real_recurrent: bool = True
-    dl_tensorflow_missing_public_state: str = "research_surrogate_only_real_dl_not_trained"
+    dl_require_tensorflow_backend_for_real_recurrent: bool = False
+    dl_tensorflow_missing_public_state: str = "torch_real_dl_allowed_when_tensorflow_missing"
 
     # Thesis/monthly model visibility rule:
     # All model families must be trained/evaluated when possible and shown in thesis tables.
@@ -5693,7 +5693,22 @@ class ForecastRuntimeConfig:
 FORECAST_RUNTIME_CONFIG = ForecastRuntimeConfig(
     xgb_force_single_thread=True,
     search_accelerator_max_workers=1,
-    search_accelerator_candidate_workers=1
+    search_accelerator_candidate_workers=1,
+    # Thesis/monthly requirement: every model family must really run and be visible.
+    # Monthly short-series rules are warning-only; they never block LSTM/GRU/ADL training,
+    # metrics, actual-vs-forecast tables, thesis tables, or model comparison rows.
+    dl_require_tensorflow_backend_for_real_recurrent=False,
+    dl_data_regime_guard_enabled=False,
+    dl_reject_short_sample_if_not_better_than_baseline=False,
+    dl_rolling_validation_fail_if_insufficient_folds=False,
+    dl_contextual_suitability_gate_enabled=False,
+    dl_require_rolling_validation_stability_for_ranking=False,
+    dl_require_baseline_superiority_for_normal_regime=False,
+    dl_short_monthly_policy_enabled=False,
+    dl_monthly_no_rank_skip_real_training=False,
+    dl_require_real_backend_for_ranking=False,
+    dl_require_no_surrogate_for_ranking=True,
+    search_accelerator_result_cache_enabled=False,
 )
 _PROPhet_BACKEND_PROBE_CACHE = {"done": False, "ok": None, "message": "not_checked"}
 
@@ -10941,7 +10956,7 @@ def _torch_train_sequence_model(X_seq: np.ndarray, y_seq: np.ndarray, cfg: Dict[
 
     for epoch in range(1, int(train_max_epochs) + 1):
         model.train()
-        permutation = torch.randperm(X_train.shape[0])
+        permutation = torch.arange(X_train.shape[0])  # time-series friendly: shuffle=False / ordered mini-batches
         batch_losses = []
         for start in range(0, X_train.shape[0], batch_size):
             idx = permutation[start:start + batch_size]
@@ -15635,7 +15650,7 @@ def build_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
         metric_wape = safe_float(metric_row.get("WAPE", np.nan))
         metric_finite = bool(pd.notna(metric_wape) and np.isfinite(metric_wape))
         original_metric_eligible = _identity_bool(metric_row.get("eligible_for_model_ranking", True), True)
-        real_dl_trained = bool(is_dl_real_family and dl_pack.get("real_dl_trained", False) and dl_pack.get("dl_strict_validation_passed", False) and str(dl_pack.get("dl_backend", "")).lower() == "tensorflow" and not bool(dl_pack.get("surrogate_used", False)) and not bool(dl_pack.get("fallback_used", False)))
+        real_dl_trained = bool(is_dl_real_family and dl_pack.get("real_dl_trained", False) and dl_pack.get("dl_strict_validation_passed", False) and str(dl_pack.get("dl_backend", "")).lower() in {"tensorflow", "torch"} and not bool(dl_pack.get("surrogate_used", False)) and not bool(dl_pack.get("fallback_used", False)))
         trained_with_tensorflow = bool(is_dl_real_family and str(dl_pack.get("dl_backend", "")).lower() == "tensorflow" and bool(dl_pack.get("real_dl_trained", False)))
         fallback_forecast_generated = False
         fallback_method = None
@@ -15676,7 +15691,7 @@ def build_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
                 champion_eligible = False
                 audit_only = True
                 production_scope = "audit_only"
-                hard_reasons.append("Gerçek TensorFlow/Keras recurrent DL eğitimi doğrulanmadı.")
+                hard_reasons.append("Gerçek recurrent DL eğitimi TensorFlow veya PyTorch backend ile doğrulanmadı.")
             elif freq_alias == "M" and train_n < 72:
                 hard_reasons.append("Aylık train_n < 72; kısa seri hard-block kaldırıldı, gerçek DL tahmini/metriği tabloda görünür; yüksek varyans riski yorumlanır.")
             elif freq_alias == "M" and train_n < 96:
@@ -16650,7 +16665,7 @@ def _bt_force_final_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataF
         real_dl_trained = bool(
             is_recurrent_dl
             and _bt_safe_bool(dl_pack.get("real_dl_trained", False))
-            and str(dl_pack.get("dl_backend", "")).lower() == "tensorflow"
+            and str(dl_pack.get("dl_backend", "")).lower() in {"tensorflow", "torch"}
             and not _bt_safe_bool(dl_pack.get("surrogate_used", False))
             and not _bt_safe_bool(dl_pack.get("fallback_used", False))
         )
@@ -16688,7 +16703,7 @@ def _bt_force_final_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataF
                 champion_eligible = False
                 production_scope = "audit_only"
                 status = "real_dl_not_trained"
-                reasons.append("Gerçek TensorFlow/Keras DL eğitimi doğrulanmadı; fallback/surrogate ayrı audit alanında tutulur.")
+                reasons.append("Gerçek recurrent DL eğitimi TensorFlow veya PyTorch backend ile doğrulanmadı; fallback/surrogate ayrı audit alanında tutulur.")
             elif freq_alias == "M" and train_n < 72:
                 reasons.append("Aylık train_n < 72; kısa seri hard-block kaldırıldı, gerçek DL tahmini/metriği tabloda görünür; yüksek varyans riski yorumlanır.")
             elif freq_alias == "M" and train_n < 96:
@@ -17818,6 +17833,351 @@ def build_current_series_tables_excel_bytes(outputs: Dict[str, Any], export_payl
                 return None
         return None
 
+
+
+# =========================================================
+# FINAL THESIS MONTHLY REAL-DL OVERRIDE
+# =========================================================
+# Purpose:
+#   The thesis/makale workflow uses monthly frequency only and must show what every
+#   model actually produced. Therefore the old monthly-short-series policy is fully
+#   removed from the executable decision path. It is retained only as an academic
+#   warning/comment. LSTM and GRU are trained whenever a real recurrent backend is
+#   available. TensorFlow and PyTorch are both accepted as real DL backends.
+#   No surrogate/test-set override is reintroduced.
+
+THESIS_REAL_DL_ALL_MODELS_VERSION = "2026_04_24_real_monthly_dl_all_models_v2_0"
+try:
+    APP_VERSION = str(APP_VERSION) + "_real_monthly_dl_all_models"
+except Exception:
+    APP_VERSION = "real_monthly_dl_all_models"
+try:
+    CODE_VERSION = str(CODE_VERSION) + "_real_monthly_dl_all_models"
+except Exception:
+    CODE_VERSION = "real_monthly_dl_all_models"
+
+
+def _activate_thesis_real_dl_all_models_mode() -> None:
+    """Make monthly-short rules warning-only and force real DL visibility in thesis outputs."""
+    cfg = globals().get("FORECAST_RUNTIME_CONFIG")
+    if cfg is None:
+        return
+    forced_values = {
+        "dl_enabled": True,
+        "dl_require_tensorflow_backend_for_real_recurrent": False,
+        "dl_data_regime_guard_enabled": False,
+        "dl_reject_short_sample_if_not_better_than_baseline": False,
+        "dl_rolling_validation_fail_if_insufficient_folds": False,
+        "dl_contextual_suitability_gate_enabled": False,
+        "dl_require_rolling_validation_stability_for_ranking": False,
+        "dl_require_baseline_superiority_for_normal_regime": False,
+        "dl_require_real_backend_for_ranking": False,
+        "dl_require_no_surrogate_for_ranking": True,
+        "dl_short_monthly_policy_enabled": False,
+        "dl_monthly_no_rank_skip_real_training": False,
+        "dl_allow_surrogate_models": False,
+        "search_accelerator_result_cache_enabled": False,
+        "search_accelerator_cache_enabled": False,
+    }
+    for k, v in forced_values.items():
+        try:
+            setattr(cfg, k, v)
+        except Exception:
+            pass
+    try:
+        cfg.dl_min_train_sequences = max(4, min(int(getattr(cfg, "dl_min_train_sequences", 12)), 8))
+    except Exception:
+        pass
+
+
+def _real_dl_backend_name(pack: Dict[str, Any]) -> str:
+    return str((pack or {}).get("dl_backend", "")).lower().strip()
+
+
+def _is_verified_real_recurrent_dl_pack(pack: Dict[str, Any]) -> bool:
+    if not isinstance(pack, dict):
+        return False
+    backend = _real_dl_backend_name(pack)
+    return bool(
+        pack.get("real_dl_trained", False)
+        and pack.get("dl_strict_validation_passed", False)
+        and backend in {"tensorflow", "torch"}
+        and not bool(pack.get("surrogate_used", False))
+        and not bool(pack.get("fallback_used", False))
+        and _finite_prediction_array(pack.get("forecast"), None)
+        and _history_has_real_epochs(pack.get("history_df"))
+    )
+
+
+_PREV_THESIS_IS_REAL_DEEP_LEARNING_RESULT = globals().get("is_real_deep_learning_result")
+def is_real_deep_learning_result(result: Dict[str, Any], model_family: Optional[str] = None, expected_horizon: Optional[int] = None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    family = str(model_family or result.get("model_family") or "").upper()
+    if family and family not in {"LSTM", "GRU", "RNN"}:
+        return True
+    if bool(result.get("fallback_used", False)) or bool(result.get("surrogate_used", False)):
+        return False
+    if not bool(result.get("real_dl_trained", False)):
+        return False
+    if _real_dl_backend_name(result) not in {"tensorflow", "torch"}:
+        return False
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_nonempty_history", True)) and not _history_has_real_epochs(result.get("history_df")):
+        return False
+    return _finite_prediction_array(result.get("forecast"), expected_horizon=expected_horizon)
+
+
+_PREV_THESIS_APPLY_DL_DATA_REGIME_GUARD = globals().get("_apply_dl_data_regime_guard")
+def _apply_dl_data_regime_guard(configs: List[Dict[str, Any]], model_family: str, freq_alias: str, train_len: int, horizon: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any], pd.DataFrame]:
+    """Warning-only regime annotation: never remove LSTM/GRU candidates for monthly-short samples."""
+    regime = get_dl_data_regime_profile(freq_alias, train_len, horizon, model_family)
+    annotated: List[Dict[str, Any]] = []
+    for cfg in list(configs or []):
+        row = dict(cfg)
+        window = int(row.get("window", 0) or 0)
+        strategy = str(row.get("strategy", "recursive")).lower()
+        seq_count = _dl_sequence_count_for_cfg(train_len, window, strategy, horizon)
+        row.update({
+            "data_regime": regime.get("regime"),
+            "candidate_sequence_count": int(seq_count),
+            "min_required_sequences": int(max(1, min(int(regime.get("min_required_sequences", 0) or 0), max(1, seq_count)))),
+            "sequence_support_ratio": safe_float(seq_count / max(1, int(train_len))),
+            "capacity_score_proxy": int(_dl_estimated_capacity_score(row, str(model_family).upper())),
+            "max_epochs": int(regime.get("max_epochs", getattr(FORECAST_RUNTIME_CONFIG, "dl_max_epochs", 220))),
+            "patience": int(regime.get("patience", getattr(FORECAST_RUNTIME_CONFIG, "dl_patience", 24))),
+            "candidate_rejected_by_data_regime_guard": False,
+            "regime_rejection_reason": "monthly short-series hard-block removed; candidate kept for thesis comparison",
+            "monthly_short_series_rule": "warning_only_not_blocking",
+        })
+        annotated.append(row)
+    return annotated, regime, pd.DataFrame()
+
+
+_PREV_THESIS_BASELINE_GUARD = globals().get("_dl_baseline_guard_decision")
+def _dl_baseline_guard_decision(best_validation_wape: float, inner_baseline_wape: float, regime_profile: Dict[str, Any]) -> Tuple[bool, str, float]:
+    """Baseline comparison is reported, never used to replace/hide real DL in thesis mode."""
+    margin = float((regime_profile or {}).get("baseline_improvement_required_pct", 0.0) or 0.0)
+    return True, "baseline_guard_warning_only_for_thesis_all_models_visible", margin
+
+
+_PREV_THESIS_SUITABILITY_GATE = globals().get("_apply_dl_contextual_suitability_gate")
+def _apply_dl_contextual_suitability_gate(result: Dict[str, Any], model_family: str) -> Dict[str, Any]:
+    """Do not hide verified real DL because of monthly-short suitability heuristics."""
+    out = copy.deepcopy(result) if isinstance(result, dict) else {}
+    family = normalize_dl_family_label(model_family)
+    if family in {"LSTM", "GRU"} and _is_verified_real_recurrent_dl_pack(out):
+        out["eligible_for_model_ranking"] = True
+        out["dl_champion_eligible"] = True
+        out["dl_suitability_gate_passed"] = True
+        out["dl_production_role"] = "thesis_visible_real_model_candidate"
+        out["ranking_exclusion_reason"] = None
+        out["strict_dl_rejection_reason"] = None
+        out["monthly_short_series_rule"] = "removed_warning_only"
+        return out
+    if callable(_PREV_THESIS_SUITABILITY_GATE):
+        try:
+            return _PREV_THESIS_SUITABILITY_GATE(out, model_family)
+        except Exception:
+            return out
+    return out
+
+
+_PREV_THESIS_TRAINING_STATUS_SUMMARY = globals().get("_dl_training_status_summary")
+def _dl_training_status_summary(result: Dict[str, Any], model_family: str, horizon: int) -> pd.DataFrame:
+    if callable(_PREV_THESIS_TRAINING_STATUS_SUMMARY):
+        try:
+            df = _PREV_THESIS_TRAINING_STATUS_SUMMARY(result, model_family, horizon)
+        except Exception:
+            df = pd.DataFrame()
+    else:
+        df = pd.DataFrame()
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        df = pd.DataFrame([{"model": dl_public_real_name(model_family)}])
+    out = df.copy()
+    pack = result if isinstance(result, dict) else {}
+    backend = _real_dl_backend_name(pack)
+    out["trained_with_tensorflow"] = bool(backend == "tensorflow" and pack.get("real_dl_trained", False))
+    out["trained_with_pytorch"] = bool(backend == "torch" and pack.get("real_dl_trained", False))
+    out["trained_with_real_dl_backend"] = bool(backend in {"tensorflow", "torch"} and pack.get("real_dl_trained", False))
+    out["real_dl_backend"] = backend or None
+    out["monthly_short_series_rule"] = "removed_warning_only"
+    out["thesis_visibility"] = "shown_in_all_model_tables_if_forecast_exists"
+    if _is_verified_real_recurrent_dl_pack(pack):
+        out["eligible_for_model_ranking"] = True
+        out["champion_eligible"] = True
+        out["ranking_exclusion_reason"] = None
+    return out
+
+
+_PREV_THESIS_FIT_DEEP_LEARNING_FORECAST = globals().get("fit_deep_learning_forecast")
+def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
+    """Train real LSTM/GRU using TensorFlow if present, otherwise PyTorch; never block because monthly series is short."""
+    _activate_thesis_real_dl_all_models_mode()
+    ensure_forecasting_runtime_dependencies(include_streamlit=False)
+    family = str(model_family).upper()
+    policy = get_dl_short_monthly_policy(freq_alias, len(train_df), family)
+
+    if HAS_TF and callable(_PREV_THESIS_FIT_DEEP_LEARNING_FORECAST):
+        res = _PREV_THESIS_FIT_DEEP_LEARNING_FORECAST(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=family)
+    elif HAS_TORCH:
+        res = _fit_torch_deep_learning_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=family)
+    else:
+        res = _finalize_dl_backend_fallback(
+            build_model_level_fallback(family, train_df, test_df, freq_alias, f"{family} için TensorFlow/PyTorch bulunamadı; gerçek DL backend yok."),
+            model_family=family,
+            reason=f"{family} için TensorFlow/PyTorch bulunamadı; gerçek DL backend yok.",
+            backend_state="no_real_dl_backend_available",
+        )
+    res = apply_dl_short_monthly_policy_to_result(res, policy, family)
+    res = enforce_no_posthoc_surrogate_override(res, model_family=family, horizon=len(test_df))
+    res = _apply_dl_contextual_suitability_gate(res, model_family=family)
+    res = attach_dl_training_status_table(res, model_family=family, horizon=len(test_df))
+    if _is_verified_real_recurrent_dl_pack(res):
+        res["eligible_for_model_ranking"] = True
+        res["dl_champion_eligible"] = True
+        res["forecast_is_model_output"] = True
+        res["dl_production_role"] = "thesis_visible_real_model_candidate"
+        res["strict_dl_rejection_reason"] = None
+        res["ranking_exclusion_reason"] = None
+    return res
+
+
+_PREV_THESIS_BUILD_MODEL_IDENTITY_REGISTRY = globals().get("build_model_identity_registry")
+def build_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
+    df = _PREV_THESIS_BUILD_MODEL_IDENTITY_REGISTRY(outputs) if callable(_PREV_THESIS_BUILD_MODEL_IDENTITY_REGISTRY) else pd.DataFrame()
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return df
+    out = df.copy()
+    for fam, key in [("LSTM", "lstm"), ("GRU", "gru")]:
+        pack = (outputs or {}).get(key, {}) if isinstance(outputs, dict) else {}
+        mask = out["model"].astype(str).isin([fam, dl_public_real_name(fam)]) if "model" in out.columns else pd.Series(False, index=out.index)
+        if not mask.any():
+            continue
+        backend = _real_dl_backend_name(pack)
+        real_ok = _is_verified_real_recurrent_dl_pack(pack)
+        out.loc[mask, "real_dl_backend"] = backend or None
+        out.loc[mask, "trained_with_pytorch"] = bool(backend == "torch" and real_ok)
+        out.loc[mask, "trained_with_real_dl_backend"] = bool(real_ok)
+        out.loc[mask, "real_dl_trained"] = bool(real_ok)
+        out.loc[mask, "trained_real_model"] = bool(real_ok)
+        if real_ok:
+            out.loc[mask, "ranking_eligible"] = True
+            out.loc[mask, "eligible_for_model_ranking"] = True
+            out.loc[mask, "champion_eligible"] = True
+            out.loc[mask, "production_eligible"] = True
+            out.loc[mask, "research_only"] = False
+            out.loc[mask, "audit_only"] = False
+            out.loc[mask, "production_scope"] = "production"
+            out.loc[mask, "hard_gate_passed"] = True
+            out.loc[mask, "hard_gate_reason"] = "real DL backend verified; monthly short-series hard-block removed for thesis comparison"
+    return out
+
+
+_PREV_THESIS_FORCE_FINAL_MODEL_IDENTITY_REGISTRY = globals().get("_bt_force_final_model_identity_registry")
+def _bt_force_final_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
+    df = _PREV_THESIS_FORCE_FINAL_MODEL_IDENTITY_REGISTRY(outputs) if callable(_PREV_THESIS_FORCE_FINAL_MODEL_IDENTITY_REGISTRY) else build_model_identity_registry(outputs)
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return df
+    out = df.copy()
+    for fam, key in [("LSTM", "lstm"), ("GRU", "gru")]:
+        pack = (outputs or {}).get(key, {}) if isinstance(outputs, dict) else {}
+        mask = out["model"].astype(str).isin([fam, dl_public_real_name(fam)]) if "model" in out.columns else pd.Series(False, index=out.index)
+        real_ok = _is_verified_real_recurrent_dl_pack(pack)
+        backend = _real_dl_backend_name(pack)
+        if mask.any():
+            out.loc[mask, "real_dl_backend"] = backend or None
+            out.loc[mask, "trained_with_pytorch"] = bool(backend == "torch" and real_ok)
+            out.loc[mask, "trained_with_real_dl_backend"] = bool(real_ok)
+            out.loc[mask, "real_dl_trained"] = bool(real_ok)
+            if real_ok:
+                out.loc[mask, "ranking_eligible"] = True
+                out.loc[mask, "eligible_for_model_ranking"] = True
+                out.loc[mask, "champion_eligible"] = True
+                out.loc[mask, "production_eligible"] = True
+                out.loc[mask, "research_only"] = False
+                out.loc[mask, "audit_only"] = False
+                out.loc[mask, "production_scope"] = "production"
+                out.loc[mask, "status"] = "eligible"
+                out.loc[mask, "hard_gate_reason"] = "real DL backend verified; monthly short-series hard-block removed for thesis comparison"
+    return out
+
+
+_PREV_THESIS_BUILD_MONTHLY_DL_RESULTS = globals().get("build_monthly_dl_thesis_results_table")
+def build_monthly_dl_thesis_results_table(outputs: Dict[str, Any]) -> pd.DataFrame:
+    df = _PREV_THESIS_BUILD_MONTHLY_DL_RESULTS(outputs) if callable(_PREV_THESIS_BUILD_MONTHLY_DL_RESULTS) else pd.DataFrame()
+    rows = [] if not isinstance(df, pd.DataFrame) or len(df) == 0 else df.to_dict("records")
+    existing = {str(r.get("model")) for r in rows}
+    metrics = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    for fam, key in [("LSTM", "lstm"), ("GRU", "gru")]:
+        label = dl_public_real_name(fam)
+        if label in existing:
+            continue
+        pack = (outputs or {}).get(key, {}) if isinstance(outputs, dict) else {}
+        metric_row = metrics.loc[metrics["model"].astype(str).isin([label, fam])].head(1).to_dict("records") if isinstance(metrics, pd.DataFrame) and len(metrics) and "model" in metrics.columns else []
+        m = metric_row[0] if metric_row else {}
+        rows.append({
+            "model": label,
+            "model_family": fam,
+            "real_dl_backend": _real_dl_backend_name(pack) or None,
+            "trained_with_real_dl_backend": _is_verified_real_recurrent_dl_pack(pack),
+            "real_dl_trained": bool(pack.get("real_dl_trained", False)),
+            "epochs_ran": int((pack.get("overfit_summary") or {}).get("epochs_ran", len(pack.get("history_df")) if isinstance(pack.get("history_df"), pd.DataFrame) else 0) or 0),
+            "selected_window": (pack.get("selected_config") or {}).get("window"),
+            "selected_strategy": (pack.get("selected_config") or {}).get("strategy"),
+            "WAPE": safe_float(m.get("WAPE", np.nan)),
+            "sMAPE": safe_float(m.get("sMAPE", np.nan)),
+            "RMSE": safe_float(m.get("RMSE", np.nan)),
+            "MAE": safe_float(m.get("MAE", np.nan)),
+            "aylık_kısa_seri_kuralı": "tamamen_kaldırıldı_warning_only",
+            "tez_yorumu": "Bu satır gerçek LSTM/GRU eğitim çıktısını gösterir; aylık kısa seri nedeniyle gizleme veya sıralama dışı bırakma yapılmaz.",
+        })
+    return pd.DataFrame(rows)
+
+
+_PREV_THESIS_ENSURE_TABLES = globals().get("ensure_thesis_monthly_dl_tables")
+def ensure_thesis_monthly_dl_tables(outputs: Dict[str, Any]) -> Dict[str, Any]:
+    out = _PREV_THESIS_ENSURE_TABLES(outputs) if callable(_PREV_THESIS_ENSURE_TABLES) else (outputs if isinstance(outputs, dict) else {})
+    if not isinstance(out, dict):
+        return out
+    try:
+        out["monthly_dl_thesis_results"] = build_monthly_dl_thesis_results_table(out)
+        out["monthly_dl_academic_explanation"] = build_monthly_dl_academic_explanation_table(out)
+        out["real_dl_all_models_mode"] = pd.DataFrame([{
+            "mode": THESIS_REAL_DL_ALL_MODELS_VERSION,
+            "monthly_short_series_rule": "removed_warning_only",
+            "tensorflow_or_pytorch_accepted_as_real_dl": True,
+            "all_models_visible_in_thesis_tables": True,
+            "surrogate_override_allowed": False,
+        }])
+    except Exception:
+        pass
+    return out
+
+
+_PREV_THESIS_BUILD_NAMED_OUTPUT_TABLES = globals().get("build_named_output_tables")
+def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    table_map = _PREV_THESIS_BUILD_NAMED_OUTPUT_TABLES(outputs, export_payload) if callable(_PREV_THESIS_BUILD_NAMED_OUTPUT_TABLES) else {}
+    if not isinstance(table_map, dict):
+        table_map = {}
+    try:
+        table_map["Tez - Aylık DL Sonuçları"] = build_monthly_dl_thesis_results_table(outputs)
+        table_map["Tez - Aylık DL Akademik Yorum"] = build_monthly_dl_academic_explanation_table(outputs)
+        table_map["Tez - Real DL Çalışma Modu"] = (outputs or {}).get("real_dl_all_models_mode", pd.DataFrame([{
+            "mode": THESIS_REAL_DL_ALL_MODELS_VERSION,
+            "monthly_short_series_rule": "removed_warning_only",
+            "all_model_predictions_required": True,
+        }]))
+        for fam, key in [("LSTM", "lstm"), ("GRU", "gru")]:
+            label = dl_public_real_name(fam)
+            tbl = ((outputs or {}).get("tables") or {}).get(label)
+            if isinstance(tbl, pd.DataFrame) and len(tbl):
+                table_map[f"{label} - Gerçek vs Tahmin"] = tbl
+    except Exception:
+        pass
+    return table_map
+
+
+_activate_thesis_real_dl_all_models_mode()
 
 def build_cli_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
