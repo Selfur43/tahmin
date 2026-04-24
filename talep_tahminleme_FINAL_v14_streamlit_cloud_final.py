@@ -16097,10 +16097,30 @@ def _production_blocked_model_name_set() -> set:
     return {"DL-fallback", "LSTM-surrogate", "GRU-surrogate"}
 
 
-def _safe_bool_series(df: pd.DataFrame, col: str, default: bool = False) -> pd.Series:
-    if isinstance(df, pd.DataFrame) and col in df.columns:
-        return df[col].fillna(default).astype(bool)
-    return pd.Series(default, index=df.index if isinstance(df, pd.DataFrame) else None, dtype=bool)
+def _safe_bool_series(obj, col: Optional[str] = None, default: bool = False) -> pd.Series:
+    """
+    Backward/forward compatible boolean-series helper.
+
+    Supported call patterns:
+      1) _safe_bool_series(series_like)
+      2) _safe_bool_series(df, col, default=False)
+
+    Earlier forecasting code called this helper with a Series, while a later
+    identity-gate patch introduced a DataFrame+column signature. Python resolves
+    globals at runtime, so the later definition overrode the first one and caused
+    TypeError inside make_series_analysis_frame(). This unified version keeps
+    both APIs valid.
+    """
+    if isinstance(obj, pd.DataFrame):
+        if col is not None and col in obj.columns:
+            return obj[col].fillna(default).astype(bool)
+        return pd.Series(default, index=obj.index, dtype=bool)
+
+    try:
+        s = pd.Series(obj)
+        return s.fillna(default).astype(bool)
+    except Exception:
+        return pd.Series(bool(default), dtype=bool)
 
 
 def _safe_text_series(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
