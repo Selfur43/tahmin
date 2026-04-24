@@ -43,6 +43,9 @@ Main capabilities:
 """
 
 import os
+# Streamlit Cloud startup guard: TensorFlow/PyTorch are imported lazily only during DL training.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
 os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -5261,7 +5264,7 @@ def _install_streamlit_excel_dataframe_override() -> None:
     STREAMLIT_DATAFRAME_OVERRIDDEN = True
 
 
-def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> None:
+def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False, include_deep_learning: bool = False) -> None:
     global st, go, make_subplots, HAS_PLOTLY
     global SARIMAX, adfuller, kpss, acf, pacf, plot_acf, plot_pacf, acorr_ljungbox, HAS_FORECAST_STATSMODELS
     global Prophet, HAS_PROPHET
@@ -5333,7 +5336,7 @@ def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> 
             XGBRegressor = None
             HAS_XGBOOST = False
 
-    if tf is None:
+    if include_deep_learning and tf is None:
         try:
             import tensorflow as _tf
             _tf.get_logger().setLevel("ERROR")
@@ -5372,7 +5375,7 @@ def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> 
             KerasAdam = None
             HAS_TF = False
 
-    if torch is None:
+    if include_deep_learning and torch is None:
         try:
             import torch as _torch
             import torch.nn as _TorchNN
@@ -11658,6 +11661,7 @@ def filter_usable_prediction_map(pred_map: Dict[str, np.ndarray], metrics_df: pd
     return usable, m.reset_index(drop=True)
 
 def _fit_torch_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
+    ensure_forecasting_runtime_dependencies(include_streamlit=False, include_deep_learning=True)
     if not HAS_TORCH:
         return _finalize_dl_backend_fallback(
             build_model_level_fallback(model_family, train_df, test_df, freq_alias, "PyTorch bulunamadı."),
@@ -11944,7 +11948,7 @@ def _fit_torch_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFr
 
 
 def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
-    ensure_forecasting_runtime_dependencies(include_streamlit=False)
+    ensure_forecasting_runtime_dependencies(include_streamlit=False, include_deep_learning=True)
     model_family = str(model_family).upper()
     short_monthly_policy = get_dl_short_monthly_policy(freq_alias, len(train_df), model_family)
 
@@ -18033,7 +18037,7 @@ _PREV_THESIS_FIT_DEEP_LEARNING_FORECAST = globals().get("fit_deep_learning_forec
 def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
     """Train real LSTM/GRU using TensorFlow if present, otherwise PyTorch; never block because monthly series is short."""
     _activate_thesis_real_dl_all_models_mode()
-    ensure_forecasting_runtime_dependencies(include_streamlit=False)
+    ensure_forecasting_runtime_dependencies(include_streamlit=False, include_deep_learning=True)
     family = str(model_family).upper()
     policy = get_dl_short_monthly_policy(freq_alias, len(train_df), family)
 
@@ -18271,7 +18275,7 @@ def _try_runtime_pip_install_for_real_dl() -> None:
     if _REAL_DL_BOOTSTRAP_ATTEMPTED:
         return
     _REAL_DL_BOOTSTRAP_ATTEMPTED = True
-    allow = str(os.environ.get("ENABLE_RUNTIME_DL_BACKEND_INSTALL", "1")).strip().lower() not in {"0", "false", "no", "off"}
+    allow = str(os.environ.get("ENABLE_RUNTIME_DL_BACKEND_INSTALL", "0")).strip().lower() not in {"0", "false", "no", "off"}
     if not allow:
         _record_real_dl_backend_bootstrap("runtime_install", "skipped", "ENABLE_RUNTIME_DL_BACKEND_INSTALL disabled")
         return
@@ -18298,25 +18302,43 @@ def _try_runtime_pip_install_for_real_dl() -> None:
 
 
 _PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES = globals().get("ensure_forecasting_runtime_dependencies")
-def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> None:
+def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False, include_deep_learning: bool = False) -> None:
+    """Load forecasting dependencies lazily.
+
+    Streamlit health checks must start the app quickly. Therefore TensorFlow/PyTorch
+    are never imported during app boot, page render, preprocessing, or classical/ML
+    model setup. They are imported only when a real DL training function explicitly
+    calls this loader with include_deep_learning=True.
+    """
     global _REAL_DL_IN_ENSURE
     if callable(_PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES):
-        _PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES(include_streamlit=include_streamlit)
-    # Try a real DL backend once per process. Avoid recursive calls while the old
-    # dependency loader imports packages.
+        try:
+            _PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES(
+                include_streamlit=include_streamlit,
+                include_deep_learning=bool(include_deep_learning),
+            )
+        except TypeError:
+            _PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES(include_streamlit=include_streamlit)
+
+    if not include_deep_learning:
+        return
+
+    # Real DL backend bootstrap is allowed only inside DL training, never at app startup.
     if not _REAL_DL_IN_ENSURE and bool(getattr(globals().get("FORECAST_RUNTIME_CONFIG", object()), "dl_enabled", True)):
         _REAL_DL_IN_ENSURE = True
         try:
             if not bool(globals().get("HAS_TF", False) or globals().get("HAS_TORCH", False)):
-                _record_real_dl_backend_bootstrap("initial_import", "missing", "TensorFlow and PyTorch were not importable before runtime bootstrap.")
+                _record_real_dl_backend_bootstrap("lazy_training_import", "missing", "TensorFlow and PyTorch were not importable at DL training time.")
                 _try_runtime_pip_install_for_real_dl()
                 if callable(_PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES):
-                    _PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES(include_streamlit=False)
+                    try:
+                        _PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES(include_streamlit=False, include_deep_learning=True)
+                    except TypeError:
+                        _PREV_REALDL_ENSURE_FORECASTING_RUNTIME_DEPENDENCIES(include_streamlit=False)
             else:
-                _record_real_dl_backend_bootstrap("initial_import", "success", "A real DL backend is already importable.")
+                _record_real_dl_backend_bootstrap("lazy_training_import", "success", "A real DL backend is importable at DL training time.")
         finally:
             _REAL_DL_IN_ENSURE = False
-
 
 def _activate_strict_real_dl_thesis_mode() -> None:
     cfg = globals().get("FORECAST_RUNTIME_CONFIG")
@@ -18422,7 +18444,7 @@ def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, fe
     or reports a clear backend blocker in the DL status/manifest tables.
     """
     _activate_strict_real_dl_thesis_mode()
-    ensure_forecasting_runtime_dependencies(include_streamlit=False)
+    ensure_forecasting_runtime_dependencies(include_streamlit=False, include_deep_learning=True)
     family = str(model_family).upper()
     if not callable(_PREV_REALDL_FIT_DEEP_LEARNING_FORECAST):
         raise RuntimeError("fit_deep_learning_forecast implementation is unavailable.")
@@ -18712,6 +18734,20 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     return outputs
 
 _activate_thesis_real_dl_all_models_mode()
+
+
+# =========================================================
+# STREAMLIT CLOUD STARTUP SAFETY: LAZY DL IMPORT DIAGNOSTICS
+# =========================================================
+def get_lazy_dl_import_startup_status() -> pd.DataFrame:
+    """Confirms no DL backend is imported merely to boot the Streamlit app."""
+    return pd.DataFrame([{
+        "lazy_dl_import_enabled": True,
+        "tensorflow_imported_now": bool(globals().get("tf") is not None),
+        "pytorch_imported_now": bool(globals().get("torch") is not None),
+        "dl_import_policy": "TensorFlow/PyTorch are imported only inside fit_deep_learning_forecast(...).",
+        "runtime_pip_install_default": "disabled; use requirements.txt for tensorflow-cpu/torch",
+    }])
 
 def build_cli_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
