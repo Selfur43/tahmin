@@ -18819,33 +18819,6 @@ def main():
     return entrypoint()
 
 
-if __name__ == "__main__":
-    try:
-        if _should_launch_streamlit_entrypoint(sys.argv[1:]):
-            main()
-        else:
-            raise SystemExit(run_cli_main(sys.argv[1:]))
-    except KeyboardInterrupt:
-        try:
-            progress_log("Kullanıcı İptali", "Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.", level="WARNING")
-            deactivate_local_progress_reporter(success=False, final_message="Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.")
-        except Exception:
-            pass
-        print("[WARNING] Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.")
-        raise SystemExit(130)
-    except SystemExit:
-        raise
-    except Exception as e:
-        if _is_running_under_streamlit() and st is not None:
-            st.error(f"Beklenmeyen uygulama hatası: {e}")
-            st.exception(e)
-        else:
-            print(f"[ERROR] {e}")
-            traceback.print_exc()
-            raise SystemExit(1)
-
-
-
 # =========================================================
 # MANDATORY BUSINESS / THESIS TABLE COMPLETION PATCH
 # =========================================================
@@ -19377,4 +19350,33 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     except Exception:
         pass
     return outputs
+
+
+
+if __name__ == "__main__":
+    try:
+        if _should_launch_streamlit_entrypoint(sys.argv[1:]):
+            main()
+        else:
+            raise SystemExit(run_cli_main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        try:
+            progress_log("Kullanıcı İptali", "Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.", level="WARNING")
+            deactivate_local_progress_reporter(success=False, final_message="Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.")
+        except Exception:
+            pass
+        print("[WARNING] Çalışma kullanıcı tarafından Ctrl+C ile durduruldu.")
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        if _is_running_under_streamlit() and st is not None:
+            st.error(f"Beklenmeyen uygulama hatası: {e}")
+            st.exception(e)
+        else:
+            print(f"[ERROR] {e}")
+            traceback.print_exc()
+            raise SystemExit(1)
+
+
 
