@@ -5186,6 +5186,17 @@ HAS_PROPHET = False
 XGBRegressor = None
 HAS_XGBOOST = False
 
+tf = None
+Sequential = None
+KerasLSTM = None
+KerasGRU = None
+KerasSimpleRNN = None
+KerasDense = None
+KerasDropout = None
+KerasEarlyStopping = None
+KerasAdam = None
+HAS_TF = False
+
 try:
     from sklearn.ensemble import HistGradientBoostingRegressor as SKHistGradientBoostingRegressor
 except Exception:
@@ -5197,6 +5208,7 @@ def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> 
     global SARIMAX, adfuller, kpss, acf, pacf, plot_acf, plot_pacf, acorr_ljungbox, HAS_FORECAST_STATSMODELS
     global Prophet, HAS_PROPHET
     global XGBRegressor, HAS_XGBOOST
+    global tf, Sequential, KerasLSTM, KerasGRU, KerasSimpleRNN, KerasDense, KerasDropout, KerasEarlyStopping, KerasAdam, HAS_TF
 
     if include_streamlit and st is None:
         try:
@@ -5261,6 +5273,45 @@ def ensure_forecasting_runtime_dependencies(include_streamlit: bool = False) -> 
             XGBRegressor = None
             HAS_XGBOOST = False
 
+    if tf is None:
+        try:
+            import tensorflow as _tf
+            _tf.get_logger().setLevel("ERROR")
+            try:
+                _tf.config.threading.set_intra_op_parallelism_threads(1)
+                _tf.config.threading.set_inter_op_parallelism_threads(1)
+            except Exception:
+                pass
+            try:
+                _tf.keras.utils.set_random_seed(42)
+            except Exception:
+                pass
+            from tensorflow.keras.models import Sequential as _Sequential
+            from tensorflow.keras.layers import LSTM as _KerasLSTM, GRU as _KerasGRU, SimpleRNN as _KerasSimpleRNN, Dense as _KerasDense, Dropout as _KerasDropout
+            from tensorflow.keras.callbacks import EarlyStopping as _KerasEarlyStopping
+            from tensorflow.keras.optimizers import Adam as _KerasAdam
+            tf = _tf
+            Sequential = _Sequential
+            KerasLSTM = _KerasLSTM
+            KerasGRU = _KerasGRU
+            KerasSimpleRNN = _KerasSimpleRNN
+            KerasDense = _KerasDense
+            KerasDropout = _KerasDropout
+            KerasEarlyStopping = _KerasEarlyStopping
+            KerasAdam = _KerasAdam
+            HAS_TF = True
+        except Exception:
+            tf = None
+            Sequential = None
+            KerasLSTM = None
+            KerasGRU = None
+            KerasSimpleRNN = None
+            KerasDense = None
+            KerasDropout = None
+            KerasEarlyStopping = None
+            KerasAdam = None
+            HAS_TF = False
+
 if XGBRegressor is None and SKHistGradientBoostingRegressor is not None:
     XGBRegressor = SKHistGradientBoostingRegressor
 
@@ -5282,7 +5333,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 
 
 
@@ -5310,6 +5361,17 @@ class ForecastRuntimeConfig:
     xgb_prefer_hist_gradient_on_short_series: bool = False
     xgb_search_wall_seconds: float = 900.0
     xgb_inner_train_max_rows: int = 240
+    dl_enabled: bool = True
+    dl_max_configs_per_family: int = 4
+    dl_max_epochs: int = 80
+    dl_patience: int = 10
+    dl_batch_size: int = 8
+    dl_validation_ratio: float = 0.20
+    dl_sequence_max_exog_cols: int = 12
+    dl_min_train_sequences: int = 16
+    dl_window_candidates: Tuple[int, ...] = (4, 6, 12, 18)
+    dl_hidden_units: Tuple[int, ...] = (24, 40)
+    dl_dropout_values: Tuple[float, ...] = (0.0, 0.15)
     search_accelerator_enabled: bool = True
     search_accelerator_model_parallel: bool = True
     search_accelerator_candidate_parallel: bool = True
@@ -5688,12 +5750,12 @@ def recommend_model_priority(profile: Dict[str, Any]) -> str:
     if label == "seasonal":
         return "Prophet + SARIMA"
     if label == "volatile":
-        return "XGBoost + Prophet"
+        return "XGBoost + LSTM + Prophet"
     if label == "intermittent":
         return "Intermittent + ARIMA + XGBoost"
     if label == "stable_fast_mover":
-        return "SARIMA + XGBoost"
-    return "SARIMA + Prophet + XGBoost"
+        return "SARIMA + XGBoost + LSTM"
+    return "SARIMA + Prophet + XGBoost + LSTM"
 
 
 
@@ -5763,14 +5825,14 @@ def recommend_candidate_models(profile: Dict[str, Any]) -> List[str]:
     family = seg["family"]
     abcxyz = seg["abc_xyz"]
     if family == "seasonal":
-        return ["SARIMA/SARIMAX", "ARIMA", "Prophet", "Ensemble"]
+        return ["SARIMA/SARIMAX", "ARIMA", "Prophet", "LSTM", "Ensemble"]
     if family == "intermittent":
-        return ["Intermittent", "ARIMA", "XGBoost", "Ensemble"]
+        return ["Intermittent", "ARIMA", "XGBoost", "LSTM", "Ensemble"]
     if family == "volatile":
-        return ["XGBoost", "Prophet", "SARIMA/SARIMAX", "Ensemble"]
+        return ["XGBoost", "LSTM", "GRU", "Prophet", "SARIMA/SARIMAX", "Ensemble"]
     if abcxyz in ["AX", "BX"]:
-        return ["SARIMA/SARIMAX", "ARIMA", "XGBoost", "Ensemble"]
-    return ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "Ensemble"]
+        return ["SARIMA/SARIMAX", "ARIMA", "XGBoost", "LSTM", "Ensemble"]
+    return ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "LSTM", "GRU", "Ensemble"]
 
 def choose_target_transform(y: pd.Series) -> Dict[str, Any]:
     s = pd.to_numeric(y, errors="coerce").dropna().astype(float)
@@ -6344,6 +6406,12 @@ def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str,
         "XGBoost - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("search_table"))),
         "XGBoost - Strateji karşılaştırması": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("strategy_comparison"))),
         "XGBoost - Özellik önemleri": _df_or_empty((outputs.get("xgboost") or {}).get("feature_importance")),
+        "LSTM - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("LSTM"))),
+        "LSTM - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("lstm") or {}).get("search_table"))),
+        "LSTM - Epoch Loss Geçmişi": style_metric_dataframe(_df_or_empty((outputs.get("lstm") or {}).get("history_df"))),
+        "GRU - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("GRU"))),
+        "GRU - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("gru") or {}).get("search_table"))),
+        "GRU - Epoch Loss Geçmişi": style_metric_dataframe(_df_or_empty((outputs.get("gru") or {}).get("history_df"))),
         "Karar hiyerarşisi özeti": style_metric_dataframe(_df_or_empty(outputs.get("karar_hiyerarsisi"))),
         "Holdout sıralaması": style_metric_dataframe(_df_or_empty((outputs.get("champion_challenger") or {}).get("ranking"))),
         "Ansambl ağırlıkları (peak-aware + bias-aware)": style_metric_dataframe(_df_or_empty(outputs.get("ensemble_weights"))),
@@ -7372,6 +7440,11 @@ def build_model_visual_style_map(outputs: Optional[Dict[str, Any]] = None) -> Di
     if prophet_info and bool(prophet_info.get("fallback_used", False)):
         style_map.setdefault("Prophet", {})
         style_map["Prophet"].update({"opacity": 0.28, "width": 1.2, "dash": "dot"})
+    for dl_name in ["LSTM", "GRU"]:
+        dl_info = outputs.get(dl_name.lower(), {}) if isinstance(outputs, dict) else {}
+        if dl_info and bool(dl_info.get("fallback_used", False)):
+            style_map.setdefault(dl_name, {})
+            style_map[dl_name].update({"opacity": 0.32, "width": 1.2, "dash": "dot"})
     return style_map
 
 def plot_forecast_results(train_df: pd.DataFrame, test_df: pd.DataFrame, predictions: Dict[str, np.ndarray], title: str, model_style_map: Optional[Dict[str, Dict[str, Any]]] = None):
@@ -9031,6 +9104,249 @@ def infer_runtime_regime_from_profile(profile: Optional[Dict[str, Any]] = None, 
     }
 
 
+
+def infer_dl_window_candidates(freq_alias: str, train_len: int) -> List[int]:
+    base = list(FORECAST_RUNTIME_CONFIG.dl_window_candidates)
+    fa = str(freq_alias).upper()
+    if fa == "M":
+        base = [4, 6, 12, 18]
+    elif fa == "W":
+        base = [4, 8, 13, 26]
+    elif fa == "D":
+        base = [7, 14, 28]
+    elif fa == "H":
+        base = [24, 48, 72]
+    max_allowed = max(3, min(max(train_len - 2, 3), max(6, train_len // 2)))
+    out=[int(w) for w in base if 3 <= int(w) <= max_allowed]
+    return sorted(set(out or [max(3, min(6, max_allowed))]))
+
+
+def _select_dl_feature_columns(feature_train: pd.DataFrame, feature_test: pd.DataFrame, max_cols: int) -> List[str]:
+    if not isinstance(feature_train, pd.DataFrame):
+        return []
+    combined = pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_test, pd.DataFrame) else feature_train.copy()
+    scores=[]
+    for col in combined.columns:
+        s=pd.to_numeric(combined[col], errors="coerce").replace([np.inf,-np.inf], np.nan)
+        if s.notna().mean() >= 0.60:
+            scores.append((col, float(s.notna().mean()), float(s.std(skipna=True) or 0.0)))
+    scores=sorted(scores, key=lambda x:(x[1],x[2]), reverse=True)
+    return [c for c,_,_ in scores[:max(1,int(max_cols))]]
+
+
+def _fit_dl_scalers(train_y_t: np.ndarray, train_cov: np.ndarray):
+    y_scaler = StandardScaler()
+    y_scaled = y_scaler.fit_transform(np.asarray(train_y_t, dtype=float).reshape(-1,1)).reshape(-1)
+    if train_cov.size == 0:
+        return y_scaler, None, y_scaled, np.zeros((len(train_y_t),0), dtype=float)
+    x_scaler = RobustScaler()
+    x_scaled = x_scaler.fit_transform(np.asarray(train_cov, dtype=float))
+    return y_scaler, x_scaler, y_scaled, x_scaled
+
+
+def _transform_dl_covariates(x_scaler, cov_df: pd.DataFrame) -> np.ndarray:
+    if x_scaler is None or cov_df is None or len(cov_df) == 0:
+        return np.zeros((0,0), dtype=float)
+    arr = cov_df.replace([np.inf,-np.inf], np.nan).fillna(0.0).values.astype(float)
+    return x_scaler.transform(arr)
+
+
+def _make_dl_sequences(y_scaled: np.ndarray, cov_scaled: np.ndarray, window: int) -> Tuple[np.ndarray, np.ndarray]:
+    y_scaled=np.asarray(y_scaled, dtype=float).reshape(-1)
+    cov_scaled=np.asarray(cov_scaled, dtype=float) if cov_scaled is not None else np.zeros((len(y_scaled),0), dtype=float)
+    Xs=[]; ys=[]
+    for end_idx in range(int(window), len(y_scaled)):
+        yw = y_scaled[end_idx-int(window):end_idx].reshape(int(window),1)
+        xw = cov_scaled[end_idx-int(window):end_idx] if cov_scaled.size else np.zeros((int(window),0), dtype=float)
+        Xs.append(np.concatenate([yw,xw], axis=1))
+        ys.append(y_scaled[end_idx])
+    if not Xs:
+        return np.zeros((0,int(window),1 + (cov_scaled.shape[1] if cov_scaled.ndim==2 else 0)), dtype=float), np.zeros((0,), dtype=float)
+    return np.asarray(Xs, dtype=float), np.asarray(ys, dtype=float)
+
+
+def _build_dl_network(input_shape: Tuple[int, int], model_family: str, units: int, layers: int, dropout: float, learning_rate: float = 0.001):
+    if not HAS_TF or Sequential is None:
+        raise ImportError("TensorFlow/Keras bulunamadı.")
+    fam = str(model_family).upper()
+    recurrent_cls = KerasLSTM if fam == "LSTM" else KerasGRU if fam == "GRU" else KerasSimpleRNN
+    tf.keras.backend.clear_session()
+    try:
+        tf.keras.utils.set_random_seed(42)
+    except Exception:
+        pass
+    model = Sequential()
+    if int(layers) <= 1:
+        model.add(recurrent_cls(int(units), input_shape=input_shape, return_sequences=False))
+        if float(dropout) > 0:
+            model.add(KerasDropout(float(dropout)))
+    else:
+        model.add(recurrent_cls(int(units), input_shape=input_shape, return_sequences=True))
+        if float(dropout) > 0:
+            model.add(KerasDropout(float(dropout)))
+        model.add(recurrent_cls(max(12, int(units)//2), return_sequences=False))
+        if float(dropout) > 0:
+            model.add(KerasDropout(float(dropout)))
+    model.add(KerasDense(max(8, int(units)//2), activation="relu"))
+    model.add(KerasDense(1))
+    model.compile(optimizer=KerasAdam(learning_rate=float(learning_rate)), loss="mse", metrics=["mae"])
+    return model
+
+
+def _recursive_dl_forecast(model, history_y_scaled: np.ndarray, history_cov_scaled: np.ndarray, future_cov_scaled: np.ndarray, window: int) -> np.ndarray:
+    hist_y=list(np.asarray(history_y_scaled, dtype=float).reshape(-1))
+    if np.asarray(history_cov_scaled).size:
+        hist_cov=[np.asarray(r, dtype=float) for r in np.asarray(history_cov_scaled, dtype=float)]
+    else:
+        hist_cov=[np.zeros((0,), dtype=float) for _ in hist_y]
+    future_cov_scaled=np.asarray(future_cov_scaled, dtype=float) if future_cov_scaled is not None else np.zeros((0,0), dtype=float)
+    preds=[]
+    for i in range(len(future_cov_scaled)):
+        yw=np.asarray(hist_y[-int(window):], dtype=float).reshape(int(window),1)
+        xw=np.asarray(hist_cov[-int(window):], dtype=float) if hist_cov else np.zeros((int(window),0), dtype=float)
+        X=np.concatenate([yw,xw], axis=1)[None,:,:]
+        pred_scaled=float(model.predict(X, verbose=0).reshape(-1)[0])
+        preds.append(pred_scaled)
+        hist_y.append(pred_scaled)
+        hist_cov.append(np.asarray(future_cov_scaled[i], dtype=float))
+    return np.asarray(preds, dtype=float)
+
+
+def _history_to_frame(history_obj) -> pd.DataFrame:
+    hist=getattr(history_obj, "history", {}) or {}
+    if not hist:
+        return pd.DataFrame(columns=["epoch","loss","val_loss","mae","val_mae"])
+    df=pd.DataFrame(hist)
+    df.insert(0, "epoch", np.arange(1, len(df)+1))
+    return df
+
+
+def build_dl_loss_curve(history_df: pd.DataFrame, title: str):
+    if history_df is None or len(history_df) == 0 or not HAS_PLOTLY:
+        return None
+    fig = go.Figure()
+    if "loss" in history_df.columns:
+        fig.add_trace(go.Scatter(x=history_df["epoch"], y=history_df["loss"], mode="lines+markers", name="Train Loss"))
+    if "val_loss" in history_df.columns:
+        fig.add_trace(go.Scatter(x=history_df["epoch"], y=history_df["val_loss"], mode="lines+markers", name="Val Loss"))
+    fig.update_layout(title=title, xaxis_title="Epoch", yaxis_title="Loss", template="plotly_white")
+    return fig
+
+
+def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
+    ensure_forecasting_runtime_dependencies(include_streamlit=False)
+    if not FORECAST_RUNTIME_CONFIG.dl_enabled:
+        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, "DL katmanı runtime yapılandırmasında kapalı.")
+    if not HAS_TF:
+        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, "TensorFlow/Keras bulunamadı.")
+    if len(train_df) < 24:
+        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz.")
+    model_family=str(model_family).upper()
+    cache_key = build_search_signature(f"dl_{model_family.lower()}", freq_alias, train_df, test_df, exog_train=pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_train, pd.DataFrame) else None, extra={"app_version": APP_VERSION})
+    cached=SEARCH_ACCELERATOR.get_result(cache_key)
+    if cached is not None:
+        cached["search_accelerator_cache_hit"]=True
+        return cached
+    selected_cols=_select_dl_feature_columns(feature_train, feature_test, FORECAST_RUNTIME_CONFIG.dl_sequence_max_exog_cols)
+    cov_train_df = feature_train[selected_cols].copy() if selected_cols and isinstance(feature_train, pd.DataFrame) else pd.DataFrame(index=train_df.index)
+    cov_test_df = feature_test[selected_cols].copy() if selected_cols and isinstance(feature_test, pd.DataFrame) else pd.DataFrame(index=test_df.index)
+    cov_train_df=cov_train_df.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    cov_test_df=cov_test_df.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    tr_inner, val_inner = make_inner_train_val_split(train_df, val_ratio=FORECAST_RUNTIME_CONFIG.dl_validation_ratio, min_val=max(3, len(test_df)))
+    split_ix=len(tr_inner)
+    cov_tr_inner=cov_train_df.iloc[:split_ix].reset_index(drop=True)
+    cov_val_inner=cov_train_df.iloc[split_ix:].reset_index(drop=True)
+    season_length=infer_season_length_from_freq(freq_alias)
+    search_rows=[]
+    best=None
+    best_score=np.inf
+    configs=[]
+    for window in infer_dl_window_candidates(freq_alias, len(tr_inner)):
+        for units in FORECAST_RUNTIME_CONFIG.dl_hidden_units:
+            for dropout in FORECAST_RUNTIME_CONFIG.dl_dropout_values:
+                layers=2 if int(units) >= 40 and int(window) >= 8 else 1
+                configs.append({"window": int(window), "units": int(units), "dropout": float(dropout), "layers": int(layers), "learning_rate": 0.001})
+    configs=configs[:max(1, int(FORECAST_RUNTIME_CONFIG.dl_max_configs_per_family))]
+    for cfg in configs:
+        try:
+            y_transform=choose_target_transform(tr_inner["y"])
+            tr_y_t=apply_target_transform(tr_inner["y"], y_transform)[0].values.astype(float)
+            y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(tr_y_t, cov_tr_inner.values.astype(float) if len(cov_tr_inner) else np.zeros((len(tr_inner),0), dtype=float))
+            X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
+            if len(X_seq) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
+                raise ValueError("Yeterli sliding-window eğitim örneği üretilemedi.")
+            model=_build_dl_network((X_seq.shape[1], X_seq.shape[2]), model_family=model_family, units=int(cfg["units"]), layers=int(cfg["layers"]), dropout=float(cfg["dropout"]), learning_rate=float(cfg["learning_rate"]))
+            callbacks=[KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
+            hist=model.fit(X_seq, y_seq, epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs), batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_seq)//2))), validation_split=min(0.25, max(0.12, 1.0/max(len(X_seq),8))), verbose=0, callbacks=callbacks)
+            val_cov_scaled=_transform_dl_covariates(x_scaler, cov_val_inner) if len(cov_val_inner) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim==2 else 0), dtype=float)
+            pred_val_scaled=_recursive_dl_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
+            pred_val_t=y_scaler.inverse_transform(pred_val_scaled.reshape(-1,1)).reshape(-1)
+            pred_val=inverse_target_transform(pred_val_t, y_transform)
+            pred_val=np.maximum(np.asarray(pred_val, dtype=float),0.0)
+            corrected, post_cfg = compute_validation_postprocess_candidates(val_inner["y"].values, pred_val, tr_inner["y"], season_length)
+            val_w=wape(val_inner["y"].values, corrected)
+            val_s=smape(val_inner["y"].values, corrected)
+            asym=compute_asymmetric_validation_penalty(val_inner["y"].values, corrected, tr_inner["y"].values, severity=1.0)
+            hist_df=_history_to_frame(hist)
+            min_loss=safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
+            min_val_loss=safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
+            overfit_gap=safe_float((min_val_loss-min_loss)/max(abs(min_loss),1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
+            score=float(val_w + 0.35*val_s + asym["penalty"] + 4.0*max(overfit_gap,0.0) + 0.02*float(cfg["layers"]-1))
+            search_rows.append({**cfg, "model": model_family, "transform": y_transform.get("name","none"), "val_wape": val_w, "val_smape": val_s, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "min_train_loss": min_loss, "min_val_loss": min_val_loss, "overfit_gap_ratio": overfit_gap, "epochs_ran": int(len(hist_df)), "selected_exog_cols": ", ".join(selected_cols), "composite_score": score})
+            if score < best_score:
+                best_score=score
+                best={"cfg": dict(cfg), "transform_cfg": dict(y_transform), "postprocess_cfg": dict(post_cfg), "validation_wape": safe_float(val_w), "validation_smape": safe_float(val_s), "selected_cols": list(selected_cols)}
+        except Exception as e:
+            search_rows.append({**cfg, "model": model_family, "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
+    if best is None:
+        result=build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} modeli kurulamadı.")
+        result["search_accelerator_cache_hit"]=False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+    full_y_t=apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
+    y_scaler, x_scaler, full_y_scaled, full_cov_scaled = _fit_dl_scalers(full_y_t, cov_train_df[best["selected_cols"]].values.astype(float) if best["selected_cols"] else np.zeros((len(train_df),0), dtype=float))
+    X_full, y_full = _make_dl_sequences(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]))
+    if len(X_full) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
+        result=build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için final training sequence sayısı yetersiz.")
+        result["search_accelerator_cache_hit"]=False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+    final_model=_build_dl_network((X_full.shape[1], X_full.shape[2]), model_family=model_family, units=int(best["cfg"]["units"]), layers=int(best["cfg"]["layers"]), dropout=float(best["cfg"]["dropout"]), learning_rate=float(best["cfg"]["learning_rate"]))
+    callbacks=[KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
+    final_hist=final_model.fit(X_full, y_full, epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs), batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_full)//2))), validation_split=min(0.20, max(0.10, 1.0/max(len(X_full),8))), verbose=0, callbacks=callbacks)
+    future_cov_scaled=_transform_dl_covariates(x_scaler, cov_test_df[best["selected_cols"]]) if best["selected_cols"] else np.zeros((len(test_df),0), dtype=float)
+    pred_scaled=_recursive_dl_forecast(final_model, full_y_scaled, full_cov_scaled, future_cov_scaled, int(best["cfg"]["window"]))
+    pred_t=y_scaler.inverse_transform(pred_scaled.reshape(-1,1)).reshape(-1)
+    pred=inverse_target_transform(pred_t, best["transform_cfg"])
+    pred=np.maximum(np.asarray(pred,dtype=float),0.0)
+    pred=apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
+    hist_df=_history_to_frame(final_hist)
+    overfit_summary={
+        "epochs_ran": int(len(hist_df)),
+        "min_train_loss": safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan,
+        "min_val_loss": safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan,
+        "final_train_loss": safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").iloc[-1]) if len(hist_df) else np.nan,
+        "final_val_loss": safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").iloc[-1]) if len(hist_df) and "val_loss" in hist_df.columns else np.nan,
+    }
+    overfit_summary["overfit_gap_ratio"] = safe_float((overfit_summary.get("min_val_loss", np.nan)-overfit_summary.get("min_train_loss", np.nan))/max(abs(overfit_summary.get("min_train_loss", np.nan)),1e-8)) if pd.notna(overfit_summary.get("min_val_loss", np.nan)) and pd.notna(overfit_summary.get("min_train_loss", np.nan)) else np.nan
+    result={
+        "forecast": pred,
+        "search_table": pd.DataFrame(search_rows).sort_values(["composite_score","val_wape"], ascending=[True,True], na_position="last").reset_index(drop=True),
+        "history_df": hist_df,
+        "overfit_summary": overfit_summary,
+        "selected_config": dict(best["cfg"]),
+        "transform": best["transform_cfg"].get("name","none"),
+        "used_exog_cols": list(best["selected_cols"]),
+        "validation_wape": safe_float(best.get("validation_wape", np.nan)),
+        "validation_smape": safe_float(best.get("validation_smape", np.nan)),
+        "fallback_used": False,
+        "fallback_method": None,
+        "fit_mode": f"deep_learning_{model_family.lower()}",
+        "search_accelerator_cache_hit": False,
+    }
+    SEARCH_ACCELERATOR.put_result(cache_key, result)
+    return result
+
 def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     if not isinstance(validation_df, pd.DataFrame) or len(validation_df) == 0:
         return pd.DataFrame(columns=["model", "val_WAPE", "val_sMAPE", "bağlamsal_ceza", "bağlamsal_doğrulama_skoru"])
@@ -9054,6 +9370,9 @@ def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Op
         out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] -= 0.15
     if regime.get("trendy_like", False):
         out.loc[out["model"].eq("XGBoost"), "bağlamsal_ceza"] -= 0.10
+        out.loc[out["model"].isin(["LSTM", "GRU"]), "bağlamsal_ceza"] -= 0.12
+    if regime.get("volatile_like", False):
+        out.loc[out["model"].isin(["LSTM", "GRU"]), "bağlamsal_ceza"] -= 0.05
     out["bağlamsal_doğrulama_skoru"] = pd.to_numeric(out.get("val_WAPE"), errors="coerce").fillna(99.0) + pd.to_numeric(out.get("val_sMAPE"), errors="coerce").fillna(99.0) * 0.12 + out["bağlamsal_ceza"].fillna(0.0)
     return out.sort_values(["bağlamsal_doğrulama_skoru", "val_WAPE", "val_sMAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
 
@@ -9163,6 +9482,9 @@ def build_weighted_ensemble(
         use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_pen"] -= 0.08
     if regime.get("volatile_like", False):
         use_df.loc[use_df["model"].eq("XGBoost"), "regime_pen"] -= 0.05
+        use_df.loc[use_df["model"].isin(["LSTM", "GRU"]), "regime_pen"] -= 0.06
+    if regime.get("trendy_like", False):
+        use_df.loc[use_df["model"].isin(["LSTM", "GRU"]), "regime_pen"] -= 0.03
 
     # Haftalıkta rolling ve lokal yakın geçmişe daha fazla ağırlık ver
     if freq_alias == "W":
@@ -9418,7 +9740,7 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
             rows = feature_audit_df[feature_audit_df["used_in"].str.contains(area, na=False)]
             risk_by_area[area] = float(rows["availability_risk_score"].max()) if len(rows) else 0.0
     rows_out: List[Dict[str, Any]] = []
-    for model_name in ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "Intermittent", "Ensemble"]:
+    for model_name in ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "LSTM", "GRU", "Intermittent", "Ensemble"]:
         reasons = []
         score = 100.0
         area_risk = 0.0
@@ -9426,7 +9748,7 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
             area_risk = risk_by_area.get("statistical", 0.0)
         elif model_name == "Prophet":
             area_risk = risk_by_area.get("prophet", 0.0)
-        elif model_name == "XGBoost":
+        elif model_name in ["XGBoost", "LSTM", "GRU"]:
             area_risk = risk_by_area.get("ml", 0.0)
         score -= 20.0 * area_risk
         if area_risk >= 0.60:
@@ -9487,6 +9809,21 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
         if model_name == "XGBoost" and n_obs < 30:
             score -= 15.0
             reasons.append("Makine öğrenmesi için gözlem sayısı sınırlı.")
+        if model_name in ["LSTM", "GRU"]:
+            if n_obs < 36:
+                score -= 22.0
+                reasons.append("Derin öğrenme için gözlem sayısı sınırlı.")
+            if intermittency >= 0.30:
+                score -= 14.0
+                reasons.append("Aralıklı yapı derin öğrenme modellerini zayıflatabilir.")
+            dl_pack = (outputs.get(model_name.lower()) or {})
+            overfit_gap = safe_float((dl_pack.get("overfit_summary") or {}).get("overfit_gap_ratio", np.nan))
+            if pd.notna(overfit_gap) and overfit_gap > 0.25:
+                score -= min(18.0, 36.0 * float(overfit_gap))
+                reasons.append("Train/validation ayrışması yüksek; overfitting riski var.")
+            if bool(dl_pack.get("fallback_used", False)):
+                score -= 18.0
+                reasons.append("Derin öğrenme modeli fallback ile tamamlandı.")
         if model_name == "Ensemble":
             metric_row = metrics_df.loc[metrics_df["model"] == model_name] if len(metrics_df) else pd.DataFrame()
             champion_row = metrics_df.sort_values(["WAPE", "sMAPE"], ascending=[True, True]).head(1)
@@ -10093,6 +10430,39 @@ def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str,
         return pd.DataFrame(columns=["Rapor", "SatırSayısı", "KolonSayısı", "Kolonlar"])
     return pd.DataFrame(rows).sort_values(["Rapor"], ascending=[True]).reset_index(drop=True)
 
+
+def build_dl_model_analysis(outputs: Dict[str, Any], profile: Dict[str, Any]) -> pd.DataFrame:
+    rows=[]
+    metrics_df=outputs.get("metrics_df", pd.DataFrame()).copy()
+    if len(metrics_df)==0:
+        return pd.DataFrame(columns=["model","analysis"])
+    best_hold=float(pd.to_numeric(metrics_df.get("WAPE"), errors="coerce").min()) if len(metrics_df) else np.nan
+    for model_name in ["LSTM","GRU"]:
+        row=metrics_df.loc[metrics_df["model"].astype(str)==model_name].head(1)
+        if len(row)==0:
+            continue
+        row=row.iloc[0]
+        notes=[]
+        hold_wape=safe_float(row.get("WAPE", np.nan))
+        val_df=outputs.get("validation_metrics_df", pd.DataFrame())
+        val_row=val_df.loc[val_df["model"].astype(str)==model_name].head(1) if isinstance(val_df,pd.DataFrame) else pd.DataFrame()
+        val_wape=safe_float(val_row.iloc[0].get("val_WAPE", np.nan)) if len(val_row) else np.nan
+        overfit_gap=safe_float(((outputs.get(model_name.lower()) or {}).get("overfit_summary") or {}).get("overfit_gap_ratio", np.nan))
+        if pd.notna(hold_wape) and pd.notna(best_hold):
+            notes.append("Holdout performansı lider modellere çok yakın veya daha iyi." if hold_wape <= best_hold + 0.5 else "Holdout performansı klasik/ML lider modellere göre daha zayıf.")
+        if pd.notna(val_wape) and pd.notna(hold_wape):
+            notes.append("İç doğrulama ile holdout arasında ciddi ayrışma yok; genelleme kabul edilebilir." if val_wape <= hold_wape + 1.0 else "Validation-holdout farkı yüksek; yapı daha kırılgan olabilir.")
+        if pd.notna(overfit_gap):
+            notes.append("Epoch-loss ayrışması overfitting riskine işaret ediyor." if overfit_gap > 0.25 else "Epoch-loss davranışı aşırı overfitting göstermiyor.")
+        if float(profile.get("seasonality_strength",0) or 0) >= 0.35:
+            notes.append("Seri sezonsal; DL modeli zaman penceresi ile bu yapıyı kısmen öğrenebilir.")
+        if float(profile.get("cv",0) or 0) >= 0.45:
+            notes.append("Seri oynak; DL modeli esneklik kazanabilir ancak daha fazla gözlem ister.")
+        if not notes:
+            notes.append("DL modeli anlamlı fark üretmedi; klasik ve ağaç tabanlı adaylarla birlikte değerlendirilmelidir.")
+        rows.append({"model": model_name, "analysis": " ".join(notes)})
+    return pd.DataFrame(rows)
+
 def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
     ensure_forecasting_runtime_dependencies(include_streamlit=False)
     progress_log("Pipeline Hazırlık", f"{target_col} için forecasting pipeline başlatıldı.", target=target_col, extra={"horizon": int(horizon)})
@@ -10127,7 +10497,7 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     ml_train_X = train_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=train_feat.index)
     ml_test_X = test_feat[ml_feature_cols] if ml_feature_cols else pd.DataFrame(index=test_feat.index)
     progress_log("Özellik Hazırlığı", "Exog ve ML özellik setleri hazırlandı.", level="SUCCESS", target=target_col, extra={"stat_exog": len(stat_exog_cols), "prophet_exog": len(prophet_exog_cols), "ml_features": len(ml_feature_cols)})
-    outputs = {"metadata": {"target_col": target_col, "freq_alias": freq_alias, "horizon": horizon, "profile": profile, "segment": seg["label"], "abc_xyz": seg["abc_xyz"], "priority": recommend_model_priority(profile), "candidate_models": recommend_candidate_models(profile), "stat_exog_cols": stat_exog_cols, "prophet_exog_cols": prophet_exog_cols, "ml_feature_cols": ml_feature_cols, "runtime_guardrails": build_runtime_guardrail_notes(freq_alias, len(train_df), horizon, stat_exog_cols, prophet_exog_cols), "train_n": int(len(train_df)), "test_n": int(len(test_df)), "search_accelerator_enabled": bool(SEARCH_ACCELERATOR.config.enabled), "search_accelerator_pipeline_cache_hit": False}, "train": train_df, "test": test_df, "metrics": [], "predictions": {}, "tables": {}}
+    outputs = {"metadata": {"target_col": target_col, "freq_alias": freq_alias, "horizon": horizon, "profile": profile, "segment": seg["label"], "abc_xyz": seg["abc_xyz"], "priority": recommend_model_priority(profile), "candidate_models": recommend_candidate_models(profile), "stat_exog_cols": stat_exog_cols, "prophet_exog_cols": prophet_exog_cols, "ml_feature_cols": ml_feature_cols, "runtime_guardrails": build_runtime_guardrail_notes(freq_alias, len(train_df), horizon, stat_exog_cols, prophet_exog_cols), "train_n": int(len(train_df)), "test_n": int(len(test_df)), "search_accelerator_enabled": bool(SEARCH_ACCELERATOR.config.enabled), "search_accelerator_pipeline_cache_hit": False}, "train": train_df, "test": test_df, "metrics": [], "predictions": {}, "tables": {}, "deep_learning_analysis": pd.DataFrame()}
     def _wrap_model_run(label: str, fn):
         progress_log("Model Araması", f"{label} modeli için arama / fit süreci başladı.", target=target_col, extra={"model": label})
         start = time.perf_counter(); error = None
@@ -10156,15 +10526,17 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     progress_log("Model Araması", "Model aileleri paralel olarak başlatılıyor.", target=target_col)
     family_outputs = SEARCH_ACCELERATOR.run_parallel_tasks({
         "xgboost": lambda: _wrap_model_run("XGBoost", lambda: fit_xgboost_forecast(train_df, test_df, ml_train_X, ml_test_X, freq_alias=freq_alias)),
+        "lstm": lambda: _wrap_model_run("LSTM", lambda: fit_deep_learning_forecast(train_df, test_df, ml_train_X, ml_test_X, freq_alias=freq_alias, model_family="LSTM")),
+        "gru": lambda: _wrap_model_run("GRU", lambda: fit_deep_learning_forecast(train_df, test_df, ml_train_X, ml_test_X, freq_alias=freq_alias, model_family="GRU")),
         "prophet": lambda: _wrap_model_run("Prophet", lambda: fit_best_prophet(train_df, test_df, freq_alias, profile, prophet_exog_train, prophet_exog_test) if HAS_PROPHET else build_model_level_fallback("Prophet", train_df, test_df, freq_alias, "prophet paketi yüklü değil")),
         "sarima": lambda: _wrap_model_run("SARIMA/SARIMAX", lambda: fit_best_sarimax(train_df, test_df, freq_alias, profile, stat_exog_train, stat_exog_test)),
         "arima": lambda: _wrap_model_run("ARIMA", lambda: fit_best_arima(train_df, test_df, freq_alias, profile)),
         "intermittent": lambda: _wrap_model_run("Intermittent", lambda: fit_best_intermittent(train_df, test_df, freq_alias, profile)),
-    }, max_workers=min(5, FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers))
+    }, max_workers=min(7, FORECAST_RUNTIME_CONFIG.search_accelerator_max_workers))
     progress_log("Model Araması", "Tüm model aileleri tamamlandı.", level="SUCCESS", target=target_col)
     model_errors, stage_timings = {}, {}
-    alias_map = {"xgboost": "xgboost", "prophet": "prophet", "sarima": "sarima", "arima": "arima", "intermittent": "intermittent"}
-    for key, label in [("xgboost", "XGBoost"), ("prophet", "Prophet"), ("sarima", "SARIMA/SARIMAX"), ("arima", "ARIMA"), ("intermittent", "Intermittent")]:
+    alias_map = {"xgboost": "xgboost", "lstm": "lstm", "gru": "gru", "prophet": "prophet", "sarima": "sarima", "arima": "arima", "intermittent": "intermittent"}
+    for key, label in [("xgboost", "XGBoost"), ("lstm", "LSTM"), ("gru", "GRU"), ("prophet", "Prophet"), ("sarima", "SARIMA/SARIMAX"), ("arima", "ARIMA"), ("intermittent", "Intermittent")]:
         block = family_outputs[key]
         if block["error"]:
             model_errors[label] = block["error"]
@@ -10178,6 +10550,8 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         extract_validation_metrics_from_result("ARIMA", outputs["arima"]),
         extract_validation_metrics_from_result("Prophet", outputs["prophet"]),
         extract_validation_metrics_from_result("XGBoost", outputs["xgboost"]),
+        extract_validation_metrics_from_result("LSTM", outputs["lstm"]),
+        extract_validation_metrics_from_result("GRU", outputs["gru"]),
         extract_validation_metrics_from_result("Intermittent", outputs["intermittent"]),
     ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
     outputs["validation_metrics_df"] = validation_df
@@ -10203,11 +10577,14 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     outputs["stage_timing_table"] = build_stage_timer_rows(stage_timings)
     outputs["fallback_summary"] = pd.DataFrame([
         {"model": "XGBoost", "fallback_used": bool((outputs.get("xgboost") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("xgboost") or {}).get("fallback_method")},
+        {"model": "LSTM", "fallback_used": bool((outputs.get("lstm") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("lstm") or {}).get("fallback_method")},
+        {"model": "GRU", "fallback_used": bool((outputs.get("gru") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("gru") or {}).get("fallback_method")},
         {"model": "Prophet", "fallback_used": bool((outputs.get("prophet") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("prophet") or {}).get("fallback_method")},
         {"model": "SARIMA/SARIMAX", "fallback_used": bool((outputs.get("sarima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("sarima") or {}).get("fallback_method")},
         {"model": "ARIMA", "fallback_used": bool((outputs.get("arima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("arima") or {}).get("fallback_method")},
         {"model": "Intermittent", "fallback_used": bool((outputs.get("intermittent") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("intermittent") or {}).get("fallback_method")},
     ])
+    outputs["deep_learning_analysis"] = build_dl_model_analysis(outputs, profile)
     prophet_info = outputs.get("prophet") or {}
     if bool(prophet_info.get("fallback_used", False)):
         progress_log("Prophet Kontrolü", "Prophet gerçek fit yerine fallback ile tamamlandı.", level="WARNING", target=target_col, extra={"fallback_method": prophet_info.get("fallback_method")})
@@ -10662,6 +11039,18 @@ def run_rolling_origin_backtest_full(export_payload: Dict[str, pd.DataFrame], ta
         except Exception:
             pass
         try:
+            res = fit_deep_learning_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias, model_family="LSTM")
+            model_results["LSTM"] = res
+            _record("LSTM", np.asarray(res["forecast"], dtype=float))
+        except Exception:
+            pass
+        try:
+            res = fit_deep_learning_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias, model_family="GRU")
+            model_results["GRU"] = res
+            _record("GRU", np.asarray(res["forecast"], dtype=float))
+        except Exception:
+            pass
+        try:
             pred_map = {k: operational_bias_peak_postprocess(tr["y"], np.asarray(v["forecast"], dtype=float), freq_alias=freq_alias, model_name=k, profile=profile) for k, v in model_results.items()}
             metrics_rows = [build_model_metrics(k, tr["y"].values, te["y"].values, v) for k, v in pred_map.items()]
             val_rows = [extract_validation_metrics_from_result(k, model_results[k]) for k in model_results.keys()]
@@ -10725,7 +11114,7 @@ def enforce_hard_feature_contract_gate(eligibility_df: pd.DataFrame, feature_aud
         if len(part) == 0:
             return False
         return bool((part["availability_status"].astype(str) != "future_known").any())
-    for model_name, area in [("XGBoost", "ml"), ("Prophet", "prophet")]:
+    for model_name, area in [("XGBoost", "ml"), ("LSTM", "ml"), ("GRU", "ml"), ("Prophet", "prophet")]:
         idx = out.index[out["model"] == model_name]
         if len(idx) == 0:
             continue
@@ -11157,7 +11546,7 @@ def render_streamlit_app():
     if fig is not None:
         st.plotly_chart(fig, width="stretch")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Şampiyon-Meydan Okuyan ve Ansambl", "Gerçek vs Tahmin", "Geri Test Panosu", "Üretim Yönetişimi", "Önişleme Denetimleri", "Akıllı Değerlendirmeler"])
+    tab1, tab2, tab3, tab3b, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Derin Öğrenme (LSTM/GRU)", "Şampiyon-Meydan Okuyan ve Ansambl", "Gerçek vs Tahmin", "Geri Test Panosu", "Üretim Yönetişimi", "Önişleme Denetimleri", "Akıllı Değerlendirmeler"])
 
     with tab1:
         sarima = outputs.get("sarima")
@@ -11204,6 +11593,42 @@ def render_streamlit_app():
                 st.dataframe(style_metric_dataframe(outputs["xgboost"]["strategy_comparison"]), width="stretch")
             if len(outputs["xgboost"].get("feature_importance", pd.DataFrame())):
                 st.dataframe(outputs["xgboost"]["feature_importance"], width="stretch")
+
+
+    with tab3b:
+        dl_subtabs = st.tabs(["LSTM", "GRU", "DL Analizi"])
+        for dl_name, dl_tab in [("LSTM", dl_subtabs[0]), ("GRU", dl_subtabs[1])]:
+            with dl_tab:
+                dl_key = dl_name.lower()
+                dl_pack = outputs.get(dl_key, {}) or {}
+                if dl_name not in outputs.get("tables", {}):
+                    st.warning(outputs.get("model_errors", {}).get(dl_name, f"{dl_name} sonucu üretilemedi."))
+                else:
+                    st.json({"selected_config": dl_pack.get("selected_config"), "transform": dl_pack.get("transform"), "used_exog_cols": dl_pack.get("used_exog_cols"), "validation_wape": dl_pack.get("validation_wape"), "validation_smape": dl_pack.get("validation_smape"), "fallback_used": dl_pack.get("fallback_used"), "fallback_method": dl_pack.get("fallback_method")})
+                    st.markdown(f"**{dl_name} gerçek ve tahmin tablosu**")
+                    st.dataframe(style_metric_dataframe(outputs["tables"][dl_name]), width="stretch")
+                    fig_dl = plot_forecast_results(outputs["train"], outputs["test"], {dl_name: outputs["predictions"][dl_name]}, f"{target_col} - {dl_name}", model_style_map=outputs.get("model_gorsel_stil_haritasi", {}))
+                    if fig_dl is not None:
+                        st.plotly_chart(fig_dl, width="stretch")
+                    if isinstance(dl_pack.get("search_table"), pd.DataFrame) and len(dl_pack.get("search_table")) > 0:
+                        st.markdown(f"**{dl_name} arama tablosu**")
+                        st.dataframe(style_metric_dataframe(dl_pack.get("search_table")), width="stretch")
+                    hist_df = dl_pack.get("history_df", pd.DataFrame())
+                    if isinstance(hist_df, pd.DataFrame) and len(hist_df) > 0:
+                        st.markdown(f"**{dl_name} epoch-loss geçmişi**")
+                        st.dataframe(style_metric_dataframe(hist_df), width="stretch")
+                        fig_loss = build_dl_loss_curve(hist_df, f"{target_col} - {dl_name} Epoch-Loss")
+                        if fig_loss is not None:
+                            st.plotly_chart(fig_loss, width="stretch")
+                    if dl_pack.get("overfit_summary"):
+                        st.markdown(f"**{dl_name} overfitting kontrol özeti**")
+                        st.json(dl_pack.get("overfit_summary"))
+        with dl_subtabs[2]:
+            dl_analysis_df = outputs.get("deep_learning_analysis", pd.DataFrame())
+            if isinstance(dl_analysis_df, pd.DataFrame) and len(dl_analysis_df) > 0:
+                st.dataframe(dl_analysis_df, width="stretch")
+            else:
+                st.info("DL karşılaştırma analizi üretilemedi.")
 
     with tab4:
         st.markdown("**Karar hiyerarşisi özeti**")
@@ -11290,6 +11715,8 @@ def render_streamlit_app():
             suggestions.append("SARIMA residual white-noise testi zayıf; challenger olarak Prophet veya XGBoost önceliklendirilmeli.")
         if outputs.get("best_model") == "Ensemble":
             suggestions.append("Bu seride tek bir champion yerine ensemble daha iyi; operasyonel kullanımda champion-challenger izleme önerilir.")
+        if outputs.get("best_model") in ["LSTM", "GRU"]:
+            suggestions.append("Derin öğrenme modeli öne çıktı; epoch-loss eğrileri ve validation-holdout ayrışması özellikle kontrol edilmelidir.")
         if not suggestions:
             suggestions.append("Seri dengeli; champion-challenger ve ensemble izlemesi yeterli görünüyor.")
         for s in suggestions:
