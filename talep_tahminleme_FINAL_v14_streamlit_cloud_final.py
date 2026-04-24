@@ -5541,11 +5541,11 @@ class ForecastRuntimeConfig:
 
     # Residual-DL: for short/marginal monthly histories, recurrent DL learns
     # residuals over a train-only SARIMA/seasonal base rather than the whole
-    # demand level from scratch. This is a challenger/research mode, not a
-    # hidden override of LSTM/GRU outputs.
+    # demand level from scratch. In thesis mode it remains visible in the DL
+    # tables whenever sequence construction is technically possible.
     dl_residual_mode_for_monthly_short_series: bool = True
     dl_residual_mode_train_n_upper: int = 96
-    dl_residual_mode_min_train_n: int = 72
+    dl_residual_mode_min_train_n: int = 24
     dl_residual_base_preference: str = "sarima_then_seasonal"
 
     # Family-specific DL search governance:
@@ -5612,13 +5612,14 @@ class ForecastRuntimeConfig:
     dl_require_tensorflow_backend_for_real_recurrent: bool = True
     dl_tensorflow_missing_public_state: str = "research_surrogate_only_real_dl_not_trained"
 
-    # Academic/operational honesty rule for monthly short histories:
-    # train_n < 96  -> LSTM/GRU may be shown only as challenger/research, never champion.
-    # train_n < 72  -> real LSTM/GRU is not trained for public ranking; diagnostic fallback only.
-    dl_short_monthly_policy_enabled: bool = True
+    # Thesis/monthly model visibility rule:
+    # All model families must be trained/evaluated when possible and shown in thesis tables.
+    # The old hard monthly short-series block is disabled by default; short-sample risk is
+    # reported as a warning/interpretation field, not used to hide LSTM/GRU predictions.
+    dl_short_monthly_policy_enabled: bool = False
     dl_monthly_challenger_only_train_observations: int = 96
     dl_monthly_no_rank_train_observations: int = 72
-    dl_monthly_no_rank_skip_real_training: bool = True
+    dl_monthly_no_rank_skip_real_training: bool = False
     search_accelerator_enabled: bool = True
     search_accelerator_model_parallel: bool = True
     search_accelerator_candidate_parallel: bool = True
@@ -9600,90 +9601,64 @@ def dl_family_score_adjustment(cfg: Dict[str, Any], model_family: str, val_len: 
 
 def get_dl_short_monthly_policy(freq_alias: str, train_len: int, model_family: str = "LSTM") -> Dict[str, Any]:
     """
-    Hard policy for monthly short histories, based only on training length.
+    Non-blocking monthly DL visibility policy for thesis/makale workflows.
 
-    Rules:
-      - Monthly train_n < 72: do not train/publish real LSTM/GRU for ranking.
-      - Monthly 72 <= train_n < 96: real DL may be trained, but only as
-        challenger/research; it is not eligible to become champion or enter
-        production ranking.
-      - Otherwise: normal guarded DL eligibility still applies.
+    Earlier versions used train_n < 72 / train_n < 96 as a hard exclusion rule.
+    That is not appropriate when the academic requirement is to report what DL
+    actually did on monthly data. Therefore this policy never prevents real
+    LSTM/GRU training and never removes their predictions from thesis tables.
+
+    It only adds interpretation labels:
+      - monthly_short_visible: train_n < 72
+      - monthly_marginal_visible: 72 <= train_n < 96
+      - monthly_sufficient_visible: train_n >= 96
     """
     cfg = FORECAST_RUNTIME_CONFIG
     family = str(model_family or "").upper()
     fa = str(freq_alias or "").upper()
     n = max(0, int(train_len))
-    if family not in {"LSTM", "GRU"} or not bool(getattr(cfg, "dl_short_monthly_policy_enabled", True)) or fa != "M":
-        return {
-            "active": False,
-            "freq_alias": fa,
-            "model_family": family,
-            "train_observations": n,
-            "policy_state": "not_applicable",
-            "train_real_dl_allowed": True,
-            "eligible_for_model_ranking": True,
-            "champion_eligible": True,
-            "production_role": "normal_guarded_candidate",
-            "ranking_exclusion_reason": None,
-        }
-
     no_rank_thr = int(getattr(cfg, "dl_monthly_no_rank_train_observations", 72))
     challenger_thr = int(getattr(cfg, "dl_monthly_challenger_only_train_observations", 96))
-    skip_training = bool(getattr(cfg, "dl_monthly_no_rank_skip_real_training", True))
 
-    if n < no_rank_thr:
-        return {
-            "active": True,
-            "freq_alias": fa,
-            "model_family": family,
-            "train_observations": n,
-            "policy_state": "monthly_train_n_lt_72_no_public_ranking",
-            "train_real_dl_allowed": not skip_training,
-            "skip_real_training": skip_training,
-            "eligible_for_model_ranking": False,
-            "champion_eligible": False,
-            "production_role": "research_surrogate_only",
-            "ranking_exclusion_reason": (
-                f"Aylık kısa seri kuralı: train_n={n} < {no_rank_thr}. "
-                "Gerçek LSTM/GRU public sıralamaya alınmaz; araştırma/surrogate-only veya DL-fallback olarak raporlanır."
-            ),
-        }
-
-    if n < challenger_thr:
-        return {
-            "active": True,
-            "freq_alias": fa,
-            "model_family": family,
-            "train_observations": n,
-            "policy_state": "monthly_train_n_lt_96_challenger_research_only",
-            "train_real_dl_allowed": True,
-            "skip_real_training": False,
-            "eligible_for_model_ranking": False,
-            "champion_eligible": False,
-            "production_role": "challenger_research_only",
-            "ranking_exclusion_reason": (
-                f"Aylık kısa seri kuralı: train_n={n} < {challenger_thr}. "
-                "LSTM/GRU yalnız challenger/research mode; champion veya normal ranking adayı olamaz."
-            ),
-        }
+    if family not in {"LSTM", "GRU"} or fa != "M":
+        state = "not_applicable"
+        comment = None
+    elif n < no_rank_thr:
+        state = "monthly_short_visible_no_hard_block"
+        comment = (
+            f"Aylık kısa seri: train_n={n} < {no_rank_thr}. "
+            "Bu artık hard-block değildir; LSTM/GRU gerçek eğitim denenir, "
+            "çıkan tahmin ve metrikler tez tablosunda raporlanır. Yorumda yüksek varyans/overfitting riski belirtilir."
+        )
+    elif n < challenger_thr:
+        state = "monthly_marginal_visible_no_hard_block"
+        comment = (
+            f"Aylık marjinal seri: train_n={n} < {challenger_thr}. "
+            "LSTM/GRU eğitilir ve raporlanır; sonuçlar klasik/ML modellerle birlikte görünür, "
+            "ancak kısa örneklem riski yorum alanında açıklanır."
+        )
+    else:
+        state = "monthly_sufficient_visible"
+        comment = "Aylık seri DL eğitimi için göreli olarak daha elverişli; yine de rolling validation ve overfit kontrolleri yorumlanır."
 
     return {
-        "active": True,
+        "active": bool(fa == "M" and family in {"LSTM", "GRU"}),
         "freq_alias": fa,
         "model_family": family,
         "train_observations": n,
-        "policy_state": "monthly_train_n_gte_96_normal_guarded",
+        "policy_state": state,
         "train_real_dl_allowed": True,
         "skip_real_training": False,
         "eligible_for_model_ranking": True,
         "champion_eligible": True,
-        "production_role": "normal_guarded_candidate",
+        "production_role": "visible_model_candidate",
         "ranking_exclusion_reason": None,
+        "monthly_sample_warning": comment,
+        "short_monthly_hard_block_removed": True,
     }
 
-
 def apply_dl_short_monthly_policy_to_result(result: Dict[str, Any], policy: Dict[str, Any], model_family: str) -> Dict[str, Any]:
-    """Attach monthly short-series policy metadata and enforce rankability."""
+    """Attach monthly sample-risk metadata without hiding or blocking DL predictions."""
     out = copy.deepcopy(result) if isinstance(result, dict) else {}
     policy = policy or {}
     family = str(model_family or policy.get("model_family") or "").upper()
@@ -9693,30 +9668,33 @@ def apply_dl_short_monthly_policy_to_result(result: Dict[str, Any], policy: Dict
     out["dl_short_monthly_policy"] = dict(policy)
     out["dl_short_monthly_policy_state"] = policy.get("policy_state")
     out["dl_train_observations"] = int(policy.get("train_observations", 0) or 0)
-    out["dl_production_role"] = policy.get("production_role", out.get("dl_production_role", "normal_guarded_candidate"))
-    out["dl_champion_eligible"] = bool(policy.get("champion_eligible", out.get("eligible_for_model_ranking", True)))
-    out["dl_research_only"] = bool(out.get("dl_production_role") in {"challenger_research_only", "research_surrogate_only"})
+    out["dl_monthly_sample_warning"] = policy.get("monthly_sample_warning")
+    out["short_monthly_hard_block_removed"] = True
 
-    if not bool(policy.get("eligible_for_model_ranking", True)):
-        reason = str(policy.get("ranking_exclusion_reason") or "DL short-monthly policy excluded model from normal ranking.")
-        out["eligible_for_model_ranking"] = False
-        out["ranking_exclusion_reason"] = reason
-        out["strict_dl_rejection_reason"] = out.get("strict_dl_rejection_reason") or reason
-        # A model can still be genuinely trained, but it is not a champion/ranking
-        # candidate in this data regime. Preserve dl_strict_validation_passed if
-        # true so the user can see that training happened; block only ranking.
-        note = str(out.get("model_identity_note") or "")
-        add = f" Kısa aylık seri politikası uygulandı: {reason}"
-        out["model_identity_note"] = (note + add).strip()
-        stbl = out.get("search_table")
-        if isinstance(stbl, pd.DataFrame):
-            stbl = stbl.copy()
-            stbl["monthly_short_series_policy_state"] = policy.get("policy_state")
-            stbl["ranking_excluded_by_monthly_short_series_policy"] = True
-            stbl["ranking_exclusion_reason"] = reason
-            out["search_table"] = stbl
+    # Never let the old monthly train_n<72/train_n<96 rule erase a forecast, metric,
+    # or thesis-table row. Eligibility can still be controlled by true technical
+    # failures such as missing backend, failed fit, surrogate/fallback identity, or
+    # explicit production safety gates, but not by the monthly short-sample rule.
+    if bool(out.get("real_dl_trained", False)) and not bool(out.get("fallback_used", False)) and not bool(out.get("surrogate_used", False)):
+        out["eligible_for_model_ranking"] = True
+        out["dl_champion_eligible"] = True
+        out["dl_research_only"] = False
+        out["dl_production_role"] = "visible_model_candidate"
+        old_reason = str(out.get("strict_dl_rejection_reason") or "")
+        if "monthly_train_n_lt" in old_reason or "Aylık train_n" in old_reason or "kısa aylık" in old_reason.lower():
+            out["strict_dl_rejection_reason"] = None
+            out["ranking_exclusion_reason"] = None
+
+    stbl = out.get("search_table")
+    if isinstance(stbl, pd.DataFrame):
+        stbl = stbl.copy()
+        stbl["monthly_short_series_policy_state"] = policy.get("policy_state")
+        stbl["monthly_short_series_hard_block_removed"] = True
+        stbl["monthly_sample_warning"] = policy.get("monthly_sample_warning")
+        # Backward-compatible column kept, but now false.
+        stbl["ranking_excluded_by_monthly_short_series_policy"] = False
+        out["search_table"] = stbl
     return out
-
 
 def finalize_tf_missing_research_only_result(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, model_family: str, reason: str) -> Dict[str, Any]:
     """
@@ -11148,8 +11126,12 @@ def quarantine_non_real_dl_result(result: Dict[str, Any], test_len: int, model_f
     except Exception:
         original_forecast = np.full(int(test_len), np.nan, dtype=float)
     out["operational_fallback_forecast"] = original_forecast.copy()
-    out["forecast"] = np.full(int(test_len), np.nan, dtype=float)
-    out["raw_forecast"] = np.full(int(test_len), np.nan, dtype=float)
+    # Thesis/makale visibility mode: keep the generated DL-family forecast visible
+    # in tables even when it is not accepted as a verified real LSTM/GRU output.
+    # Identity/status columns explicitly state that it is fallback/surrogate/non-real.
+    out["forecast"] = original_forecast.copy()
+    out["raw_forecast"] = original_forecast.copy()
+    out["forecast_visible_for_thesis"] = True
     out["validation_wape"] = np.nan
     out["validation_smape"] = np.nan
     out["eligible_for_model_ranking"] = False
@@ -11163,13 +11145,13 @@ def quarantine_non_real_dl_result(result: Dict[str, Any], test_len: int, model_f
     out["surrogate_selection_metric"] = None
     out["dl_test_set_surrogate_override_removed"] = True
     out["dl_never_compare_surrogate_to_holdout"] = True
-    out["leakage_guard"] = "quarantined_no_public_metric_no_holdout_selection"
-    out["dl_result_kind"] = "quarantined_not_real_dl"
-    out["dl_runtime_state"] = "excluded_from_public_lstm_gru_metrics"
+    out["leakage_guard"] = "quarantined_but_forecast_visible_for_thesis_no_holdout_selection"
+    out["dl_result_kind"] = "quarantined_not_real_dl_forecast_visible_for_thesis"
+    out["dl_runtime_state"] = "not_real_dl_but_forecast_visible_for_thesis_tables"
     out["model_identity_note"] = (
         f"{model_family} gerçek recurrent DL eğitimi olarak doğrulanamadı. "
-        "Fallback/surrogate/baseline değerleri LSTM/GRU metriği gibi kullanılmadı; "
-        "yalnızca operational_fallback_forecast alanında audit için saklandı. "
+        "Fallback/surrogate/baseline değerleri gerçek LSTM/GRU olarak yorumlanmamalıdır; "
+        "tez görünürlüğü için forecast tablosunda tutulur ve ayrıca operational_fallback_forecast alanında audit için saklanır. "
         f"Sebep: {reason}"
     )
     if "history_df" not in out or not isinstance(out.get("history_df"), pd.DataFrame):
@@ -11280,7 +11262,7 @@ def enforce_no_posthoc_surrogate_override(result: Dict[str, Any], model_family: 
 # =========================================================
 
 def _dl_should_use_residual_mode(freq_alias: str, train_len: int, model_family: str, policy: Optional[Dict[str, Any]] = None) -> bool:
-    """Use residual-DL only for short/marginal monthly real-DL challenger regimes."""
+    """Use residual-DL/ADL for monthly short or marginal regimes whenever enough observations exist to build sequences."""
     cfg = FORECAST_RUNTIME_CONFIG
     family = str(model_family or "").upper()
     if family not in {"LSTM", "GRU"}:
@@ -11290,7 +11272,7 @@ def _dl_should_use_residual_mode(freq_alias: str, train_len: int, model_family: 
     if str(freq_alias or "").upper() != "M":
         return False
     n = int(train_len or 0)
-    lo = int(getattr(cfg, "dl_residual_mode_min_train_n", 72))
+    lo = int(getattr(cfg, "dl_residual_mode_min_train_n", 24))
     hi = int(getattr(cfg, "dl_residual_mode_train_n_upper", 96))
     if n < lo or n >= hi:
         return False
@@ -11425,7 +11407,9 @@ def _apply_dl_contextual_suitability_gate(result: Dict[str, Any], model_family: 
         margin = float(getattr(FORECAST_RUNTIME_CONFIG, "dl_normal_sample_min_baseline_improvement_pct", 0.0) or 0.0)
         if w_mean > base * (1.0 - margin):
             reasons.append(f"rolling DL WAPE did not beat train-only baseline: dl={w_mean:.4f}, baseline={base:.4f}")
-    if bool(out.get("dl_research_only", False)) or out.get("dl_production_role") in {"challenger_research_only", "research_surrogate_only"}:
+    # Do not block thesis visibility/ranking merely because the series is monthly-short.
+    # True technical failures are still handled above.
+    if (bool(out.get("dl_research_only", False)) or out.get("dl_production_role") in {"challenger_research_only", "research_surrogate_only"}) and not bool(out.get("short_monthly_hard_block_removed", False)):
         reasons.append("DL production role is research/challenger only")
     if reasons:
         reason = " | ".join(dict.fromkeys([str(r) for r in reasons if r]))
@@ -11958,17 +11942,9 @@ def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, fe
         )
         return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
 
-    if bool(short_monthly_policy.get("skip_real_training", False)) and not bool(short_monthly_policy.get("train_real_dl_allowed", True)):
-        result = _finalize_dl_backend_fallback(
-            build_model_level_fallback(model_family, train_df, test_df, freq_alias, short_monthly_policy.get("ranking_exclusion_reason", "Aylık kısa seri DL için public ranking dışı.")),
-            model_family=model_family,
-            reason=short_monthly_policy.get("ranking_exclusion_reason", "Aylık kısa seri DL için public ranking dışı."),
-            backend_state="monthly_train_n_lt_72_real_dl_not_trained_research_only"
-        )
-        result["dl_runtime_state"] = "monthly_short_series_real_dl_not_trained_research_only"
-        result["dl_result_kind"] = "real_dl_not_trained_monthly_short_series"
-        result["model_identity_class"] = "research_surrogate_only"
-        return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+    # Monthly short-series hard blocking has been removed for thesis/makale visibility.
+    # LSTM/GRU are now trained/evaluated whenever the backend and minimum sequence
+    # construction allow it; short-sample risk is reported, not used to hide outputs.
 
     if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_tensorflow_backend_for_real_recurrent", True)) and not HAS_TF:
         reason = "TensorFlow/Keras bulunamadı; gerçek LSTM/GRU eğitimi yapılmadı."
@@ -13555,7 +13531,13 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         raw_forecast = np.asarray(res.get("forecast", np.array([])), dtype=float)
         res["raw_forecast"] = raw_forecast.copy()
         if is_dl_family and not bool(res.get("dl_strict_validation_passed", False)):
-            res["forecast"] = np.full(len(test_df), np.nan, dtype=float)
+            # Thesis/makale mode: do not silently erase the produced DL-family output.
+            # If it is not real DL, the identity columns explain that clearly and the
+            # fallback/surrogate is also emitted under its separate public name.
+            if raw_forecast.size == len(test_df) and np.isfinite(raw_forecast).any():
+                res["forecast"] = operational_bias_peak_postprocess(train_df["y"], raw_forecast, freq_alias=freq_alias, model_name=public_label, profile=profile)
+            else:
+                res["forecast"] = np.full(len(test_df), np.nan, dtype=float)
         else:
             res["forecast"] = operational_bias_peak_postprocess(train_df["y"], raw_forecast, freq_alias=freq_alias, model_name=public_label, profile=profile)
         if "static_forecast" in res:
@@ -13564,9 +13546,16 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
             except Exception:
                 pass
         if is_dl_family and not bool(res.get("dl_strict_validation_passed", False)):
-            metric = build_invalid_model_metrics(dl_public_real_name(label), res.get("strict_dl_rejection_reason", "strict_real_dl_gate_failed"))
-            metric["eligible_for_model_ranking"] = False
-            metric["ranking_exclusion_reason"] = res.get("strict_dl_rejection_reason", "strict_real_dl_gate_failed")
+            forecast_arr = np.asarray(res.get("forecast", []), dtype=float)
+            if forecast_arr.size == len(test_df) and np.isfinite(forecast_arr).any():
+                metric = build_model_metrics(public_label, train_df["y"].values, test_df["y"].values, res["forecast"])
+                metric["metric_status"] = "DL-family tahmini üretildi; kimlik/kalite durumu ayrıca yorumlanmalı"
+                metric["eligible_for_model_ranking"] = bool(res.get("eligible_for_model_ranking", False))
+                metric["ranking_exclusion_reason"] = res.get("strict_dl_rejection_reason", "strict_real_dl_gate_failed")
+            else:
+                metric = build_invalid_model_metrics(dl_public_real_name(label), res.get("strict_dl_rejection_reason", "strict_real_dl_gate_failed"))
+                metric["eligible_for_model_ranking"] = False
+                metric["ranking_exclusion_reason"] = res.get("strict_dl_rejection_reason", "strict_real_dl_gate_failed")
         else:
             metric = build_model_metrics(public_label, train_df["y"].values, test_df["y"].values, res["forecast"])
             metric["eligible_for_model_ranking"] = bool(res.get("eligible_for_model_ranking", True))
@@ -15689,17 +15678,9 @@ def build_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
                 production_scope = "audit_only"
                 hard_reasons.append("Gerçek TensorFlow/Keras recurrent DL eğitimi doğrulanmadı.")
             elif freq_alias == "M" and train_n < 72:
-                ranking_eligible = False
-                champion_eligible = False
-                audit_only = True
-                production_scope = "audit_only"
-                hard_reasons.append("Aylık train_n < 72; gerçek LSTM/GRU public sıralama dışıdır.")
+                hard_reasons.append("Aylık train_n < 72; kısa seri hard-block kaldırıldı, gerçek DL tahmini/metriği tabloda görünür; yüksek varyans riski yorumlanır.")
             elif freq_alias == "M" and train_n < 96:
-                ranking_eligible = False
-                champion_eligible = False
-                research_only = True
-                production_scope = "research_only"
-                hard_reasons.append("Aylık train_n < 96; LSTM/GRU yalnız challenger/research modunda raporlanır.")
+                hard_reasons.append("Aylık train_n < 96; challenger hard-block kaldırıldı, gerçek DL tahmini/metriği tabloda görünür; marjinal örneklem riski yorumlanır.")
             folds = int(dl_pack.get("rolling_validation_folds", 0) or 0)
             if production_scope == "production" and folds < int(getattr(FORECAST_RUNTIME_CONFIG, "dl_rolling_validation_min_folds", 2)):
                 ranking_eligible = False
@@ -16561,7 +16542,7 @@ except Exception:
 
 _FINAL_AUDIT_MODEL_NAMES = {"DL-fallback", "LSTM-surrogate", "GRU-surrogate"}
 _FINAL_REAL_DL_MODEL_NAMES = {"LSTM", "GRU", "LSTM (real)", "GRU (real)"}
-_FINAL_PRODUCTION_STATUS_BLOCKLIST = {"audit_only", "research_only", "challenger_only", "blocked", "reject", "real_dl_not_trained", "monthly_short_series_blocked"}
+_FINAL_PRODUCTION_STATUS_BLOCKLIST = {"audit_only", "research_only", "challenger_only", "blocked", "reject", "real_dl_not_trained", "monthly_short_series_warning_only"}
 
 
 def _bt_safe_float(x: Any, default: float = np.nan) -> float:
@@ -16709,17 +16690,9 @@ def _bt_force_final_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataF
                 status = "real_dl_not_trained"
                 reasons.append("Gerçek TensorFlow/Keras DL eğitimi doğrulanmadı; fallback/surrogate ayrı audit alanında tutulur.")
             elif freq_alias == "M" and train_n < 72:
-                ranking_eligible = False
-                champion_eligible = False
-                production_scope = "audit_only"
-                status = "monthly_short_series_blocked"
-                reasons.append("Aylık train_n < 72; gerçek LSTM/GRU public sıralamaya alınmaz.")
+                reasons.append("Aylık train_n < 72; kısa seri hard-block kaldırıldı, gerçek DL tahmini/metriği tabloda görünür; yüksek varyans riski yorumlanır.")
             elif freq_alias == "M" and train_n < 96:
-                ranking_eligible = False
-                champion_eligible = False
-                production_scope = "research_only"
-                status = "research_only"
-                reasons.append("Aylık train_n < 96; LSTM/GRU yalnız challenger/research modunda izlenir.")
+                reasons.append("Aylık train_n < 96; challenger hard-block kaldırıldı, gerçek DL tahmini/metriği tabloda görünür; marjinal örneklem riski yorumlanır.")
             folds = int(dl_pack.get("rolling_validation_folds", 0) or 0)
             if production_scope == "production" and folds < 2:
                 ranking_eligible = False
@@ -17686,15 +17659,15 @@ def build_monthly_dl_academic_explanation_table(outputs: Dict[str, Any]) -> pd.D
     })
     if train_n < 72 and freq == "M":
         rows.append({
-            "başlık": "DL eğitim kararı",
-            "bulgu": f"train_n={train_n} < 72 olduğu için gerçek LSTM/GRU public ranking dışında bırakıldı.",
-            "tezde_yazılacak_yorum": "Bu sonuç 'DL başarısız oldu' şeklinde değil, 'aylık kısa seri gerçek DL eğitimi için yeterli veri rejimi sağlamadı' şeklinde yorumlanmalıdır.",
+            "başlık": "DL eğitim ve görünürlük kararı",
+            "bulgu": f"train_n={train_n} < 72 olmasına rağmen kısa seri hard-block kaldırıldı; LSTM/GRU/ADL mümkünse eğitilir ve tahminleri tabloda gösterilir.",
+            "tezde_yazılacak_yorum": "Bu veri rejiminde DL sonuçları mutlaka raporlanabilir; ancak sliding-window sonrası örnek sayısı azaldığı için overfitting, yüksek varyans ve klasik/ML modellere göre zayıf genelleme riski özellikle yorumlanmalıdır.",
         })
     elif train_n < 96 and freq == "M":
         rows.append({
-            "başlık": "DL research/challenger modu",
-            "bulgu": f"train_n={train_n} aralığı 72-95 olduğundan DL yalnız araştırma/challenger rolünde değerlendirilir.",
-            "tezde_yazılacak_yorum": "Bu aralıkta residual-DL daha anlamlıdır; DL ana talep sinyalini sıfırdan öğrenmek yerine güçlü baz modelin residual hatasını öğrenir.",
+            "başlık": "DL aylık marjinal veri rejimi",
+            "bulgu": f"train_n={train_n} aralığı 72-95; kısa seri hard-block kaldırıldığı için DL metrikleri klasik/ML modellerle aynı tabloda görünür.",
+            "tezde_yazılacak_yorum": "Bu aralıkta residual-DL/ADL yorumu özellikle önemlidir; DL ana sinyali sıfırdan öğrenmekte zorlanırsa baz model + residual öğrenme yaklaşımının ne yaptığı ayrıca açıklanmalıdır.",
         })
     else:
         rows.append({
@@ -17704,8 +17677,8 @@ def build_monthly_dl_academic_explanation_table(outputs: Dict[str, Any]) -> pd.D
         })
     rows.append({
         "başlık": "ADL / residual-DL yorumu",
-        "bulgu": "Residual-DL kullanıldı." if any_residual else "Bu çıktı özelinde residual-DL aktif metrik üretmedi veya veri rejimi nedeniyle gerçek DL bloklandı.",
-        "tezde_yazılacak_yorum": "ADL/residual-DL, aylık kısa serilerde DL'nin ana sinyali sıfırdan öğrenme riskini azaltmak için baz model + residual öğrenme yaklaşımıdır. Aktif değilse sebep genellikle train_n eşiği, TensorFlow erişimi veya kalite kapısıdır.",
+        "bulgu": "Residual-DL kullanıldı." if any_residual else "Bu çıktı özelinde residual-DL aktif metrik üretmedi; artık bunun sebebi kısa aylık seri hard-block değildir, backend/sekans/fit/kalite koşulları ayrıca kontrol edilmelidir.",
+        "tezde_yazılacak_yorum": "ADL/residual-DL, aylık kısa serilerde DL'nin ana sinyali sıfırdan öğrenme riskini azaltmak için baz model + residual öğrenme yaklaşımıdır. Aktif değilse TensorFlow erişimi, yeterli sequence oluşumu, rolling validation veya model fit hatası rapordan okunmalıdır.",
     })
     rows.append({
         "başlık": "Üretim ve tez ayrımı",
