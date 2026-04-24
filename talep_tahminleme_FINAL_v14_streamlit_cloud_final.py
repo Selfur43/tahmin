@@ -5420,7 +5420,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.5.8_dl_residual_rolling_status_gate"
 
 
 
@@ -5455,13 +5455,170 @@ class ForecastRuntimeConfig:
     dl_batch_size: int = 6
     dl_validation_ratio: float = 0.20
     dl_sequence_max_exog_cols: int = 16
+
+    # DL input governance:
+    # Recurrent LSTM/GRU must not simply reuse the XGBoost tabular lag/rolling
+    # feature pool. By default the DL channel is sequence-native: the first
+    # tensor channel is always the scaled target history, and optional
+    # covariates are limited to known-in-advance calendar/time encodings.
+    # Lag/rolling/ewm/diff target-engineered tabular columns are blocked from
+    # DL input so recurrent models do not become disguised tabular ML models.
+    dl_sequence_input_mode: str = "sequence_native"  # sequence_native | target_only | legacy_tabular
+    dl_allow_legacy_tabular_exog: bool = False
+    dl_native_include_calendar_covariates: bool = True
+    dl_native_include_time_index_covariates: bool = True
+    dl_native_include_family_marker: bool = True
+    dl_native_max_calendar_covariates: int = 12
+    dl_block_tabular_lag_rolling_exog: bool = True
+    dl_report_input_contract_in_metrics: bool = True
+
     dl_min_train_sequences: int = 12
+    # Generic DL defaults are still kept for backward compatibility, but
+    # LSTM and GRU now use family-specific search spaces below. This prevents
+    # the two recurrent models from becoming practically identical under small
+    # time-series samples.
     dl_window_candidates: Tuple[int, ...] = (3, 4, 6, 9, 12, 18, 24)
     dl_hidden_units: Tuple[int, ...] = (16, 24, 32, 48, 64)
     dl_dropout_values: Tuple[float, ...] = (0.0, 0.10, 0.20, 0.30)
     dl_learning_rates: Tuple[float, ...] = (0.001, 0.0005)
     dl_strategies: Tuple[str, ...] = ("direct", "recursive")
     dl_recent_sample_weight_max: float = 1.60
+
+    # DL data-regime governance:
+    # Short monthly histories (for example 60-70 usable observations) lose many
+    # samples after sliding-window conversion. In that regime, recurrent DL is
+    # allowed only as a guarded challenger: windows must leave enough real
+    # sequences, capacity is capped, training is shorter, and the candidate must
+    # beat a leakage-free inner-validation baseline before it can enter ranking.
+    dl_data_regime_guard_enabled: bool = True
+    dl_monthly_small_sample_observations: int = 72
+    dl_monthly_marginal_sample_observations: int = 96
+    dl_weekly_small_sample_observations: int = 104
+    dl_weekly_marginal_sample_observations: int = 156
+    dl_daily_small_sample_observations: int = 120
+    dl_daily_marginal_sample_observations: int = 180
+    dl_hourly_small_sample_observations: int = 336
+    dl_hourly_marginal_sample_observations: int = 720
+    dl_small_sample_min_train_sequences: int = 18
+    dl_marginal_sample_min_train_sequences: int = 24
+    dl_normal_sample_min_train_sequences: int = 30
+    dl_min_sequences_per_test_step: int = 5
+    dl_small_sample_sequence_ratio: float = 0.35
+    dl_marginal_sample_sequence_ratio: float = 0.30
+    dl_normal_sample_sequence_ratio: float = 0.24
+    dl_small_sample_max_epochs: int = 90
+    dl_small_sample_patience: int = 10
+    dl_marginal_sample_max_epochs: int = 140
+    dl_marginal_sample_patience: int = 16
+    dl_small_sample_min_baseline_improvement_pct: float = 0.03
+    dl_marginal_sample_min_baseline_improvement_pct: float = 0.01
+    dl_reject_short_sample_if_not_better_than_baseline: bool = True
+
+    # Rolling-origin DL validation governance:
+    # DL hyperparameter selection is never based on a single tail split or on
+    # Keras validation_split. Each LSTM/GRU candidate is selected by the mean
+    # score across leakage-free rolling-origin folds built only from train_df.
+    dl_use_rolling_origin_validation: bool = True
+    dl_rolling_validation_max_folds: int = 3
+    dl_rolling_validation_min_folds: int = 2
+    dl_rolling_validation_target_folds: int = 3
+    dl_rolling_validation_horizon_cap: int = 6
+    dl_rolling_validation_min_train_observations: int = 24
+    dl_rolling_validation_fail_if_insufficient_folds: bool = True
+    dl_early_stopping_validation_ratio: float = 0.18
+    dl_min_early_stopping_val_sequences: int = 3
+    dl_keras_shuffle: bool = False
+
+    # DL suitability gate: DL receives no contextual bonus before these gates pass.
+    dl_contextual_suitability_gate_enabled: bool = True
+    dl_require_rolling_validation_stability_for_ranking: bool = True
+    dl_max_rolling_wape_cv_for_ranking: float = 0.60
+    dl_max_overfit_gap_for_ranking: float = 0.35
+    dl_require_real_backend_for_ranking: bool = True
+    dl_require_no_surrogate_for_ranking: bool = True
+    dl_require_baseline_superiority_for_normal_regime: bool = True
+    dl_normal_sample_min_baseline_improvement_pct: float = 0.00
+
+    # Residual-DL: for short/marginal monthly histories, recurrent DL learns
+    # residuals over a train-only SARIMA/seasonal base rather than the whole
+    # demand level from scratch. This is a challenger/research mode, not a
+    # hidden override of LSTM/GRU outputs.
+    dl_residual_mode_for_monthly_short_series: bool = True
+    dl_residual_mode_train_n_upper: int = 96
+    dl_residual_mode_min_train_n: int = 72
+    dl_residual_base_preference: str = "sarima_then_seasonal"
+
+    # Family-specific DL search governance:
+    # - LSTM is treated as the longer-memory, higher-capacity recurrent model.
+    # - GRU is treated as the lighter, faster-adapting recurrent model.
+    # These spaces are intentionally different in window lengths, units,
+    # dropout, learning rate, depth, dense head, batch size and recency weight.
+    dl_family_specific_search_spaces: bool = True
+    dl_lstm_window_candidates_monthly: Tuple[int, ...] = (9, 12, 18, 24)
+    dl_gru_window_candidates_monthly: Tuple[int, ...] = (3, 6, 9, 12)
+    dl_lstm_window_candidates_weekly: Tuple[int, ...] = (8, 13, 26, 39)
+    dl_gru_window_candidates_weekly: Tuple[int, ...] = (4, 8, 13, 18)
+    dl_lstm_window_candidates_daily: Tuple[int, ...] = (14, 28, 42, 56)
+    dl_gru_window_candidates_daily: Tuple[int, ...] = (7, 14, 21, 28)
+    dl_lstm_window_candidates_hourly: Tuple[int, ...] = (24, 48, 72, 96)
+    dl_gru_window_candidates_hourly: Tuple[int, ...] = (12, 24, 36, 48)
+    dl_lstm_hidden_units: Tuple[int, ...] = (32, 48, 64, 96)
+    dl_gru_hidden_units: Tuple[int, ...] = (12, 16, 24, 32, 48)
+    dl_lstm_dropout_values: Tuple[float, ...] = (0.10, 0.20, 0.30, 0.35)
+    dl_gru_dropout_values: Tuple[float, ...] = (0.00, 0.05, 0.10, 0.20)
+    dl_lstm_learning_rates: Tuple[float, ...] = (0.0005, 0.0003, 0.0002)
+    dl_gru_learning_rates: Tuple[float, ...] = (0.0020, 0.0015, 0.0010)
+    dl_lstm_layer_candidates: Tuple[int, ...] = (2, 3)
+    dl_gru_layer_candidates: Tuple[int, ...] = (1, 2)
+    dl_lstm_strategies: Tuple[str, ...] = ("direct",)
+    dl_gru_strategies: Tuple[str, ...] = ("recursive",)
+    dl_lstm_dense_head_ratio: float = 0.75
+    dl_gru_dense_head_ratio: float = 0.50
+    dl_lstm_recurrent_dropout: float = 0.05
+    dl_gru_recurrent_dropout: float = 0.00
+    dl_lstm_weight_decay: float = 3e-4
+    dl_gru_weight_decay: float = 8e-5
+    dl_lstm_batch_size: int = 4
+    dl_gru_batch_size: int = 8
+    dl_lstm_recent_sample_weight_max: float = 1.35
+    dl_gru_recent_sample_weight_max: float = 1.85
+    dl_lstm_family_score_bias: float = 0.000
+    dl_gru_family_score_bias: float = 0.000
+    # Strict DL identity governance:
+    # LSTM/GRU may only be ranked/reported as LSTM/GRU if a real recurrent
+    # backend trained successfully and produced a non-empty epoch-loss history.
+    # Fallback forecasts are preserved only as operational diagnostics and are
+    # never allowed to overwrite or masquerade as real LSTM/GRU output.
+    dl_strict_real_training: bool = True
+    dl_allow_surrogate_models: bool = False
+    dl_quarantine_fallback_from_ranking: bool = True
+    dl_require_nonempty_history: bool = True
+    # Leakage governance:
+    # Test/holdout values must never be used to choose, correct, replace,
+    # or override LSTM/GRU forecasts. Model selection is limited to the
+    # inner validation split created from train_df. Surrogate MLP is sealed.
+    dl_forbid_test_set_model_selection: bool = True
+    dl_forbid_surrogate_override_after_real_fit: bool = True
+    dl_remove_test_set_surrogate_override: bool = True
+    dl_never_compare_surrogate_to_holdout: bool = True
+    dl_surrogate_override_contract_version: str = "no_holdout_surrogate_override_v1"
+    dl_surrogate_mlp_policy: str = "removed_hard_disabled_no_public_metric"
+
+    # DL backend / short-monthly regime hard governance:
+    # TensorFlow/Keras is the only backend allowed to publish LSTM/GRU as real
+    # recurrent DL by default. If TensorFlow is missing, the model is not marked
+    # as failed; it is marked as "real DL not trained" and kept as
+    # research/surrogate-only / DL-fallback diagnostic outside normal ranking.
+    dl_require_tensorflow_backend_for_real_recurrent: bool = True
+    dl_tensorflow_missing_public_state: str = "research_surrogate_only_real_dl_not_trained"
+
+    # Academic/operational honesty rule for monthly short histories:
+    # train_n < 96  -> LSTM/GRU may be shown only as challenger/research, never champion.
+    # train_n < 72  -> real LSTM/GRU is not trained for public ranking; diagnostic fallback only.
+    dl_short_monthly_policy_enabled: bool = True
+    dl_monthly_challenger_only_train_observations: int = 96
+    dl_monthly_no_rank_train_observations: int = 72
+    dl_monthly_no_rank_skip_real_training: bool = True
     search_accelerator_enabled: bool = True
     search_accelerator_model_parallel: bool = True
     search_accelerator_candidate_parallel: bool = True
@@ -5957,16 +6114,19 @@ def apply_target_transform(y: pd.Series, transform_cfg: Dict[str, Any]) -> Tuple
 
 def inverse_target_transform(arr: np.ndarray, transform_cfg: Dict[str, Any]) -> np.ndarray:
     x = np.asarray(arr, dtype=float)
+    transform_cfg = transform_cfg or {}
+    allow_negative = bool(transform_cfg.get("allow_negative_output", False))
     name = transform_cfg.get("name", "none")
     if name == "log1p":
-        return np.maximum(np.expm1(x), 0.0)
+        out = np.expm1(x)
+        return out if allow_negative else np.maximum(out, 0.0)
     if name == "boxcox" and HAS_SCIPY:
         lam = transform_cfg.get("lambda", None)
         shift = float(transform_cfg.get("shift", 0.0) or 0.0)
         inv = inv_boxcox(x, lam)
         inv = inv - shift
-        return np.maximum(inv, 0.0)
-    return np.maximum(x, 0.0)
+        return inv if allow_negative else np.maximum(inv, 0.0)
+    return x if allow_negative else np.maximum(x, 0.0)
 
 def make_inner_train_val_split(train_df: pd.DataFrame, val_ratio: float = 0.2, min_val: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame]:
     n = len(train_df)
@@ -6498,6 +6658,7 @@ def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str,
         "Çalışma süresi - performans özeti": style_metric_dataframe(_df_or_empty(outputs.get("stage_timing_table"))),
         "Model hata özeti": style_metric_dataframe(error_df),
         "Fallback özeti": style_metric_dataframe(_df_or_empty(outputs.get("fallback_summary"))),
+        "DL şeffaflık ve kimlik doğrulama tablosu": style_metric_dataframe(_df_or_empty(outputs.get("dl_transparency_table"))),
         "Otomatik model uygunluk kapısı": style_metric_dataframe(_df_or_empty(prod_pack.get("model_eligibility_gate"))),
         "Karar kademelerine göre model liderleri": style_metric_dataframe(_df_or_empty(build_model_liderleri(outputs))),
         "SARIMA-SARIMAX - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("SARIMA/SARIMAX"))),
@@ -6509,10 +6670,11 @@ def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str,
         "XGBoost - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("search_table"))),
         "XGBoost - Strateji karşılaştırması": style_metric_dataframe(_df_or_empty((outputs.get("xgboost") or {}).get("strategy_comparison"))),
         "XGBoost - Özellik önemleri": _df_or_empty((outputs.get("xgboost") or {}).get("feature_importance")),
-        "LSTM - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("LSTM"))),
+        "LSTM - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("LSTM (real)", outputs.get("tables", {}).get("LSTM")))),
         "LSTM - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("lstm") or {}).get("search_table"))),
         "LSTM - Epoch Loss Geçmişi": style_metric_dataframe(_df_or_empty((outputs.get("lstm") or {}).get("history_df"))),
-        "GRU - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("GRU"))),
+        "LSTM - Eğitim Durumu Tablosu": style_metric_dataframe(_df_or_empty((outputs.get("lstm") or {}).get("dl_training_status_table"))),
+        "GRU - Gerçek ve tahmin tablosu": style_metric_dataframe(_df_or_empty(outputs.get("tables", {}).get("GRU (real)", outputs.get("tables", {}).get("GRU")))),
         "GRU - Arama tablosu": style_metric_dataframe(_df_or_empty((outputs.get("gru") or {}).get("search_table"))),
         "GRU - Epoch Loss Geçmişi": style_metric_dataframe(_df_or_empty((outputs.get("gru") or {}).get("history_df"))),
         "Karar hiyerarşisi özeti": style_metric_dataframe(_df_or_empty(outputs.get("karar_hiyerarsisi"))),
@@ -7545,9 +7707,13 @@ def build_model_visual_style_map(outputs: Optional[Dict[str, Any]] = None) -> Di
         style_map["Prophet"].update({"opacity": 0.28, "width": 1.2, "dash": "dot"})
     for dl_name in ["LSTM", "GRU"]:
         dl_info = outputs.get(dl_name.lower(), {}) if isinstance(outputs, dict) else {}
+        real_name = dl_public_real_name(dl_name)
+        if dl_info and not bool(dl_info.get("dl_strict_validation_passed", False)):
+            style_map.setdefault(real_name, {})
+            style_map[real_name].update({"opacity": 0.32, "width": 1.2, "dash": "dot"})
         if dl_info and bool(dl_info.get("fallback_used", False)):
-            style_map.setdefault(dl_name, {})
-            style_map[dl_name].update({"opacity": 0.32, "width": 1.2, "dash": "dot"})
+            style_map.setdefault("DL-fallback", {})
+            style_map["DL-fallback"].update({"opacity": 0.42, "width": 1.6, "dash": "dot"})
     return style_map
 
 def plot_forecast_results(train_df: pd.DataFrame, test_df: pd.DataFrame, predictions: Dict[str, np.ndarray], title: str, model_style_map: Optional[Dict[str, Dict[str, Any]]] = None):
@@ -7774,35 +7940,45 @@ def sanitize_exog_for_sarimax(exog_train: Optional[pd.DataFrame], exog_test: Opt
 
 
 def build_fallback_forecast(y_train: pd.Series, y_test: pd.Series, freq_alias: str, season_length: int) -> Tuple[np.ndarray, str]:
-    y_train = pd.to_numeric(y_train, errors='coerce').dropna().astype(float).reset_index(drop=True)
-    y_test = pd.to_numeric(y_test, errors='coerce').astype(float).reset_index(drop=True)
-    h = len(y_test)
+    """
+    Leakage-safe fallback forecast.
+
+    Critical rule:
+        y_test is used ONLY to infer the forecast horizon length. Its actual
+        values are never read, scored, ranked, or used to choose a fallback
+        method. This prevents holdout/test leakage and prevents a fallback
+        or surrogate path from silently becoming a test-optimized substitute
+        for a real model.
+    """
+    y_train = pd.to_numeric(y_train, errors="coerce").dropna().astype(float).reset_index(drop=True)
+    try:
+        h = int(len(y_test))
+    except Exception:
+        h = int(y_test) if str(y_test).strip().isdigit() else 0
     if h <= 0:
-        return np.array([], dtype=float), 'empty'
-    methods = []
+        return np.array([], dtype=float), "empty"
+
+    if len(y_train) == 0:
+        return np.zeros(h, dtype=float), "zero_no_train_data"
+
+    season_length = int(season_length or 1)
+    freq_alias = str(freq_alias or "").upper()
+
+    # Deterministic, train-only priority order. No holdout scoring.
     if season_length > 1 and len(y_train) >= season_length:
-        seasonal_vals = y_train.iloc[-season_length:].tolist()
+        seasonal_vals = y_train.iloc[-season_length:].values.astype(float)
         pred = np.array([seasonal_vals[i % season_length] for i in range(h)], dtype=float)
-        methods.append(('seasonal_naive', pred))
-    if len(y_train) >= 2:
-        methods.append(('drift', drift_forecast(y_train, h)))
+        return np.maximum(pred, 0.0), "seasonal_naive_train_only"
+
+    if len(y_train) >= 3:
+        pred = drift_forecast(y_train, h)
+        if np.isfinite(pred).all():
+            return np.maximum(np.asarray(pred, dtype=float), 0.0), "drift_train_only"
+
     if len(y_train) >= 1:
-        methods.append(('last_value', np.repeat(float(y_train.iloc[-1]), h)))
-        methods.append(('mean', np.repeat(float(y_train.mean()), h)))
-    best_name = 'last_value'
-    best_pred = np.repeat(0.0, h)
-    best_score = np.inf
-    actual = y_test.values.astype(float)
-    for name, pred in methods:
-        pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
-        score = wape(actual, pred) + 0.35 * smape(actual, pred)
-        if score < best_score:
-            best_score = score
-            best_name = name
-            best_pred = pred
-    return best_pred, best_name
+        return np.maximum(np.repeat(float(y_train.iloc[-1]), h), 0.0), "last_value_train_only"
 
-
+    return np.zeros(h, dtype=float), "zero_no_train_data"
 
 
 def forecast_with_baseline_name(y_train: pd.Series, horizon: int, freq_alias: str, season_length: int, baseline_name: str) -> np.ndarray:
@@ -7998,6 +8174,8 @@ def fit_best_arima(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: st
 
 
 def extract_validation_metrics_from_result(model_name: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    if normalize_dl_family_label(model_name) in {"LSTM", "GRU"} and isinstance(result, dict) and not bool(result.get("dl_strict_validation_passed", False)):
+        return {"model": model_name, "val_WAPE": np.nan, "val_sMAPE": np.nan, "eligible_for_model_ranking": False, "ranking_exclusion_reason": result.get("strict_dl_rejection_reason")}
     val_w = safe_float(result.get("validation_wape", np.nan))
     val_s = safe_float(result.get("validation_smape", np.nan))
     if pd.isna(val_w):
@@ -9193,7 +9371,23 @@ def build_model_metrics(model_name: str, y_train: np.ndarray, y_true: np.ndarray
 
 
 def build_champion_challenger(metrics_df: pd.DataFrame) -> Dict[str, Any]:
-    ranked = metrics_df.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
+    if not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
+        ranked = pd.DataFrame()
+        return {"champion": None, "challenger": None, "holdout_winner": None, "ranking": ranked}
+
+    ranked = metrics_df.copy()
+    if "eligible_for_model_ranking" in ranked.columns:
+        ranked = ranked.loc[ranked["eligible_for_model_ranking"].fillna(True).astype(bool)].copy()
+    for metric_col in ["WAPE", "sMAPE", "RMSE"]:
+        if metric_col in ranked.columns:
+            ranked[metric_col] = pd.to_numeric(ranked[metric_col], errors="coerce")
+    if "WAPE" in ranked.columns:
+        ranked = ranked.loc[ranked["WAPE"].notna() & np.isfinite(ranked["WAPE"].astype(float))].copy()
+
+    if len(ranked) == 0:
+        return {"champion": None, "challenger": None, "holdout_winner": None, "ranking": ranked.reset_index(drop=True)}
+
+    ranked = ranked.sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
     champion = ranked.iloc[0]["model"] if len(ranked) >= 1 else None
     challenger = ranked.iloc[1]["model"] if len(ranked) >= 2 else None
     return {"champion": champion, "challenger": challenger, "holdout_winner": champion, "ranking": ranked}
@@ -9226,21 +9420,497 @@ def infer_runtime_regime_from_profile(profile: Optional[Dict[str, Any]] = None, 
 
 
 
-def infer_dl_window_candidates(freq_alias: str, train_len: int) -> List[int]:
-    base = list(FORECAST_RUNTIME_CONFIG.dl_window_candidates)
-    fa = str(freq_alias).upper()
-    if fa == "M":
-        base = [4, 6, 12, 18]
-    elif fa == "W":
-        base = [4, 8, 13, 26]
-    elif fa == "D":
-        base = [7, 14, 28]
-    elif fa == "H":
-        base = [24, 48, 72]
-    max_allowed = max(3, min(max(train_len - 2, 3), max(6, train_len // 2)))
-    out=[int(w) for w in base if 3 <= int(w) <= max_allowed]
-    return sorted(set(out or [max(3, min(6, max_allowed))]))
+def infer_dl_window_candidates(freq_alias: str, train_len: int, model_family: Optional[str] = None) -> List[int]:
+    """
+    Backward-compatible window inference.
 
+    When model_family is supplied, LSTM and GRU intentionally receive different
+    candidate windows. This fixes the practical-identical-search-space problem:
+    LSTM is allowed to search longer memory, while GRU focuses on shorter and
+    medium memory windows.
+    """
+    fa = str(freq_alias).upper()
+    fam = str(model_family or "").upper()
+    cfg = FORECAST_RUNTIME_CONFIG
+
+    if bool(getattr(cfg, "dl_family_specific_search_spaces", True)) and fam in {"LSTM", "GRU"}:
+        prefix = "dl_lstm" if fam == "LSTM" else "dl_gru"
+        if fa == "M":
+            base = list(getattr(cfg, f"{prefix}_window_candidates_monthly"))
+        elif fa == "W":
+            base = list(getattr(cfg, f"{prefix}_window_candidates_weekly"))
+        elif fa == "D":
+            base = list(getattr(cfg, f"{prefix}_window_candidates_daily"))
+        elif fa == "H":
+            base = list(getattr(cfg, f"{prefix}_window_candidates_hourly"))
+        else:
+            base = list(getattr(cfg, "dl_window_candidates"))
+    else:
+        base = list(getattr(cfg, "dl_window_candidates"))
+        if fa == "M":
+            base = [4, 6, 12, 18]
+        elif fa == "W":
+            base = [4, 8, 13, 26]
+        elif fa == "D":
+            base = [7, 14, 28]
+        elif fa == "H":
+            base = [24, 48, 72]
+
+    max_allowed = max(3, min(max(int(train_len) - 2, 3), max(6, int(train_len) // 2)))
+    if bool(getattr(cfg, "dl_data_regime_guard_enabled", True)) and fam in {"LSTM", "GRU"}:
+        try:
+            regime = get_dl_data_regime_profile(fa, int(train_len), 1, fam)
+            if regime.get("regime") in {"small_sample", "marginal_sample"}:
+                max_allowed = min(max_allowed, int(regime.get("max_window", max_allowed)))
+        except Exception:
+            pass
+    out = [int(w) for w in base if 3 <= int(w) <= max_allowed]
+    if not out:
+        fallback = max(3, min(6 if fam != "LSTM" else 9, max_allowed))
+        out = [fallback]
+    return sorted(set(out))
+
+
+def get_dl_family_profile(model_family: str) -> Dict[str, Any]:
+    fam = str(model_family).upper()
+    cfg = FORECAST_RUNTIME_CONFIG
+    if fam == "LSTM":
+        return {
+            "family": "LSTM",
+            "search_profile": "long_memory_high_capacity",
+            "units": tuple(getattr(cfg, "dl_lstm_hidden_units", (32, 48, 64, 96))),
+            "dropouts": tuple(getattr(cfg, "dl_lstm_dropout_values", (0.10, 0.20, 0.30))),
+            "learning_rates": tuple(getattr(cfg, "dl_lstm_learning_rates", (0.0007, 0.0005))),
+            "layers": tuple(getattr(cfg, "dl_lstm_layer_candidates", (2, 3))),
+            "strategies": tuple(getattr(cfg, "dl_lstm_strategies", ("direct", "recursive"))),
+            "dense_head_ratio": float(getattr(cfg, "dl_lstm_dense_head_ratio", 0.75)),
+            "recurrent_dropout": float(getattr(cfg, "dl_lstm_recurrent_dropout", 0.05)),
+            "weight_decay": float(getattr(cfg, "dl_lstm_weight_decay", 3e-4)),
+            "batch_size": int(getattr(cfg, "dl_lstm_batch_size", 4)),
+            "recent_weight": float(getattr(cfg, "dl_lstm_recent_sample_weight_max", 1.35)),
+            "score_bias": float(getattr(cfg, "dl_lstm_family_score_bias", -0.035)),
+            "dense_activation": "tanh",
+        }
+    if fam == "GRU":
+        return {
+            "family": "GRU",
+            "search_profile": "short_medium_memory_fast_adaptation",
+            "units": tuple(getattr(cfg, "dl_gru_hidden_units", (12, 16, 24, 32, 48))),
+            "dropouts": tuple(getattr(cfg, "dl_gru_dropout_values", (0.00, 0.05, 0.10, 0.20))),
+            "learning_rates": tuple(getattr(cfg, "dl_gru_learning_rates", (0.0015, 0.0010, 0.0007))),
+            "layers": tuple(getattr(cfg, "dl_gru_layer_candidates", (1, 2))),
+            "strategies": tuple(getattr(cfg, "dl_gru_strategies", ("recursive", "direct"))),
+            "dense_head_ratio": float(getattr(cfg, "dl_gru_dense_head_ratio", 0.50)),
+            "recurrent_dropout": float(getattr(cfg, "dl_gru_recurrent_dropout", 0.00)),
+            "weight_decay": float(getattr(cfg, "dl_gru_weight_decay", 8e-5)),
+            "batch_size": int(getattr(cfg, "dl_gru_batch_size", 8)),
+            "recent_weight": float(getattr(cfg, "dl_gru_recent_sample_weight_max", 1.85)),
+            "score_bias": float(getattr(cfg, "dl_gru_family_score_bias", -0.020)),
+            "dense_activation": "relu",
+        }
+    return {
+        "family": fam or "RNN",
+        "search_profile": "generic_recurrent",
+        "units": tuple(getattr(cfg, "dl_hidden_units", (16, 32, 48))),
+        "dropouts": tuple(getattr(cfg, "dl_dropout_values", (0.0, 0.1, 0.2))),
+        "learning_rates": tuple(getattr(cfg, "dl_learning_rates", (0.001,))),
+        "layers": (1, 2),
+        "strategies": tuple(getattr(cfg, "dl_strategies", ("recursive",))),
+        "dense_head_ratio": 0.5,
+        "recurrent_dropout": 0.0,
+        "weight_decay": 1e-4,
+        "batch_size": int(getattr(cfg, "dl_batch_size", 6)),
+        "recent_weight": float(getattr(cfg, "dl_recent_sample_weight_max", 1.60)),
+        "score_bias": 0.0,
+        "dense_activation": "relu",
+    }
+
+
+def build_family_specific_dl_configs(model_family: str, freq_alias: str, train_len: int, val_len: int) -> List[Dict[str, Any]]:
+    profile = get_dl_family_profile(model_family)
+    fam = profile["family"]
+    configs: List[Dict[str, Any]] = []
+    windows = infer_dl_window_candidates(freq_alias, train_len, model_family=fam)
+    for window in windows:
+        for units in profile["units"]:
+            for dropout in profile["dropouts"]:
+                for learning_rate in profile["learning_rates"]:
+                    for layers in profile["layers"]:
+                        for strategy in profile["strategies"]:
+                            strategy = str(strategy).lower()
+                            if strategy == "direct" and int(val_len) < 2:
+                                continue
+                            # LSTM gets longer-memory/deeper configs; GRU stays compact. Keep
+                            # this as a hard architecture policy, not as a post-hoc metric trick.
+                            if fam == "LSTM" and int(window) < 6 and int(train_len) >= 18:
+                                continue
+                            if fam == "GRU" and int(layers) > 1 and int(units) < 24:
+                                continue
+                            configs.append({
+                                "window": int(window),
+                                "units": int(units),
+                                "dropout": float(dropout),
+                                "layers": int(layers),
+                                "learning_rate": float(learning_rate),
+                                "strategy": strategy,
+                                "family_profile": str(profile["search_profile"]),
+                                "dense_head_ratio": float(profile["dense_head_ratio"]),
+                                "recurrent_dropout": float(profile["recurrent_dropout"]),
+                                "weight_decay": float(profile["weight_decay"]),
+                                "batch_size": int(profile["batch_size"]),
+                                "recent_weight": float(profile["recent_weight"]),
+                                "dense_activation": str(profile["dense_activation"]),
+                            })
+    return configs
+
+
+def dl_family_score_adjustment(cfg: Dict[str, Any], model_family: str, val_len: int) -> float:
+    """Small inner-validation-only tie-breaker to preserve family identity."""
+    fam = str(model_family).upper()
+    window = int(cfg.get("window", 0) or 0)
+    layers = int(cfg.get("layers", 1) or 1)
+    strategy = str(cfg.get("strategy", "recursive")).lower()
+    profile = get_dl_family_profile(fam)
+    adj = float(profile.get("score_bias", 0.0))
+    if fam == "LSTM":
+        if window >= 12:
+            adj -= 0.025
+        if layers >= 2:
+            adj -= 0.015
+        if strategy == "direct" and int(val_len) > 1:
+            adj -= 0.010
+    elif fam == "GRU":
+        if window <= 9:
+            adj -= 0.025
+        if layers == 1:
+            adj -= 0.015
+        if strategy == "recursive" and int(val_len) > 1:
+            adj -= 0.020
+    return float(adj)
+
+
+
+
+def get_dl_short_monthly_policy(freq_alias: str, train_len: int, model_family: str = "LSTM") -> Dict[str, Any]:
+    """
+    Hard policy for monthly short histories, based only on training length.
+
+    Rules:
+      - Monthly train_n < 72: do not train/publish real LSTM/GRU for ranking.
+      - Monthly 72 <= train_n < 96: real DL may be trained, but only as
+        challenger/research; it is not eligible to become champion or enter
+        production ranking.
+      - Otherwise: normal guarded DL eligibility still applies.
+    """
+    cfg = FORECAST_RUNTIME_CONFIG
+    family = str(model_family or "").upper()
+    fa = str(freq_alias or "").upper()
+    n = max(0, int(train_len))
+    if family not in {"LSTM", "GRU"} or not bool(getattr(cfg, "dl_short_monthly_policy_enabled", True)) or fa != "M":
+        return {
+            "active": False,
+            "freq_alias": fa,
+            "model_family": family,
+            "train_observations": n,
+            "policy_state": "not_applicable",
+            "train_real_dl_allowed": True,
+            "eligible_for_model_ranking": True,
+            "champion_eligible": True,
+            "production_role": "normal_guarded_candidate",
+            "ranking_exclusion_reason": None,
+        }
+
+    no_rank_thr = int(getattr(cfg, "dl_monthly_no_rank_train_observations", 72))
+    challenger_thr = int(getattr(cfg, "dl_monthly_challenger_only_train_observations", 96))
+    skip_training = bool(getattr(cfg, "dl_monthly_no_rank_skip_real_training", True))
+
+    if n < no_rank_thr:
+        return {
+            "active": True,
+            "freq_alias": fa,
+            "model_family": family,
+            "train_observations": n,
+            "policy_state": "monthly_train_n_lt_72_no_public_ranking",
+            "train_real_dl_allowed": not skip_training,
+            "skip_real_training": skip_training,
+            "eligible_for_model_ranking": False,
+            "champion_eligible": False,
+            "production_role": "research_surrogate_only",
+            "ranking_exclusion_reason": (
+                f"Aylık kısa seri kuralı: train_n={n} < {no_rank_thr}. "
+                "Gerçek LSTM/GRU public sıralamaya alınmaz; araştırma/surrogate-only veya DL-fallback olarak raporlanır."
+            ),
+        }
+
+    if n < challenger_thr:
+        return {
+            "active": True,
+            "freq_alias": fa,
+            "model_family": family,
+            "train_observations": n,
+            "policy_state": "monthly_train_n_lt_96_challenger_research_only",
+            "train_real_dl_allowed": True,
+            "skip_real_training": False,
+            "eligible_for_model_ranking": False,
+            "champion_eligible": False,
+            "production_role": "challenger_research_only",
+            "ranking_exclusion_reason": (
+                f"Aylık kısa seri kuralı: train_n={n} < {challenger_thr}. "
+                "LSTM/GRU yalnız challenger/research mode; champion veya normal ranking adayı olamaz."
+            ),
+        }
+
+    return {
+        "active": True,
+        "freq_alias": fa,
+        "model_family": family,
+        "train_observations": n,
+        "policy_state": "monthly_train_n_gte_96_normal_guarded",
+        "train_real_dl_allowed": True,
+        "skip_real_training": False,
+        "eligible_for_model_ranking": True,
+        "champion_eligible": True,
+        "production_role": "normal_guarded_candidate",
+        "ranking_exclusion_reason": None,
+    }
+
+
+def apply_dl_short_monthly_policy_to_result(result: Dict[str, Any], policy: Dict[str, Any], model_family: str) -> Dict[str, Any]:
+    """Attach monthly short-series policy metadata and enforce rankability."""
+    out = copy.deepcopy(result) if isinstance(result, dict) else {}
+    policy = policy or {}
+    family = str(model_family or policy.get("model_family") or "").upper()
+    if family not in {"LSTM", "GRU"}:
+        return out
+
+    out["dl_short_monthly_policy"] = dict(policy)
+    out["dl_short_monthly_policy_state"] = policy.get("policy_state")
+    out["dl_train_observations"] = int(policy.get("train_observations", 0) or 0)
+    out["dl_production_role"] = policy.get("production_role", out.get("dl_production_role", "normal_guarded_candidate"))
+    out["dl_champion_eligible"] = bool(policy.get("champion_eligible", out.get("eligible_for_model_ranking", True)))
+    out["dl_research_only"] = bool(out.get("dl_production_role") in {"challenger_research_only", "research_surrogate_only"})
+
+    if not bool(policy.get("eligible_for_model_ranking", True)):
+        reason = str(policy.get("ranking_exclusion_reason") or "DL short-monthly policy excluded model from normal ranking.")
+        out["eligible_for_model_ranking"] = False
+        out["ranking_exclusion_reason"] = reason
+        out["strict_dl_rejection_reason"] = out.get("strict_dl_rejection_reason") or reason
+        # A model can still be genuinely trained, but it is not a champion/ranking
+        # candidate in this data regime. Preserve dl_strict_validation_passed if
+        # true so the user can see that training happened; block only ranking.
+        note = str(out.get("model_identity_note") or "")
+        add = f" Kısa aylık seri politikası uygulandı: {reason}"
+        out["model_identity_note"] = (note + add).strip()
+        stbl = out.get("search_table")
+        if isinstance(stbl, pd.DataFrame):
+            stbl = stbl.copy()
+            stbl["monthly_short_series_policy_state"] = policy.get("policy_state")
+            stbl["ranking_excluded_by_monthly_short_series_policy"] = True
+            stbl["ranking_exclusion_reason"] = reason
+            out["search_table"] = stbl
+    return out
+
+
+def finalize_tf_missing_research_only_result(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, model_family: str, reason: str) -> Dict[str, Any]:
+    """
+    TensorFlow-missing state is not reported as an ordinary model failure.
+    It means real recurrent DL was not trained, so the public LSTM/GRU slot is
+    excluded and any diagnostic forecast is kept outside normal ranking.
+    """
+    family = str(model_family).upper()
+    fallback = build_model_level_fallback(family, train_df, test_df, freq_alias, reason)
+    result = _finalize_dl_backend_fallback(
+        fallback,
+        model_family=family,
+        reason=reason,
+        backend_state="tensorflow_unavailable_real_dl_not_trained_research_only",
+    )
+    result["dl_runtime_state"] = str(getattr(FORECAST_RUNTIME_CONFIG, "dl_tensorflow_missing_public_state", "research_surrogate_only_real_dl_not_trained"))
+    result["dl_result_kind"] = "real_dl_not_trained_backend_missing"
+    result["model_identity_class"] = "research_surrogate_only"
+    result["dl_production_role"] = "research_surrogate_only"
+    result["dl_research_only"] = True
+    result["eligible_for_model_ranking"] = False
+    result["forecast_is_model_output"] = False
+    result["real_dl_trained"] = False
+    result["dl_backend"] = "tensorflow_missing"
+    result["model_identity_note"] = (
+        f"{family} için TensorFlow/Keras bulunmadığı için gerçek recurrent DL eğitilmedi. "
+        "Bu durum normal model başarısızlığı olarak değil, araştırma/surrogate-only durumu olarak işaretlendi; "
+        "satır normal model sıralamasına veya champion seçimine girmez."
+    )
+    return result
+
+
+def get_dl_data_regime_profile(freq_alias: str, train_len: int, horizon: int, model_family: str = "LSTM") -> Dict[str, Any]:
+    """Training-only DL data regime classifier for sliding-window support."""
+    cfg = FORECAST_RUNTIME_CONFIG
+    fa = str(freq_alias).upper()
+    fam = str(model_family).upper()
+    n = max(0, int(train_len))
+    h = max(1, int(horizon))
+    if fa == "M":
+        small_thr = int(getattr(cfg, "dl_monthly_small_sample_observations", 72))
+        marginal_thr = int(getattr(cfg, "dl_monthly_marginal_sample_observations", 96))
+        small_max_window = 12 if fam == "LSTM" else 9
+        marginal_max_window = 18 if fam == "LSTM" else 12
+    elif fa == "W":
+        small_thr = int(getattr(cfg, "dl_weekly_small_sample_observations", 104))
+        marginal_thr = int(getattr(cfg, "dl_weekly_marginal_sample_observations", 156))
+        small_max_window = 13 if fam == "LSTM" else 8
+        marginal_max_window = 26 if fam == "LSTM" else 13
+    elif fa == "D":
+        small_thr = int(getattr(cfg, "dl_daily_small_sample_observations", 120))
+        marginal_thr = int(getattr(cfg, "dl_daily_marginal_sample_observations", 180))
+        small_max_window = 28 if fam == "LSTM" else 14
+        marginal_max_window = 42 if fam == "LSTM" else 21
+    elif fa == "H":
+        small_thr = int(getattr(cfg, "dl_hourly_small_sample_observations", 336))
+        marginal_thr = int(getattr(cfg, "dl_hourly_marginal_sample_observations", 720))
+        small_max_window = 48 if fam == "LSTM" else 24
+        marginal_max_window = 72 if fam == "LSTM" else 36
+    else:
+        small_thr, marginal_thr = 72, 96
+        small_max_window = 12 if fam == "LSTM" else 9
+        marginal_max_window = 18 if fam == "LSTM" else 12
+    if n <= small_thr:
+        regime = "small_sample"
+        min_seq_base = int(getattr(cfg, "dl_small_sample_min_train_sequences", 18))
+        seq_ratio = float(getattr(cfg, "dl_small_sample_sequence_ratio", 0.35))
+        max_epochs = int(getattr(cfg, "dl_small_sample_max_epochs", 90))
+        patience = int(getattr(cfg, "dl_small_sample_patience", 10))
+        baseline_margin = float(getattr(cfg, "dl_small_sample_min_baseline_improvement_pct", 0.03))
+        max_window = small_max_window
+    elif n <= marginal_thr:
+        regime = "marginal_sample"
+        min_seq_base = int(getattr(cfg, "dl_marginal_sample_min_train_sequences", 24))
+        seq_ratio = float(getattr(cfg, "dl_marginal_sample_sequence_ratio", 0.30))
+        max_epochs = int(getattr(cfg, "dl_marginal_sample_max_epochs", 140))
+        patience = int(getattr(cfg, "dl_marginal_sample_patience", 16))
+        baseline_margin = float(getattr(cfg, "dl_marginal_sample_min_baseline_improvement_pct", 0.01))
+        max_window = marginal_max_window
+    else:
+        regime = "normal_sample"
+        min_seq_base = int(getattr(cfg, "dl_normal_sample_min_train_sequences", 30))
+        seq_ratio = float(getattr(cfg, "dl_normal_sample_sequence_ratio", 0.24))
+        max_epochs = int(getattr(cfg, "dl_max_epochs", 220))
+        patience = int(getattr(cfg, "dl_patience", 24))
+        baseline_margin = 0.0
+        max_window = max(3, n // 2)
+    min_sequences = int(max(
+        getattr(cfg, "dl_min_train_sequences", 12),
+        min_seq_base,
+        math.ceil(max(1, n) * seq_ratio),
+        int(getattr(cfg, "dl_min_sequences_per_test_step", 5)) * h,
+    ))
+    return {
+        "regime": regime,
+        "freq_alias": fa,
+        "model_family": fam,
+        "train_observations": n,
+        "horizon": h,
+        "small_threshold": small_thr,
+        "marginal_threshold": marginal_thr,
+        "min_required_sequences": min_sequences,
+        "sequence_ratio_required": seq_ratio,
+        "max_window": int(max_window),
+        "max_epochs": max(12, max_epochs),
+        "patience": max(4, patience),
+        "baseline_improvement_required_pct": baseline_margin,
+        "ranking_guard_active": bool(regime in {"small_sample", "marginal_sample"}),
+        "short_monthly_policy": get_dl_short_monthly_policy(freq_alias, train_len, model_family),
+    }
+
+
+def _dl_sequence_count_for_cfg(train_len: int, window: int, strategy: str, horizon: int) -> int:
+    n = max(0, int(train_len))
+    w = max(1, int(window))
+    h = max(1, int(horizon))
+    if str(strategy).lower() == "direct":
+        return max(0, n - w - h + 1)
+    return max(0, n - w)
+
+
+def _dl_estimated_capacity_score(cfg: Dict[str, Any], model_family: str) -> int:
+    units = max(1, int(cfg.get("units", 1)))
+    layers = max(1, int(cfg.get("layers", 1)))
+    fam_mult = 4 if str(model_family).upper() == "LSTM" else 3
+    return int(fam_mult * layers * units * units)
+
+
+def _apply_dl_data_regime_guard(configs: List[Dict[str, Any]], model_family: str, freq_alias: str, train_len: int, horizon: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any], pd.DataFrame]:
+    if not bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_data_regime_guard_enabled", True)):
+        return list(configs), get_dl_data_regime_profile(freq_alias, train_len, horizon, model_family), pd.DataFrame()
+    regime = get_dl_data_regime_profile(freq_alias, train_len, horizon, model_family)
+    fam = str(model_family).upper()
+    kept, rejected = [], []
+    for cfg in list(configs):
+        row = dict(cfg)
+        window = int(row.get("window", 0) or 0)
+        strategy = str(row.get("strategy", "recursive")).lower()
+        seq_count = _dl_sequence_count_for_cfg(train_len, window, strategy, horizon)
+        capacity_score = _dl_estimated_capacity_score(row, fam)
+        reject_reasons = []
+        if window > int(regime.get("max_window", window)):
+            reject_reasons.append(f"window>{regime.get('max_window')}")
+        if seq_count < int(regime.get("min_required_sequences", 0)):
+            reject_reasons.append(f"sequence_count<{regime.get('min_required_sequences')}")
+        if regime.get("regime") == "small_sample":
+            if fam == "LSTM" and int(row.get("units", 0)) > 48:
+                reject_reasons.append("small_sample_lstm_units>48")
+            if fam == "LSTM" and int(row.get("layers", 1)) > 2:
+                reject_reasons.append("small_sample_lstm_layers>2")
+            if fam == "GRU" and int(row.get("units", 0)) > 32:
+                reject_reasons.append("small_sample_gru_units>32")
+            if fam == "GRU" and int(row.get("layers", 1)) > 1:
+                reject_reasons.append("small_sample_gru_layers>1")
+            if capacity_score > max(3500, int(seq_count) * 190):
+                reject_reasons.append("capacity_too_high_for_sequence_count")
+        elif regime.get("regime") == "marginal_sample":
+            if fam == "LSTM" and int(row.get("units", 0)) > 64:
+                reject_reasons.append("marginal_sample_lstm_units>64")
+            if fam == "GRU" and int(row.get("units", 0)) > 48:
+                reject_reasons.append("marginal_sample_gru_units>48")
+            if capacity_score > max(5500, int(seq_count) * 260):
+                reject_reasons.append("capacity_too_high_for_sequence_count")
+        row.update({
+            "data_regime": regime.get("regime"),
+            "candidate_sequence_count": int(seq_count),
+            "min_required_sequences": int(regime.get("min_required_sequences", 0)),
+            "sequence_support_ratio": safe_float(seq_count / max(1, int(train_len))),
+            "capacity_score_proxy": int(capacity_score),
+            "max_epochs": int(regime.get("max_epochs", getattr(FORECAST_RUNTIME_CONFIG, "dl_max_epochs", 220))),
+            "patience": int(regime.get("patience", getattr(FORECAST_RUNTIME_CONFIG, "dl_patience", 24))),
+        })
+        if reject_reasons:
+            row["candidate_rejected_by_data_regime_guard"] = True
+            row["regime_rejection_reason"] = " | ".join(reject_reasons)
+            rejected.append(row)
+        else:
+            row["candidate_rejected_by_data_regime_guard"] = False
+            row["regime_rejection_reason"] = ""
+            kept.append(row)
+    return kept, regime, pd.DataFrame(rejected)
+
+
+def _dl_baseline_guard_decision(best_validation_wape: float, inner_baseline_wape: float, regime_profile: Dict[str, Any]) -> Tuple[bool, str, float]:
+    regime = str((regime_profile or {}).get("regime", "normal_sample"))
+    if regime not in {"small_sample", "marginal_sample"}:
+        return True, "normal_sample_no_baseline_superiority_gate", 0.0
+    if not bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_reject_short_sample_if_not_better_than_baseline", True)):
+        return True, "baseline_superiority_gate_disabled", 0.0
+    margin = float((regime_profile or {}).get("baseline_improvement_required_pct", 0.0) or 0.0)
+    try:
+        dl_w = float(best_validation_wape)
+        base_w = float(inner_baseline_wape)
+    except Exception:
+        return False, "baseline_guard_invalid_validation_scores", margin
+    if not np.isfinite(dl_w) or not np.isfinite(base_w) or base_w <= 0:
+        return False, "baseline_guard_nonfinite_or_invalid_baseline", margin
+    required_wape = base_w * (1.0 - margin)
+    if dl_w <= required_wape:
+        return True, f"dl_inner_validation_beats_baseline_by_required_margin_{margin:.3f}", margin
+    return False, f"dl_inner_validation_wape_not_better_than_baseline: dl={dl_w:.4f}, baseline={base_w:.4f}, required<={required_wape:.4f}", margin
 
 def _select_diverse_dl_configs(configs: List[Dict[str, Any]], max_n: int) -> List[Dict[str, Any]]:
     max_n = max(1, int(max_n))
@@ -9275,6 +9945,437 @@ def _select_diverse_dl_configs(configs: List[Dict[str, Any]], max_n: int) -> Lis
     return selected[:max_n]
 
 
+
+def _build_dl_rolling_origin_folds(
+    train_df: pd.DataFrame,
+    horizon: int,
+    freq_alias: str,
+    model_family: str,
+) -> List[Dict[str, int]]:
+    """
+    Build leakage-free rolling-origin validation folds for DL selection.
+
+    The folds are created only inside train_df. The external holdout/test_df is
+    not inspected. Each fold trains on [0:train_end) and validates on the next
+    contiguous block [val_start:val_end), preserving time order.
+    """
+    cfg = FORECAST_RUNTIME_CONFIG
+    n = int(len(train_df))
+    if n <= 0:
+        return []
+    requested_h = max(1, int(horizon or 1))
+    horizon_cap = max(1, int(getattr(cfg, "dl_rolling_validation_horizon_cap", 6)))
+    val_h = max(1, min(requested_h, horizon_cap, max(1, n // 4)))
+    max_folds = max(1, int(getattr(cfg, "dl_rolling_validation_max_folds", 3)))
+    season_length = int(infer_season_length_from_freq(freq_alias) or 1)
+    min_obs_cfg = int(getattr(cfg, "dl_rolling_validation_min_train_observations", 24))
+    min_train_obs = max(min_obs_cfg, 2 * season_length if season_length > 1 else min_obs_cfg)
+    folds: List[Dict[str, int]] = []
+
+    # Most recent folds are preferred because they match the production horizon,
+    # but every fold still uses only past observations for training.
+    for back in range(max_folds - 1, -1, -1):
+        val_end = n - back * val_h
+        val_start = val_end - val_h
+        train_end = val_start
+        if val_start <= 0 or val_end > n:
+            continue
+        if train_end < min_train_obs:
+            continue
+        folds.append({
+            "fold": len(folds) + 1,
+            "train_start": 0,
+            "train_end": int(train_end),
+            "val_start": int(val_start),
+            "val_end": int(val_end),
+            "val_len": int(val_h),
+            "origin_index": int(train_end - 1),
+        })
+    return folds
+
+
+def _dl_insufficient_rolling_folds(
+    folds: List[Dict[str, int]],
+    model_family: str,
+) -> Tuple[bool, str]:
+    min_folds = max(1, int(getattr(FORECAST_RUNTIME_CONFIG, "dl_rolling_validation_min_folds", 2)))
+    if len(folds) >= min_folds:
+        return False, "rolling_origin_validation_available"
+    reason = (
+        f"{model_family} için rolling-origin DL validasyonu yetersiz: "
+        f"bulunan_fold={len(folds)}, gerekli_min_fold={min_folds}. "
+        "Tek split ile DL hiperparametre seçimi yapılmadı."
+    )
+    return True, reason
+
+
+def _compute_dl_rolling_baseline_summary(
+    train_df: pd.DataFrame,
+    folds: List[Dict[str, int]],
+    freq_alias: str,
+    season_length: int,
+) -> Dict[str, Any]:
+    rows = []
+    for fold in folds:
+        tr = train_df.iloc[:int(fold["train_end"])].reset_index(drop=True)
+        val = train_df.iloc[int(fold["val_start"]):int(fold["val_end"])].reset_index(drop=True)
+        try:
+            pred, method = build_fallback_forecast(tr["y"], val["y"], freq_alias, season_length)
+            bw = safe_float(wape(val["y"].values, pred))
+            bs = safe_float(smape(val["y"].values, pred))
+        except Exception as e:
+            method = f"baseline_error:{str(e)[:80]}"
+            bw = np.nan
+            bs = np.nan
+        rows.append({
+            "fold": int(fold.get("fold", len(rows) + 1)),
+            "train_end": int(fold.get("train_end", 0)),
+            "val_start": int(fold.get("val_start", 0)),
+            "val_end": int(fold.get("val_end", 0)),
+            "val_len": int(fold.get("val_len", 0)),
+            "baseline_method": method,
+            "baseline_wape": bw,
+            "baseline_smape": bs,
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return {"method": "rolling_baseline_unavailable", "wape": np.nan, "smape": np.nan, "fold_table": df}
+    method = "rolling_origin_mean_baseline:" + ",".join(sorted(set(df["baseline_method"].dropna().astype(str))))
+    return {
+        "method": method,
+        "wape": safe_float(pd.to_numeric(df["baseline_wape"], errors="coerce").mean()),
+        "smape": safe_float(pd.to_numeric(df["baseline_smape"], errors="coerce").mean()),
+        "fold_table": df,
+    }
+
+
+def _split_dl_sequence_arrays_for_early_stopping(
+    X_seq: np.ndarray,
+    y_seq: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Time-ordered early-stopping split for sequence tensors.
+
+    This replaces Keras validation_split. It never shuffles and never uses the
+    external holdout/test set. If there are too few sequences, validation is
+    disabled and EarlyStopping must monitor training loss.
+    """
+    X_seq = np.asarray(X_seq, dtype=float)
+    y_seq = np.asarray(y_seq, dtype=float)
+    n = int(len(X_seq))
+    if n <= 0:
+        return X_seq, y_seq, None, None, None
+    sw = np.asarray(sample_weight, dtype=float).reshape(-1) if sample_weight is not None and len(sample_weight) >= n else np.ones((n,), dtype=float)
+    ratio = float(getattr(FORECAST_RUNTIME_CONFIG, "dl_early_stopping_validation_ratio", 0.18))
+    min_val = max(1, int(getattr(FORECAST_RUNTIME_CONFIG, "dl_min_early_stopping_val_sequences", 3)))
+    val_size = int(round(n * ratio))
+    val_size = max(min_val, val_size) if n >= (min_val + 6) else 0
+    val_size = min(val_size, max(0, n - max(6, min(12, n))))
+    if val_size < min_val or n - val_size < max(6, min(12, n)):
+        return X_seq, y_seq, None, None, sw
+    split = n - val_size
+    return X_seq[:split], y_seq[:split], X_seq[split:], y_seq[split:], sw[:split]
+
+
+def _fit_keras_sequence_model_time_ordered(
+    X_seq: np.ndarray,
+    y_seq: np.ndarray,
+    cfg: Dict[str, Any],
+    model_family: str,
+    output_dim: int,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Tuple[Any, pd.DataFrame]:
+    model = _build_dl_network(
+        (X_seq.shape[1], X_seq.shape[2]),
+        model_family=model_family,
+        units=int(cfg["units"]),
+        layers=int(cfg["layers"]),
+        dropout=float(cfg["dropout"]),
+        learning_rate=float(cfg["learning_rate"]),
+        output_dim=int(output_dim),
+        dense_head_ratio=float(cfg.get("dense_head_ratio", get_dl_family_profile(model_family).get("dense_head_ratio", 0.5))),
+        recurrent_dropout=float(cfg.get("recurrent_dropout", get_dl_family_profile(model_family).get("recurrent_dropout", 0.0))),
+        dense_activation=str(cfg.get("dense_activation", get_dl_family_profile(model_family).get("dense_activation", "relu"))),
+    )
+    X_fit, y_fit, X_es, y_es, sw_fit = _split_dl_sequence_arrays_for_early_stopping(X_seq, y_seq, sample_weight)
+    monitor = "val_loss" if X_es is not None and y_es is not None and len(X_es) else "loss"
+    callbacks = [KerasEarlyStopping(monitor=monitor, patience=int(max(4, cfg.get("patience", FORECAST_RUNTIME_CONFIG.dl_patience))), restore_best_weights=True)]
+    fit_kwargs = {
+        "x": X_fit,
+        "y": y_fit,
+        "epochs": int(max(12, cfg.get("max_epochs", FORECAST_RUNTIME_CONFIG.dl_max_epochs))),
+        "batch_size": int(min(int(cfg.get("batch_size", FORECAST_RUNTIME_CONFIG.dl_batch_size)), max(4, len(X_fit) // 2 if len(X_fit) else 4))),
+        "verbose": 0,
+        "callbacks": callbacks,
+        "shuffle": bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_keras_shuffle", False)),
+    }
+    if sw_fit is not None and len(sw_fit) == len(X_fit):
+        fit_kwargs["sample_weight"] = sw_fit
+    if monitor == "val_loss":
+        fit_kwargs["validation_data"] = (X_es, y_es)
+    hist = model.fit(**fit_kwargs)
+    hist_df = _history_to_frame(hist)
+    if "val_loss" not in hist_df.columns:
+        hist_df["val_loss"] = np.nan
+    hist_df["validation_design"] = "explicit_time_ordered_sequence_tail"
+    return model, hist_df
+
+
+def _summarize_dl_fold_rows(fold_rows: List[Dict[str, Any]], cfg: Dict[str, Any], model_family: str, backend: str, selected_cols: List[str], inner_baseline_method: str, inner_baseline_wape: float, inner_baseline_smape: float, dl_regime_profile: Dict[str, Any]) -> Dict[str, Any]:
+    df = pd.DataFrame(fold_rows)
+    val_w = safe_float(pd.to_numeric(df.get("fold_wape"), errors="coerce").mean()) if len(df) else np.nan
+    val_s = safe_float(pd.to_numeric(df.get("fold_smape"), errors="coerce").mean()) if len(df) else np.nan
+    w_std = safe_float(pd.to_numeric(df.get("fold_wape"), errors="coerce").std(ddof=0)) if len(df) else np.nan
+    s_std = safe_float(pd.to_numeric(df.get("fold_smape"), errors="coerce").std(ddof=0)) if len(df) else np.nan
+    bias_mean = safe_float(pd.to_numeric(df.get("bias_pct"), errors="coerce").mean()) if len(df) else np.nan
+    under_mean = safe_float(pd.to_numeric(df.get("under_forecast_rate"), errors="coerce").mean()) if len(df) else np.nan
+    peak_mean = safe_float(pd.to_numeric(df.get("peak_event_score"), errors="coerce").mean()) if len(df) else np.nan
+    overfit_mean = safe_float(pd.to_numeric(df.get("overfit_gap_ratio"), errors="coerce").mean()) if len(df) else np.nan
+    asym_penalty = safe_float(pd.to_numeric(df.get("asym_penalty"), errors="coerce").mean()) if len(df) else 0.0
+    direction_pen = 0.0 if pd.isna(bias_mean) or abs(float(bias_mean)) <= 10 else 0.12
+    fold_instability_pen = 0.18 * max(0.0, float(w_std) if pd.notna(w_std) else 0.0)
+    score = float(
+        val_w
+        + 0.28 * val_s
+        + 0.85 * (asym_penalty if pd.notna(asym_penalty) else 0.0)
+        + 2.2 * max(overfit_mean if pd.notna(overfit_mean) else 0.0, 0.0)
+        + direction_pen
+        + fold_instability_pen
+        + dl_family_score_adjustment(cfg, model_family, int(max(pd.to_numeric(df.get("fold_val_len"), errors="coerce").max() if len(df) else 1, 1)))
+    )
+    row = {
+        **cfg,
+        "model": model_family,
+        "backend": backend,
+        "validation_design": "rolling_origin_kfold_train_only",
+        "fold_count": int(len(df)),
+        "val_wape": val_w,
+        "val_smape": val_s,
+        "rolling_val_wape_mean": val_w,
+        "rolling_val_wape_std": w_std,
+        "rolling_val_smape_mean": val_s,
+        "rolling_val_smape_std": s_std,
+        "inner_baseline_method": inner_baseline_method,
+        "inner_baseline_wape": inner_baseline_wape,
+        "inner_baseline_smape": inner_baseline_smape,
+        "data_regime": (dl_regime_profile or {}).get("regime"),
+        "bias_pct": bias_mean,
+        "under_forecast_rate": under_mean,
+        "peak_event_score": peak_mean,
+        "min_train_loss": safe_float(pd.to_numeric(df.get("min_train_loss"), errors="coerce").mean()) if len(df) else np.nan,
+        "min_val_loss": safe_float(pd.to_numeric(df.get("min_val_loss"), errors="coerce").mean()) if len(df) else np.nan,
+        "overfit_gap_ratio": overfit_mean,
+        "epochs_ran": safe_float(pd.to_numeric(df.get("epochs_ran"), errors="coerce").mean()) if len(df) else np.nan,
+        "selected_exog_cols": ", ".join(selected_cols),
+        "composite_score": score,
+    }
+    return row
+
+
+def _evaluate_tf_dl_config_rolling_origin(
+    cfg: Dict[str, Any],
+    train_df: pd.DataFrame,
+    cov_train_df: pd.DataFrame,
+    folds: List[Dict[str, int]],
+    freq_alias: str,
+    model_family: str,
+    selected_cols: List[str],
+    season_length: int,
+    inner_baseline_method: str,
+    inner_baseline_wape: float,
+    inner_baseline_smape: float,
+    dl_regime_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    fold_rows: List[Dict[str, Any]] = []
+    fold_tables: List[pd.DataFrame] = []
+    best_post_cfg: Dict[str, Any] = {"name": "raw"}
+    best_transform: Dict[str, Any] = {"name": "none"}
+    for fold in folds:
+        tr = train_df.iloc[:int(fold["train_end"])].reset_index(drop=True)
+        val = train_df.iloc[int(fold["val_start"]):int(fold["val_end"])].reset_index(drop=True)
+        cov_tr = cov_train_df.iloc[:int(fold["train_end"])].reset_index(drop=True)
+        cov_val = cov_train_df.iloc[int(fold["val_start"]):int(fold["val_end"])].reset_index(drop=True)
+        residual_mode = bool(cfg.get("residual_mode", False))
+        residual_base_method = None
+        residual_base_val = None
+        if residual_mode:
+            base_pack = build_residual_dl_base_arrays(tr["y"], len(val), freq_alias, season_length)
+            residual_base_train = np.asarray(base_pack.get("train_base"), dtype=float).reshape(-1)
+            residual_base_val = np.asarray(base_pack.get("future_base"), dtype=float).reshape(-1)
+            residual_base_method = str(base_pack.get("method"))
+            model_target_train = pd.to_numeric(tr["y"], errors="coerce").astype(float).reset_index(drop=True) - residual_base_train
+            y_transform = {"name": "none", "lambda": None, "shift": 0.0, "allow_negative_output": True, "target_mode": "residual"}
+        else:
+            model_target_train = tr["y"]
+            y_transform = choose_target_transform(tr["y"])
+        tr_y_t = apply_target_transform(model_target_train, y_transform)[0].values.astype(float)
+        y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(
+            tr_y_t,
+            cov_tr.values.astype(float) if len(cov_tr) else np.zeros((len(tr), 0), dtype=float),
+        )
+        strategy = str(cfg.get("strategy", "recursive")).lower()
+        if strategy == "direct":
+            X_seq, y_seq = _make_dl_sequences_direct(tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val)))
+            output_dim = int(len(val))
+        else:
+            X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
+            output_dim = 1
+        if len(X_seq) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
+            raise ValueError(f"Fold {fold.get('fold')} için yeterli sliding-window eğitim örneği üretilemedi.")
+        sample_weight = _make_recent_sample_weights(len(y_seq), float(cfg.get("recent_weight", getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))))
+        model, hist_df = _fit_keras_sequence_model_time_ordered(X_seq, y_seq, cfg, model_family, output_dim=output_dim, sample_weight=sample_weight)
+        if strategy == "direct":
+            pred_val_scaled = _direct_dl_forecast(model, tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val)))
+        else:
+            val_cov_scaled = _transform_dl_covariates(x_scaler, cov_val) if len(cov_val) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim == 2 else 0), dtype=float)
+            pred_val_scaled = _recursive_dl_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
+        pred_val_t = y_scaler.inverse_transform(pred_val_scaled.reshape(-1, 1)).reshape(-1)
+        pred_val_component = inverse_target_transform(pred_val_t, y_transform)
+        if residual_mode:
+            pred_val = np.maximum(np.asarray(residual_base_val, dtype=float).reshape(-1)[:len(pred_val_component)] + np.asarray(pred_val_component, dtype=float).reshape(-1), 0.0)
+        else:
+            pred_val = np.maximum(np.asarray(pred_val_component, dtype=float), 0.0)
+        corrected, post_cfg = compute_validation_postprocess_candidates(val["y"].values, pred_val, tr["y"], season_length)
+        asym = compute_asymmetric_validation_penalty(val["y"].values, corrected, tr["y"].values, severity=1.0)
+        min_loss = safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
+        min_val_loss = safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
+        overfit_gap = safe_float((min_val_loss - min_loss) / max(abs(min_loss), 1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
+        fold_rows.append({
+            "fold": int(fold.get("fold", len(fold_rows) + 1)),
+            "fold_train_end": int(fold["train_end"]),
+            "fold_val_start": int(fold["val_start"]),
+            "fold_val_end": int(fold["val_end"]),
+            "fold_val_len": int(len(val)),
+            "fold_wape": safe_float(wape(val["y"].values, corrected)),
+            "fold_smape": safe_float(smape(val["y"].values, corrected)),
+            "bias_pct": safe_float(asym.get("bias_pct", np.nan)),
+            "under_forecast_rate": safe_float(asym.get("under_forecast_rate", np.nan)),
+            "peak_event_score": safe_float(asym.get("peak_event_score", np.nan)),
+            "asym_penalty": safe_float(asym.get("penalty", 0.0)),
+            "min_train_loss": min_loss,
+            "min_val_loss": min_val_loss,
+            "overfit_gap_ratio": overfit_gap,
+            "epochs_ran": int(len(hist_df)),
+            "transform": y_transform.get("name", "none"),
+            "postprocess": post_cfg.get("name", "raw") if isinstance(post_cfg, dict) else "raw",
+            "residual_mode": bool(residual_mode),
+            "residual_base_method": residual_base_method,
+        })
+        fold_hist = hist_df.copy()
+        fold_hist["fold"] = int(fold.get("fold", len(fold_tables) + 1))
+        fold_tables.append(fold_hist)
+        best_post_cfg = dict(post_cfg)
+        best_transform = dict(y_transform)
+    row = _summarize_dl_fold_rows(fold_rows, cfg, model_family, "TensorFlow", selected_cols, inner_baseline_method, inner_baseline_wape, inner_baseline_smape, dl_regime_profile)
+    return {
+        "row": row,
+        "fold_table": pd.DataFrame(fold_rows),
+        "history_df": pd.concat(fold_tables, ignore_index=True, sort=False) if fold_tables else pd.DataFrame(),
+        "postprocess_cfg": best_post_cfg,
+        "transform_cfg": best_transform,
+    }
+
+
+def _evaluate_torch_dl_config_rolling_origin(
+    cfg: Dict[str, Any],
+    train_df: pd.DataFrame,
+    cov_train_df: pd.DataFrame,
+    folds: List[Dict[str, int]],
+    freq_alias: str,
+    model_family: str,
+    selected_cols: List[str],
+    season_length: int,
+    inner_baseline_method: str,
+    inner_baseline_wape: float,
+    inner_baseline_smape: float,
+    dl_regime_profile: Dict[str, Any],
+) -> Dict[str, Any]:
+    fold_rows: List[Dict[str, Any]] = []
+    fold_tables: List[pd.DataFrame] = []
+    best_post_cfg: Dict[str, Any] = {"name": "raw"}
+    best_transform: Dict[str, Any] = {"name": "none"}
+    for fold in folds:
+        tr = train_df.iloc[:int(fold["train_end"])].reset_index(drop=True)
+        val = train_df.iloc[int(fold["val_start"]):int(fold["val_end"])].reset_index(drop=True)
+        cov_tr = cov_train_df.iloc[:int(fold["train_end"])].reset_index(drop=True)
+        cov_val = cov_train_df.iloc[int(fold["val_start"]):int(fold["val_end"])].reset_index(drop=True)
+        residual_mode = bool(cfg.get("residual_mode", False))
+        residual_base_method = None
+        residual_base_val = None
+        if residual_mode:
+            base_pack = build_residual_dl_base_arrays(tr["y"], len(val), freq_alias, season_length)
+            residual_base_train = np.asarray(base_pack.get("train_base"), dtype=float).reshape(-1)
+            residual_base_val = np.asarray(base_pack.get("future_base"), dtype=float).reshape(-1)
+            residual_base_method = str(base_pack.get("method"))
+            model_target_train = pd.to_numeric(tr["y"], errors="coerce").astype(float).reset_index(drop=True) - residual_base_train
+            y_transform = {"name": "none", "lambda": None, "shift": 0.0, "allow_negative_output": True, "target_mode": "residual"}
+        else:
+            model_target_train = tr["y"]
+            y_transform = choose_target_transform(tr["y"])
+        tr_y_t = apply_target_transform(model_target_train, y_transform)[0].values.astype(float)
+        y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(
+            tr_y_t,
+            cov_tr.values.astype(float) if len(cov_tr) else np.zeros((len(tr), 0), dtype=float),
+        )
+        strategy = str(cfg.get("strategy", "recursive")).lower()
+        if strategy == "direct":
+            X_seq, y_seq = _make_dl_sequences_direct(tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val)))
+        else:
+            X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
+        if len(X_seq) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
+            raise ValueError(f"Fold {fold.get('fold')} için yeterli sliding-window eğitim örneği üretilemedi.")
+        sample_weight = _make_recent_sample_weights(len(y_seq), float(cfg.get("recent_weight", getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))))
+        model, hist_df = _torch_train_sequence_model(X_seq, y_seq, cfg, model_family=model_family, sample_weight=sample_weight)
+        if strategy == "direct":
+            pred_val_scaled = _torch_direct_forecast(model, tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val)))
+        else:
+            val_cov_scaled = _transform_dl_covariates(x_scaler, cov_val) if len(cov_val) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim == 2 else 0), dtype=float)
+            pred_val_scaled = _torch_recursive_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
+        pred_val_t = y_scaler.inverse_transform(pred_val_scaled.reshape(-1, 1)).reshape(-1)
+        pred_val_component = inverse_target_transform(pred_val_t, y_transform)
+        if residual_mode:
+            pred_val = np.maximum(np.asarray(residual_base_val, dtype=float).reshape(-1)[:len(pred_val_component)] + np.asarray(pred_val_component, dtype=float).reshape(-1), 0.0)
+        else:
+            pred_val = np.maximum(np.asarray(pred_val_component, dtype=float), 0.0)
+        corrected, post_cfg = compute_validation_postprocess_candidates(val["y"].values, pred_val, tr["y"], season_length)
+        asym = compute_asymmetric_validation_penalty(val["y"].values, corrected, tr["y"].values, severity=1.0)
+        min_loss = safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
+        min_val_loss = safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
+        overfit_gap = safe_float((min_val_loss - min_loss) / max(abs(min_loss), 1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
+        fold_rows.append({
+            "fold": int(fold.get("fold", len(fold_rows) + 1)),
+            "fold_train_end": int(fold["train_end"]),
+            "fold_val_start": int(fold["val_start"]),
+            "fold_val_end": int(fold["val_end"]),
+            "fold_val_len": int(len(val)),
+            "fold_wape": safe_float(wape(val["y"].values, corrected)),
+            "fold_smape": safe_float(smape(val["y"].values, corrected)),
+            "bias_pct": safe_float(asym.get("bias_pct", np.nan)),
+            "under_forecast_rate": safe_float(asym.get("under_forecast_rate", np.nan)),
+            "peak_event_score": safe_float(asym.get("peak_event_score", np.nan)),
+            "asym_penalty": safe_float(asym.get("penalty", 0.0)),
+            "min_train_loss": min_loss,
+            "min_val_loss": min_val_loss,
+            "overfit_gap_ratio": overfit_gap,
+            "epochs_ran": int(len(hist_df)),
+            "transform": y_transform.get("name", "none"),
+            "postprocess": post_cfg.get("name", "raw") if isinstance(post_cfg, dict) else "raw",
+        })
+        fold_hist = hist_df.copy()
+        fold_hist["fold"] = int(fold.get("fold", len(fold_tables) + 1))
+        fold_tables.append(fold_hist)
+        best_post_cfg = dict(post_cfg)
+        best_transform = dict(y_transform)
+    row = _summarize_dl_fold_rows(fold_rows, cfg, model_family, "PyTorch", selected_cols, inner_baseline_method, inner_baseline_wape, inner_baseline_smape, dl_regime_profile)
+    return {
+        "row": row,
+        "fold_table": pd.DataFrame(fold_rows),
+        "history_df": pd.concat(fold_tables, ignore_index=True, sort=False) if fold_tables else pd.DataFrame(),
+        "postprocess_cfg": best_post_cfg,
+        "transform_cfg": best_transform,
+    }
+
 def _flatten_dl_sequence_tensor(X: np.ndarray) -> np.ndarray:
     X = np.asarray(X, dtype=float)
     if X.ndim <= 2:
@@ -9283,105 +10384,196 @@ def _flatten_dl_sequence_tensor(X: np.ndarray) -> np.ndarray:
 
 
 def _fit_dl_surrogate_mlp_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM", reason: str = "") -> Dict[str, Any]:
-    if SKMLPRegressor is None:
-        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{reason} | sklearn MLP bulunamadı.")
-    season_length = infer_season_length_from_freq(freq_alias)
-    selected_cols = _select_dl_feature_columns(feature_train, feature_test, train_df["y"], max(8, min(16, getattr(FORECAST_RUNTIME_CONFIG, "dl_sequence_max_exog_cols", 12))))
-    cov_train_df = feature_train[selected_cols].copy() if selected_cols and isinstance(feature_train, pd.DataFrame) else pd.DataFrame(index=train_df.index)
-    cov_test_df = feature_test[selected_cols].copy() if selected_cols and isinstance(feature_test, pd.DataFrame) else pd.DataFrame(index=test_df.index)
-    cov_train_df = cov_train_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    cov_test_df = cov_test_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    tr_inner, val_inner = make_inner_train_val_split(train_df, val_ratio=FORECAST_RUNTIME_CONFIG.dl_validation_ratio, min_val=max(3, len(test_df)))
-    split_ix = len(tr_inner)
-    cov_tr_inner = cov_train_df.iloc[:split_ix].reset_index(drop=True)
-    cov_val_inner = cov_train_df.iloc[split_ix:].reset_index(drop=True)
-    best = None
-    search_rows = []
-    for window in infer_dl_window_candidates(freq_alias, len(tr_inner)):
-        try:
-            y_transform = choose_target_transform(tr_inner["y"])
-            tr_y_t = apply_target_transform(tr_inner["y"], y_transform)[0].values.astype(float)
-            y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(tr_y_t, cov_tr_inner.values.astype(float) if len(cov_tr_inner) else np.zeros((len(tr_inner), 0), dtype=float))
-            X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(window))
-            if len(X_seq) < max(8, int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences) - 2):
-                continue
-            X_flat = _flatten_dl_sequence_tensor(X_seq)
-            mlp = SKMLPRegressor(hidden_layer_sizes=(max(16, int(window) * 4), max(8, int(window) * 2)), activation='relu', solver='adam', alpha=0.0005, learning_rate_init=0.001, max_iter=900, early_stopping=True, validation_fraction=0.15, n_iter_no_change=25, random_state=42)
-            mlp.fit(X_flat, y_seq)
-            hist_y_scaled = np.asarray(tr_y_scaled, dtype=float).reshape(-1)
-            hist_cov_scaled = np.asarray(tr_cov_scaled, dtype=float) if tr_cov_scaled is not None else np.zeros((len(hist_y_scaled), 0), dtype=float)
-            val_cov_scaled = _transform_dl_covariates(x_scaler, cov_val_inner) if len(cov_val_inner) else np.zeros((0, hist_cov_scaled.shape[1] if hist_cov_scaled.ndim == 2 else 0), dtype=float)
-            preds_scaled = []
-            hist_y_work = list(hist_y_scaled)
-            hist_cov_work = [np.asarray(r, dtype=float) for r in hist_cov_scaled] if hist_cov_scaled.size else [np.zeros((0,), dtype=float) for _ in hist_y_scaled]
-            for i in range(len(val_inner)):
-                yw = np.asarray(hist_y_work[-int(window):], dtype=float).reshape(int(window), 1)
-                xw = np.asarray(hist_cov_work[-int(window):], dtype=float) if hist_cov_work else np.zeros((int(window), 0), dtype=float)
-                x_flat = np.concatenate([yw, xw], axis=1).reshape(1, -1)
-                pred_scaled = float(mlp.predict(x_flat).reshape(-1)[0])
-                preds_scaled.append(pred_scaled)
-                hist_y_work.append(pred_scaled)
-                if len(val_cov_scaled):
-                    hist_cov_work.append(np.asarray(val_cov_scaled[i], dtype=float))
-                else:
-                    hist_cov_work.append(np.zeros((0,), dtype=float))
-            pred_val_t = y_scaler.inverse_transform(np.asarray(preds_scaled, dtype=float).reshape(-1, 1)).reshape(-1)
-            pred_val = inverse_target_transform(pred_val_t, y_transform)
-            pred_val = np.maximum(np.asarray(pred_val, dtype=float), 0.0)
-            corrected, post_cfg = compute_validation_postprocess_candidates(val_inner["y"].values, pred_val, tr_inner["y"], season_length)
-            val_w = wape(val_inner["y"].values, corrected)
-            val_s = smape(val_inner["y"].values, corrected)
-            score = float(val_w + 0.30 * val_s)
-            search_rows.append({"model": model_family, "window": int(window), "strategy": "recursive_mlp_surrogate", "val_wape": val_w, "val_smape": val_s, "selected_exog_cols": ", ".join(selected_cols), "composite_score": score})
-            if best is None or score < best["score"]:
-                best = {"window": int(window), "mlp": mlp, "y_scaler": y_scaler, "x_scaler": x_scaler, "transform_cfg": dict(y_transform), "postprocess_cfg": dict(post_cfg), "selected_cols": list(selected_cols), "score": score, "validation_wape": safe_float(val_w), "validation_smape": safe_float(val_s)}
-        except Exception as e:
-            search_rows.append({"model": model_family, "window": int(window), "strategy": "recursive_mlp_surrogate", "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
-    if best is None:
-        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{reason} | MLP surrogate da kurulamadı.")
-    full_y_t = apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
-    y_scaler, x_scaler, full_y_scaled, full_cov_scaled = _fit_dl_scalers(full_y_t, cov_train_df[best["selected_cols"]].values.astype(float) if best["selected_cols"] else np.zeros((len(train_df), 0), dtype=float))
-    X_full, y_full = _make_dl_sequences(full_y_scaled, full_cov_scaled, int(best["window"]))
-    if len(X_full) >= 6:
-        final_mlp = SKMLPRegressor(hidden_layer_sizes=(max(16, int(best["window"]) * 4), max(8, int(best["window"]) * 2)), activation='relu', solver='adam', alpha=0.0005, learning_rate_init=0.001, max_iter=1000, early_stopping=True, validation_fraction=0.12, n_iter_no_change=25, random_state=42)
-        final_mlp.fit(_flatten_dl_sequence_tensor(X_full), y_full)
-    else:
-        final_mlp = best["mlp"]
-    future_cov_scaled = _transform_dl_covariates(x_scaler, cov_test_df[best["selected_cols"]]) if best["selected_cols"] else np.zeros((len(test_df), 0), dtype=float)
-    hist_y_work = list(np.asarray(full_y_scaled, dtype=float).reshape(-1))
-    hist_cov_work = [np.asarray(r, dtype=float) for r in np.asarray(full_cov_scaled, dtype=float)] if np.asarray(full_cov_scaled).size else [np.zeros((0,), dtype=float) for _ in hist_y_work]
-    preds_scaled = []
-    for i in range(len(test_df)):
-        yw = np.asarray(hist_y_work[-int(best["window"]):], dtype=float).reshape(int(best["window"]), 1)
-        xw = np.asarray(hist_cov_work[-int(best["window"]):], dtype=float) if hist_cov_work else np.zeros((int(best["window"]), 0), dtype=float)
-        x_flat = np.concatenate([yw, xw], axis=1).reshape(1, -1)
-        pred_scaled = float(final_mlp.predict(x_flat).reshape(-1)[0])
-        preds_scaled.append(pred_scaled)
-        hist_y_work.append(pred_scaled)
-        if len(future_cov_scaled):
-            hist_cov_work.append(np.asarray(future_cov_scaled[i], dtype=float))
-        else:
-            hist_cov_work.append(np.zeros((0,), dtype=float))
-    pred_t = y_scaler.inverse_transform(np.asarray(preds_scaled, dtype=float).reshape(-1, 1)).reshape(-1)
-    pred = inverse_target_transform(pred_t, best["transform_cfg"])
-    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
-    pred = apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
-    return {
-        "forecast": pred,
-        "search_table": pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
-        "history_df": pd.DataFrame(),
-        "overfit_summary": {"epochs_ran": np.nan, "surrogate_used": True, "reason": reason},
-        "selected_config": {"window": int(best["window"]), "strategy": "recursive_mlp_surrogate"},
-        "transform": best["transform_cfg"].get("name", "none"),
-        "used_exog_cols": list(best["selected_cols"]),
-        "validation_wape": safe_float(best.get("validation_wape", np.nan)),
-        "validation_smape": safe_float(best.get("validation_smape", np.nan)),
-        "fallback_used": False,
-        "fallback_method": None,
-        "fit_mode": f"deep_learning_{str(model_family).lower()}_surrogate_mlp",
-        "search_accelerator_cache_hit": False,
-        "surrogate_used": True,
+    """
+    Sealed DL-surrogate path.
+
+    This function intentionally does NOT fit/evaluate an MLP surrogate and
+    does NOT compare surrogate WAPE against a real LSTM/GRU forecast. A
+    surrogate may not replace, improve, calibrate, blend, or masquerade as
+    LSTM/GRU output. Returning a quarantined fallback-only result keeps the
+    pipeline operational while making the model identity explicit.
+    """
+    sealed_reason = (
+        f"{reason} | DL surrogate MLP yolu kapalıdır. "
+        "Test/holdout WAPE değerine bakarak surrogate seçimi veya gerçek LSTM/GRU çıktısını "
+        "surrogate ile değiştirme leakage ürettiği için yasaklandı."
+    )
+    result = _finalize_dl_backend_fallback(
+        build_model_level_fallback(model_family, train_df, test_df, freq_alias, sealed_reason),
+        model_family=model_family,
+        reason=sealed_reason,
+        backend_state="surrogate_mlp_disabled_no_leakage",
+    )
+    result["surrogate_attempted"] = False
+    result["surrogate_used"] = False
+    result["surrogate_test_wape_comparison"] = False
+    result["surrogate_selection_metric"] = None
+    result["surrogate_override_forbidden"] = True
+    result["test_set_used_for_model_selection"] = False
+    result["posthoc_surrogate_override"] = False
+    result["dl_test_set_surrogate_override_removed"] = True
+    result["dl_never_compare_surrogate_to_holdout"] = True
+    result["model_identity_note"] = (
+        f"{model_family} için surrogate MLP bilinçli olarak çalıştırılmadı. "
+        "Gerçek recurrent DL eğitimi başarısızsa LSTM/GRU metriği üretilmez; "
+        "fallback yalnızca operational_fallback_forecast/audit amacıyla saklanır."
+    )
+    return result
+
+
+
+def _is_tabular_ml_engineered_feature(name: str) -> bool:
+    """Return True for target-derived tabular ML features that are not DL-native inputs."""
+    lower = str(name).strip().lower()
+    blocked_tokens = (
+        "lag_", "seasonal_lag", "diff_", "roll_", "rolling", "ewm_",
+        "recent_mean_gap", "recent_z", "trend_slope", "expanding_",
+        "target_", "y_lag", "y_roll", "clean_rolling", "forecast_error"
+    )
+    return any(tok in lower for tok in blocked_tokens)
+
+
+def _safe_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return pd.DataFrame(index=getattr(df, "index", None))
+    out = pd.DataFrame(index=df.index)
+    for col in df.columns:
+        s = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if s.notna().mean() >= 0.70 and s.dropna().nunique() > 1:
+            med = safe_float(s.median())
+            if pd.isna(med):
+                med = 0.0
+            out[str(col)] = s.fillna(med).fillna(0.0).astype(float).values
+    return out
+
+
+def _build_dl_calendar_time_covariates(df: pd.DataFrame, freq_alias: str, start_pos: int = 0, model_family: str = "LSTM") -> pd.DataFrame:
+    """
+    Build known-in-advance, sequence-native covariates for recurrent DL.
+
+    These are intentionally NOT XGBoost-style lag/rolling target features. They
+    use only the timestamp and deterministic position information available at
+    forecast creation time, so the recurrent tensor remains primarily a target
+    sequence with light calendar context.
+    """
+    idx = getattr(df, "index", pd.RangeIndex(0))
+    if not isinstance(df, pd.DataFrame) or "ds" not in df.columns or len(df) == 0:
+        return pd.DataFrame(index=idx)
+    cfg = FORECAST_RUNTIME_CONFIG
+    freq = str(freq_alias).upper()
+    ds = pd.to_datetime(df["ds"], errors="coerce")
+    out = pd.DataFrame(index=df.index)
+
+    if bool(getattr(cfg, "dl_native_include_time_index_covariates", True)):
+        pos = np.arange(int(start_pos), int(start_pos) + len(df), dtype=float)
+        denom = max(float(int(start_pos) + len(df) - 1), 1.0)
+        out["dl_time_idx_norm"] = pos / denom
+        out["dl_time_idx_sqrt"] = np.sqrt(np.maximum(pos, 0.0)) / max(np.sqrt(denom), 1.0)
+
+    if bool(getattr(cfg, "dl_native_include_calendar_covariates", True)):
+        month = ds.dt.month.fillna(1).astype(int).clip(1, 12)
+        out["dl_month_sin"] = np.sin(2 * np.pi * month / 12.0)
+        out["dl_month_cos"] = np.cos(2 * np.pi * month / 12.0)
+        quarter = ds.dt.quarter.fillna(1).astype(int).clip(1, 4)
+        out["dl_quarter_sin"] = np.sin(2 * np.pi * quarter / 4.0)
+        out["dl_quarter_cos"] = np.cos(2 * np.pi * quarter / 4.0)
+        out["dl_is_month_start"] = ds.dt.is_month_start.fillna(False).astype(int)
+        out["dl_is_month_end"] = ds.dt.is_month_end.fillna(False).astype(int)
+        if freq in {"W", "D", "H"}:
+            week = ds.dt.isocalendar().week.astype("Int64").fillna(1).astype(int).clip(1, 53)
+            out["dl_week_sin"] = np.sin(2 * np.pi * week / 52.0)
+            out["dl_week_cos"] = np.cos(2 * np.pi * week / 52.0)
+        if freq in {"D", "H"}:
+            dow = ds.dt.dayofweek.fillna(0).astype(int).clip(0, 6)
+            out["dl_dow_sin"] = np.sin(2 * np.pi * dow / 7.0)
+            out["dl_dow_cos"] = np.cos(2 * np.pi * dow / 7.0)
+        if freq == "H":
+            hour = ds.dt.hour.fillna(0).astype(int).clip(0, 23)
+            out["dl_hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
+            out["dl_hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
+
+    if bool(getattr(cfg, "dl_native_include_family_marker", True)):
+        fam = str(model_family).upper()
+        out["dl_family_lstm_marker"] = 1.0 if fam == "LSTM" else 0.0
+        out["dl_family_gru_marker"] = 1.0 if fam == "GRU" else 0.0
+
+    out = _safe_numeric_frame(out)
+    max_cols = max(0, int(getattr(cfg, "dl_native_max_calendar_covariates", 12)))
+    if max_cols and len(out.columns) > max_cols:
+        preferred = [
+            "dl_time_idx_norm", "dl_time_idx_sqrt",
+            "dl_month_sin", "dl_month_cos", "dl_quarter_sin", "dl_quarter_cos",
+            "dl_week_sin", "dl_week_cos", "dl_dow_sin", "dl_dow_cos",
+            "dl_hour_sin", "dl_hour_cos", "dl_is_month_start", "dl_is_month_end",
+            "dl_family_lstm_marker", "dl_family_gru_marker",
+        ]
+        keep = [c for c in preferred if c in out.columns][:max_cols]
+        out = out[keep].copy()
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def build_dl_sequence_native_covariates(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_train: Optional[pd.DataFrame],
+    feature_test: Optional[pd.DataFrame],
+    freq_alias: str,
+    model_family: str,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], Dict[str, Any]]:
+    """
+    Decide and build the DL covariate channel.
+
+    Default mode is sequence_native. It deliberately ignores the ML feature pool
+    (lags, rolling means, EWM, target diffs) used by XGBoost. A legacy tabular
+    route exists only behind an explicit opt-in flag for backward compatibility.
+    """
+    cfg = FORECAST_RUNTIME_CONFIG
+    mode = str(getattr(cfg, "dl_sequence_input_mode", "sequence_native") or "sequence_native").lower().strip()
+    family = str(model_family).upper()
+    if mode in {"target_only", "pure_sequence", "none"}:
+        tr = pd.DataFrame(index=train_df.index)
+        te = pd.DataFrame(index=test_df.index)
+        meta = {
+            "dl_input_mode": "target_only",
+            "dl_feature_source": "target_history_only",
+            "dl_feature_count": 0,
+            "dl_blocked_tabular_feature_count": int(len(getattr(feature_train, "columns", []))),
+            "dl_input_contract": "target_sequence_channel_only_no_tabular_ml_features",
+        }
+        return tr, te, [], meta
+
+    if mode == "legacy_tabular" and bool(getattr(cfg, "dl_allow_legacy_tabular_exog", False)):
+        selected = _select_dl_feature_columns(feature_train, feature_test, train_df["y"], getattr(cfg, "dl_sequence_max_exog_cols", 16))
+        selected = [c for c in selected if not (bool(getattr(cfg, "dl_block_tabular_lag_rolling_exog", True)) and _is_tabular_ml_engineered_feature(c))]
+        tr = feature_train[selected].copy() if selected and isinstance(feature_train, pd.DataFrame) else pd.DataFrame(index=train_df.index)
+        te = feature_test[selected].copy() if selected and isinstance(feature_test, pd.DataFrame) else pd.DataFrame(index=test_df.index)
+        tr = _safe_numeric_frame(tr).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        te = _safe_numeric_frame(te).reindex(columns=tr.columns, fill_value=0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        meta = {
+            "dl_input_mode": "legacy_tabular_sanitized",
+            "dl_feature_source": "explicit_legacy_feature_pool_sanitized",
+            "dl_feature_count": int(len(selected)),
+            "dl_blocked_tabular_feature_count": int(len(getattr(feature_train, "columns", [])) - len(selected)) if isinstance(feature_train, pd.DataFrame) else 0,
+            "dl_input_contract": "legacy_tabular_opt_in_blocking_lag_rolling_features",
+        }
+        return tr, te, list(tr.columns), meta
+
+    combined_train = train_df[["ds"]].copy().reset_index(drop=True)
+    combined_test = test_df[["ds"]].copy().reset_index(drop=True)
+    tr = _build_dl_calendar_time_covariates(combined_train, freq_alias=freq_alias, start_pos=0, model_family=family)
+    te = _build_dl_calendar_time_covariates(combined_test, freq_alias=freq_alias, start_pos=len(train_df), model_family=family)
+    te = te.reindex(columns=tr.columns, fill_value=0.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    blocked = 0
+    if isinstance(feature_train, pd.DataFrame):
+        blocked = int(sum(_is_tabular_ml_engineered_feature(c) for c in feature_train.columns))
+    meta = {
+        "dl_input_mode": "sequence_native",
+        "dl_feature_source": "target_history_plus_known_calendar_time_covariates",
+        "dl_feature_count": int(len(tr.columns)),
+        "dl_blocked_tabular_feature_count": blocked,
+        "dl_input_contract": "target_sequence_primary_calendar_time_only_no_xgboost_lag_rolling_pool",
     }
+    return tr.reset_index(drop=True), te.reset_index(drop=True), list(tr.columns), meta
 
 
 def _rank_dl_feature_columns_by_signal(feature_train: pd.DataFrame, target_train: pd.Series) -> List[Tuple[str, float, float, float]]:
@@ -9404,10 +10596,10 @@ def _rank_dl_feature_columns_by_signal(feature_train: pd.DataFrame, target_train
                     corr_abs = abs(float(corr_val))
             except Exception:
                 corr_abs = 0.0
+        if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_block_tabular_lag_rolling_exog", True)) and _is_tabular_ml_engineered_feature(col):
+            continue
         name_bonus = 0.0
         lower = str(col).lower()
-        if any(tok in lower for tok in ["lag", "rolling", "roll", "season", "trend", "ewm"]):
-            name_bonus += 0.08
         if any(tok in lower for tok in ["month", "quarter", "holiday", "sin", "cos", "dow", "week", "is_"]):
             name_bonus += 0.05
         score = 2.8 * corr_abs + 0.55 * completeness + 0.03 * math.log1p(max(std_val, 0.0)) + name_bonus
@@ -9490,34 +10682,96 @@ def _make_recent_sample_weights(n_samples: int, max_weight: float) -> np.ndarray
     return np.linspace(1.0, max_weight, n_samples, dtype=float)
 
 
-def _build_dl_network(input_shape: Tuple[int, int], model_family: str, units: int, layers: int, dropout: float, learning_rate: float = 0.001, output_dim: int = 1):
+def _build_dl_network(
+    input_shape: Tuple[int, int],
+    model_family: str,
+    units: int,
+    layers: int,
+    dropout: float,
+    learning_rate: float = 0.001,
+    output_dim: int = 1,
+    dense_head_ratio: Optional[float] = None,
+    recurrent_dropout: Optional[float] = None,
+    dense_activation: Optional[str] = None,
+):
     if not HAS_TF or Sequential is None:
         raise ImportError("TensorFlow/Keras bulunamadı.")
     fam = str(model_family).upper()
     recurrent_cls = KerasLSTM if fam == "LSTM" else KerasGRU if fam == "GRU" else KerasSimpleRNN
+    profile = get_dl_family_profile(fam)
+    dense_head_ratio = float(profile.get("dense_head_ratio", 0.5) if dense_head_ratio is None else dense_head_ratio)
+    recurrent_dropout = float(profile.get("recurrent_dropout", 0.0) if recurrent_dropout is None else recurrent_dropout)
+    dense_activation = str(profile.get("dense_activation", "relu") if dense_activation is None else dense_activation)
     tf.keras.backend.clear_session()
     try:
-        tf.keras.utils.set_random_seed(42)
+        tf.keras.utils.set_random_seed(42 if fam != "GRU" else 84)
     except Exception:
         pass
+
+    def _recurrent_layer(n_units: int, return_sequences: bool, use_input_shape: bool = False):
+        kwargs = {
+            "return_sequences": bool(return_sequences),
+        }
+        if use_input_shape:
+            kwargs["input_shape"] = input_shape
+        # Intentionally different regularization: LSTM gets small recurrent
+        # dropout for memory-state regularization; GRU keeps recurrent dropout
+        # at zero by default for faster adaptation on short demand histories.
+        if recurrent_dropout > 0:
+            kwargs["recurrent_dropout"] = float(recurrent_dropout)
+        return recurrent_cls(int(n_units), **kwargs)
+
     model = Sequential()
-    if int(layers) <= 1:
-        model.add(recurrent_cls(int(units), input_shape=input_shape, return_sequences=False))
-        if float(dropout) > 0:
-            model.add(KerasDropout(float(dropout)))
+    layers = max(1, int(layers))
+    if fam == "LSTM":
+        # Longer-memory, higher-capacity branch.
+        if layers <= 1:
+            model.add(_recurrent_layer(int(units), return_sequences=False, use_input_shape=True))
+            if float(dropout) > 0:
+                model.add(KerasDropout(float(dropout)))
+        else:
+            model.add(_recurrent_layer(int(units), return_sequences=True, use_input_shape=True))
+            if float(dropout) > 0:
+                model.add(KerasDropout(float(dropout)))
+            if layers >= 3:
+                model.add(_recurrent_layer(max(12, int(round(int(units) * 0.75))), return_sequences=True))
+                if float(dropout) > 0:
+                    model.add(KerasDropout(float(min(0.45, float(dropout) + 0.05))))
+            model.add(_recurrent_layer(max(10, int(units) // 2), return_sequences=False))
+            if float(dropout) > 0:
+                model.add(KerasDropout(float(dropout)))
+        head_units = max(12, int(round(int(units) * dense_head_ratio)))
+        model.add(KerasDense(head_units, activation=dense_activation))
+        model.add(KerasDense(max(8, head_units // 2), activation="relu"))
+    elif fam == "GRU":
+        # Short/medium-memory, lighter and faster-adapting branch.
+        if layers <= 1:
+            model.add(_recurrent_layer(int(units), return_sequences=False, use_input_shape=True))
+            if float(dropout) > 0:
+                model.add(KerasDropout(float(dropout)))
+        else:
+            model.add(_recurrent_layer(int(units), return_sequences=True, use_input_shape=True))
+            if float(dropout) > 0:
+                model.add(KerasDropout(float(dropout)))
+            model.add(_recurrent_layer(max(8, int(round(int(units) * 0.60))), return_sequences=False))
+            if float(dropout) > 0:
+                model.add(KerasDropout(float(max(0.0, float(dropout) * 0.75))))
+        head_units = max(8, int(round(int(units) * dense_head_ratio)))
+        model.add(KerasDense(head_units, activation=dense_activation))
     else:
-        model.add(recurrent_cls(int(units), input_shape=input_shape, return_sequences=True))
+        if layers <= 1:
+            model.add(_recurrent_layer(int(units), return_sequences=False, use_input_shape=True))
+        else:
+            model.add(_recurrent_layer(int(units), return_sequences=True, use_input_shape=True))
+            model.add(_recurrent_layer(max(10, int(units) // 2), return_sequences=False))
         if float(dropout) > 0:
             model.add(KerasDropout(float(dropout)))
-        model.add(recurrent_cls(max(10, int(units)//2), return_sequences=False))
-        if float(dropout) > 0:
-            model.add(KerasDropout(float(dropout)))
-    model.add(KerasDense(max(8, int(units)//2), activation="relu"))
+        model.add(KerasDense(max(8, int(units) // 2), activation="relu"))
+
     model.add(KerasDense(int(max(1, output_dim))))
     loss_fn = tf.keras.losses.Huber(delta=1.0) if HAS_TF else "mse"
     model.compile(optimizer=KerasAdam(learning_rate=float(learning_rate)), loss=loss_fn, metrics=["mae"])
     return model
-
 
 def _recursive_dl_forecast(model, history_y_scaled: np.ndarray, history_cov_scaled: np.ndarray, future_cov_scaled: np.ndarray, window: int) -> np.ndarray:
     hist_y=list(np.asarray(history_y_scaled, dtype=float).reshape(-1))
@@ -9572,15 +10826,28 @@ def build_dl_loss_curve(history_df: pd.DataFrame, title: str):
     return fig
 
 
-def _make_torch_sequence_model(input_size: int, hidden_size: int, layers: int, dropout: float, output_dim: int, model_family: str):
+def _make_torch_sequence_model(
+    input_size: int,
+    hidden_size: int,
+    layers: int,
+    dropout: float,
+    output_dim: int,
+    model_family: str,
+    dense_head_ratio: Optional[float] = None,
+    dense_activation: Optional[str] = None,
+):
     if TorchNN is None:
         raise ImportError("PyTorch bulunamadı.")
     family = str(model_family).upper()
     recurrent_cls = TorchNN.LSTM if family == "LSTM" else TorchNN.GRU if family == "GRU" else TorchNN.RNN
+    profile = get_dl_family_profile(family)
+    dense_head_ratio = float(profile.get("dense_head_ratio", 0.5) if dense_head_ratio is None else dense_head_ratio)
+    dense_activation = str(profile.get("dense_activation", "relu") if dense_activation is None else dense_activation)
 
     class _TorchSequenceForecaster(TorchNN.Module):
         def __init__(self):
             super().__init__()
+            self.family = family
             self.recurrent = recurrent_cls(
                 input_size=int(input_size),
                 hidden_size=int(hidden_size),
@@ -9589,13 +10856,29 @@ def _make_torch_sequence_model(input_size: int, hidden_size: int, layers: int, d
                 batch_first=True,
             )
             self.norm = TorchNN.LayerNorm(int(hidden_size))
-            mid_dim = max(8, int(hidden_size) // 2)
-            self.head = TorchNN.Sequential(
+            mid_dim = max(8, int(round(int(hidden_size) * dense_head_ratio)))
+            if dense_activation == "tanh":
+                act = TorchNN.Tanh()
+            elif hasattr(TorchNN, "GELU") and dense_activation in {"gelu", "relu"} and family == "GRU":
+                # GRU branch uses a smooth lightweight head; LSTM remains tanh-biased.
+                act = TorchNN.GELU()
+            else:
+                act = TorchNN.ReLU()
+            head_layers = [
                 TorchNN.Linear(int(hidden_size), mid_dim),
-                TorchNN.ReLU(),
+                act,
                 TorchNN.Dropout(float(dropout)),
-                TorchNN.Linear(mid_dim, int(output_dim)),
-            )
+            ]
+            if family == "LSTM":
+                head_layers.extend([
+                    TorchNN.Linear(mid_dim, max(8, mid_dim // 2)),
+                    TorchNN.ReLU(),
+                    TorchNN.Dropout(float(min(0.45, max(0.0, dropout + 0.05)))),
+                    TorchNN.Linear(max(8, mid_dim // 2), int(output_dim)),
+                ])
+            else:
+                head_layers.append(TorchNN.Linear(mid_dim, int(output_dim)))
+            self.head = TorchNN.Sequential(*head_layers)
 
         def forward(self, x):
             out, hidden = self.recurrent(x)
@@ -9607,7 +10890,6 @@ def _make_torch_sequence_model(input_size: int, hidden_size: int, layers: int, d
             return self.head(hidden_state)
 
     return _TorchSequenceForecaster()
-
 
 def _torch_history_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
@@ -9621,7 +10903,7 @@ def _torch_history_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 def _torch_train_sequence_model(X_seq: np.ndarray, y_seq: np.ndarray, cfg: Dict[str, Any], model_family: str, sample_weight: Optional[np.ndarray] = None) -> Tuple[Any, pd.DataFrame]:
     if not HAS_TORCH or torch is None or TorchNN is None or TorchOptim is None:
         raise ImportError("PyTorch bulunamadı.")
-    torch.manual_seed(42)
+    torch.manual_seed(42 if str(model_family).upper() != "GRU" else 84)
     X_np = np.asarray(X_seq, dtype=np.float32)
     y_np = np.asarray(y_seq, dtype=np.float32)
     if y_np.ndim == 1:
@@ -9646,9 +10928,17 @@ def _torch_train_sequence_model(X_seq: np.ndarray, y_seq: np.ndarray, cfg: Dict[
         dropout=float(cfg["dropout"]),
         output_dim=int(y_np.shape[1]),
         model_family=model_family,
+        dense_head_ratio=float(cfg.get("dense_head_ratio", get_dl_family_profile(model_family).get("dense_head_ratio", 0.5))),
+        dense_activation=str(cfg.get("dense_activation", get_dl_family_profile(model_family).get("dense_activation", "relu"))),
     )
-    optimizer = TorchOptim.AdamW(model.parameters(), lr=float(cfg.get("learning_rate", 0.001)), weight_decay=1e-4)
-    scheduler = TorchReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=max(4, int(FORECAST_RUNTIME_CONFIG.dl_patience) // 5), min_lr=1e-5) if TorchReduceLROnPlateau is not None else None
+    optimizer = TorchOptim.AdamW(
+        model.parameters(),
+        lr=float(cfg.get("learning_rate", 0.001)),
+        weight_decay=float(cfg.get("weight_decay", get_dl_family_profile(model_family).get("weight_decay", 1e-4))),
+    )
+    train_patience = int(max(4, cfg.get("patience", FORECAST_RUNTIME_CONFIG.dl_patience)))
+    train_max_epochs = int(max(12, cfg.get("max_epochs", FORECAST_RUNTIME_CONFIG.dl_max_epochs)))
+    scheduler = TorchReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=max(3, train_patience // 5), min_lr=1e-5) if TorchReduceLROnPlateau is not None else None
     loss_fn = TorchNN.SmoothL1Loss(reduction="none")
 
     X_train = torch.tensor(X_train_np, dtype=torch.float32)
@@ -9659,11 +10949,12 @@ def _torch_train_sequence_model(X_seq: np.ndarray, y_seq: np.ndarray, cfg: Dict[
 
     best_state = None
     best_val = np.inf
-    patience_left = int(max(8, FORECAST_RUNTIME_CONFIG.dl_patience))
+    patience_left = int(max(4, train_patience))
     history_rows: List[Dict[str, Any]] = []
-    batch_size = int(min(max(4, FORECAST_RUNTIME_CONFIG.dl_batch_size), max(4, len(X_train_np))))
+    family_batch_size = int(cfg.get("batch_size", FORECAST_RUNTIME_CONFIG.dl_batch_size))
+    batch_size = int(min(max(4, family_batch_size), max(4, len(X_train_np))))
 
-    for epoch in range(1, int(FORECAST_RUNTIME_CONFIG.dl_max_epochs) + 1):
+    for epoch in range(1, int(train_max_epochs) + 1):
         model.train()
         permutation = torch.randperm(X_train.shape[0])
         batch_losses = []
@@ -9698,7 +10989,7 @@ def _torch_train_sequence_model(X_seq: np.ndarray, y_seq: np.ndarray, cfg: Dict[
         if np.isfinite(val_loss) and (val_loss + 1e-6) < best_val:
             best_val = float(val_loss)
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            patience_left = int(max(8, FORECAST_RUNTIME_CONFIG.dl_patience))
+            patience_left = int(max(4, train_patience))
         else:
             patience_left -= 1
             if patience_left <= 0:
@@ -9749,108 +11040,811 @@ def _torch_direct_forecast(model: Any, history_y_scaled: np.ndarray, history_cov
     return np.asarray(pred[:int(horizon)], dtype=float)
 
 
+
+
+def _finalize_dl_backend_fallback(result: Dict[str, Any], model_family: str, reason: str, backend_state: str = "backend_unavailable") -> Dict[str, Any]:
+    result = copy.deepcopy(result) if isinstance(result, dict) else {"forecast": np.full(1, np.nan)}
+    result["fallback_used"] = True
+    result["fallback_method"] = backend_state
+    result["surrogate_used"] = False
+    result["real_dl_trained"] = False
+    result["dl_backend"] = "none"
+    result["surrogate_evaluation_disabled"] = True
+    result["surrogate_test_wape_comparison"] = False
+    result["surrogate_selection_metric"] = None
+    result["dl_test_set_surrogate_override_removed"] = True
+    result["dl_never_compare_surrogate_to_holdout"] = True
+    result["fit_mode"] = f"deep_learning_{str(model_family).lower()}_fallback_only"
+    result["model_identity_note"] = f"{model_family} için gerçek DL backend/eğitim kullanılamadı; sonuç güvenli fallback modelinden üretildi. Sebep: {reason}"
+    result["backend_availability"] = backend_state
+    result["eligible_for_model_ranking"] = False
+    result["forecast_is_model_output"] = False
+    result["dl_strict_validation_passed"] = False
+    result["strict_dl_rejection_reason"] = str(reason)
+    result["surrogate_override_forbidden"] = True
+    result["test_set_used_for_model_selection"] = False
+    result["posthoc_surrogate_override"] = False
+    result["leakage_guard"] = "holdout_not_used_for_fallback_or_surrogate_selection"
+    if "history_df" not in result or not isinstance(result.get("history_df"), pd.DataFrame):
+        result["history_df"] = pd.DataFrame(columns=["epoch", "loss", "val_loss"])
+    if "search_table" in result and isinstance(result["search_table"], pd.DataFrame) and len(result["search_table"]) > 0:
+        if "backend" not in result["search_table"].columns:
+            result["search_table"]["backend"] = "none"
+    return result
+
+
+def _finite_prediction_array(pred: Any, expected_horizon: Optional[int] = None) -> bool:
+    try:
+        arr = np.asarray(pred, dtype=float).reshape(-1)
+    except Exception:
+        return False
+    if expected_horizon is not None and int(expected_horizon) > 0 and len(arr) != int(expected_horizon):
+        return False
+    return bool(len(arr) > 0 and np.isfinite(arr).all())
+
+
+def _history_has_real_epochs(history_df: Any) -> bool:
+    if not isinstance(history_df, pd.DataFrame) or len(history_df) == 0:
+        return False
+    if "loss" not in history_df.columns:
+        return False
+    loss = pd.to_numeric(history_df.get("loss"), errors="coerce")
+    return bool(loss.notna().sum() > 0 and np.isfinite(loss.dropna().values).any())
+
+
+def is_real_deep_learning_result(result: Dict[str, Any], model_family: Optional[str] = None, expected_horizon: Optional[int] = None) -> bool:
+    """
+    Hard identity gate for LSTM/GRU.
+
+    A result is treated as a real DL result only if all of these are true:
+      - no fallback and no surrogate path was used,
+      - backend is TensorFlow/Keras or PyTorch,
+      - real_dl_trained is True,
+      - epoch-loss history is non-empty,
+      - forecast is finite and has the expected horizon length.
+
+    This prevents fallback/MLP/baseline forecasts from entering metrics,
+    rankings, backtests, tables, or ensembles under the LSTM/GRU label.
+    """
+    if not isinstance(result, dict):
+        return False
+    family = str(model_family or result.get("model_family") or "").upper()
+    if family and family not in {"LSTM", "GRU", "RNN"}:
+        return True
+    if bool(result.get("fallback_used", False)):
+        return False
+    if bool(result.get("surrogate_used", False)):
+        return False
+    if not bool(result.get("real_dl_trained", False)):
+        return False
+    backend = str(result.get("dl_backend", "")).lower()
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_tensorflow_backend_for_real_recurrent", True)) and family in {"LSTM", "GRU"}:
+        if backend != "tensorflow":
+            return False
+    elif backend not in {"tensorflow", "torch"}:
+        return False
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_nonempty_history", True)) and not _history_has_real_epochs(result.get("history_df")):
+        return False
+    if not _finite_prediction_array(result.get("forecast"), expected_horizon=expected_horizon):
+        return False
+    return True
+
+
+def quarantine_non_real_dl_result(result: Dict[str, Any], test_len: int, model_family: str, reason: str) -> Dict[str, Any]:
+    """
+    Preserve fallback values for audit, but remove them from the public
+    LSTM/GRU forecast channel so they cannot contaminate model comparison.
+    """
+    out = copy.deepcopy(result) if isinstance(result, dict) else {}
+    try:
+        original_forecast = np.asarray(out.get("forecast", np.full(int(test_len), np.nan)), dtype=float).reshape(-1)
+    except Exception:
+        original_forecast = np.full(int(test_len), np.nan, dtype=float)
+    out["operational_fallback_forecast"] = original_forecast.copy()
+    out["forecast"] = np.full(int(test_len), np.nan, dtype=float)
+    out["raw_forecast"] = np.full(int(test_len), np.nan, dtype=float)
+    out["validation_wape"] = np.nan
+    out["validation_smape"] = np.nan
+    out["eligible_for_model_ranking"] = False
+    out["forecast_is_model_output"] = False
+    out["dl_strict_validation_passed"] = False
+    out["strict_dl_rejection_reason"] = str(reason)
+    out["surrogate_override_forbidden"] = True
+    out["test_set_used_for_model_selection"] = False
+    out["posthoc_surrogate_override"] = False
+    out["surrogate_test_wape_comparison"] = False
+    out["surrogate_selection_metric"] = None
+    out["dl_test_set_surrogate_override_removed"] = True
+    out["dl_never_compare_surrogate_to_holdout"] = True
+    out["leakage_guard"] = "quarantined_no_public_metric_no_holdout_selection"
+    out["dl_result_kind"] = "quarantined_not_real_dl"
+    out["dl_runtime_state"] = "excluded_from_public_lstm_gru_metrics"
+    out["model_identity_note"] = (
+        f"{model_family} gerçek recurrent DL eğitimi olarak doğrulanamadı. "
+        "Fallback/surrogate/baseline değerleri LSTM/GRU metriği gibi kullanılmadı; "
+        "yalnızca operational_fallback_forecast alanında audit için saklandı. "
+        f"Sebep: {reason}"
+    )
+    if "history_df" not in out or not isinstance(out.get("history_df"), pd.DataFrame):
+        out["history_df"] = pd.DataFrame(columns=["epoch", "loss", "val_loss"])
+    stbl = out.get("search_table")
+    if isinstance(stbl, pd.DataFrame):
+        stbl = stbl.copy()
+        stbl["dl_strict_validation_passed"] = False
+        stbl["ranking_excluded"] = True
+        stbl["ranking_exclusion_reason"] = str(reason)
+        out["search_table"] = stbl
+    else:
+        out["search_table"] = pd.DataFrame([{
+            "model": model_family,
+            "dl_strict_validation_passed": False,
+            "ranking_excluded": True,
+            "ranking_exclusion_reason": str(reason),
+        }])
+    return out
+
+
+def mark_real_dl_result(result: Dict[str, Any], model_family: str) -> Dict[str, Any]:
+    out = copy.deepcopy(result) if isinstance(result, dict) else {}
+    out["model_family"] = str(model_family).upper()
+    out["eligible_for_model_ranking"] = bool(out.get("eligible_for_model_ranking", True))
+    out["forecast_is_model_output"] = True
+    out["dl_strict_validation_passed"] = True
+    out["strict_dl_rejection_reason"] = None
+    out["surrogate_override_forbidden"] = True
+    out["test_set_used_for_model_selection"] = False
+    out["posthoc_surrogate_override"] = False
+    out["surrogate_test_wape_comparison"] = False
+    out["surrogate_selection_metric"] = None
+    out["dl_test_set_surrogate_override_removed"] = True
+    out["dl_never_compare_surrogate_to_holdout"] = True
+    out["leakage_guard"] = "inner_validation_only_no_holdout_selection"
+    out["surrogate_test_wape_comparison"] = False
+    out["surrogate_selection_metric"] = None
+    out["dl_test_set_surrogate_override_removed"] = True
+    out["dl_never_compare_surrogate_to_holdout"] = True
+    out["dl_result_kind"] = "real_recurrent_dl"
+    out["dl_runtime_state"] = "trained_real_backend_rankable"
+    if "dl_input_mode" not in out:
+        out["dl_input_mode"] = str(getattr(FORECAST_RUNTIME_CONFIG, "dl_sequence_input_mode", "sequence_native"))
+    return out
+
+
+def sanitize_dl_result_for_reporting(result: Dict[str, Any], model_family: str, horizon: int) -> Dict[str, Any]:
+    if is_real_deep_learning_result(result, model_family=model_family, expected_horizon=horizon):
+        out = mark_real_dl_result(result, model_family)
+    else:
+        reason_parts = []
+        if not isinstance(result, dict):
+            reason_parts.append("result_dict_missing")
+        else:
+            if bool(result.get("fallback_used", False)):
+                reason_parts.append(f"fallback_used={result.get('fallback_method')}")
+            if bool(result.get("surrogate_used", False)):
+                reason_parts.append("surrogate_used=True")
+            if not bool(result.get("real_dl_trained", False)):
+                reason_parts.append("real_dl_trained=False")
+            backend = str(result.get("dl_backend", "")).lower()
+            if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_tensorflow_backend_for_real_recurrent", True)) and str(model_family).upper() in {"LSTM", "GRU"} and backend != "tensorflow":
+                reason_parts.append(f"tensorflow_required_backend={backend or 'missing'}")
+            elif backend not in {"tensorflow", "torch"}:
+                reason_parts.append(f"invalid_backend={backend or 'missing'}")
+            if not _history_has_real_epochs(result.get("history_df")):
+                reason_parts.append("epoch_loss_history_empty")
+            if not _finite_prediction_array(result.get("forecast"), expected_horizon=horizon):
+                reason_parts.append("forecast_not_finite_or_wrong_horizon")
+        reason = " | ".join(reason_parts) if reason_parts else "strict_real_dl_gate_failed"
+        out = quarantine_non_real_dl_result(result, int(horizon), str(model_family).upper(), reason)
+    out = _apply_dl_contextual_suitability_gate(out, model_family=model_family)
+    out = attach_dl_training_status_table(out, model_family=model_family, horizon=horizon)
+    return out
+
+
+def enforce_no_posthoc_surrogate_override(result: Dict[str, Any], model_family: str, horizon: int) -> Dict[str, Any]:
+    """Final DL leakage gate before a LSTM/GRU result can leave the fitting layer."""
+    out = sanitize_dl_result_for_reporting(result, model_family=model_family, horizon=horizon)
+    out["surrogate_override_forbidden"] = True
+    out["test_set_used_for_model_selection"] = False
+    out["posthoc_surrogate_override"] = False
+    out["surrogate_test_wape_comparison"] = False
+    out["surrogate_selection_metric"] = None
+    out["dl_test_set_surrogate_override_removed"] = True
+    out["dl_never_compare_surrogate_to_holdout"] = True
+    out["surrogate_test_wape_comparison"] = False
+    out["surrogate_selection_metric"] = None
+    out["dl_test_set_surrogate_override_removed"] = True
+    out["dl_never_compare_surrogate_to_holdout"] = True
+    out["leakage_guard"] = out.get("leakage_guard") or "final_no_surrogate_override_gate"
+    if str(model_family).upper() in {"LSTM", "GRU"} and bool(out.get("surrogate_used", False)):
+        return quarantine_non_real_dl_result(
+            out,
+            int(horizon),
+            str(model_family).upper(),
+            "surrogate_used=True after final no-leakage gate",
+        )
+    return apply_dl_no_test_surrogate_override_contract(out, model_family=model_family, horizon=horizon)
+
+
+
+
+
+# =========================================================
+# ADVANCED DL GOVERNANCE: RESIDUAL MODE, STATUS TABLE, SUITABILITY GATE
+# =========================================================
+
+def _dl_should_use_residual_mode(freq_alias: str, train_len: int, model_family: str, policy: Optional[Dict[str, Any]] = None) -> bool:
+    """Use residual-DL only for short/marginal monthly real-DL challenger regimes."""
+    cfg = FORECAST_RUNTIME_CONFIG
+    family = str(model_family or "").upper()
+    if family not in {"LSTM", "GRU"}:
+        return False
+    if not bool(getattr(cfg, "dl_residual_mode_for_monthly_short_series", True)):
+        return False
+    if str(freq_alias or "").upper() != "M":
+        return False
+    n = int(train_len or 0)
+    lo = int(getattr(cfg, "dl_residual_mode_min_train_n", 72))
+    hi = int(getattr(cfg, "dl_residual_mode_train_n_upper", 96))
+    if n < lo or n >= hi:
+        return False
+    if policy and not bool(policy.get("train_real_dl_allowed", True)):
+        return False
+    return True
+
+
+def _seasonal_or_drift_base_arrays(y_train: pd.Series, horizon: int, freq_alias: str, season_length: int) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Leakage-free in-sample one-step base and future base forecast for residual DL."""
+    y = pd.to_numeric(y_train, errors="coerce").astype(float).reset_index(drop=True).ffill().bfill().fillna(0.0)
+    n = int(len(y))
+    h = max(0, int(horizon))
+    s_len = int(season_length or 1)
+    base_train = np.zeros(n, dtype=float)
+    for i in range(n):
+        hist = y.iloc[:i]
+        if len(hist) == 0:
+            base_train[i] = float(y.iloc[0]) if n else 0.0
+        elif s_len > 1 and i >= s_len:
+            base_train[i] = float(y.iloc[i - s_len])
+        elif len(hist) >= 3:
+            base_train[i] = float(hist.tail(min(3, len(hist))).median())
+        else:
+            base_train[i] = float(hist.iloc[-1])
+    base_future, method = build_fallback_forecast(y, pd.Series([np.nan] * h), freq_alias, s_len)
+    return np.maximum(base_train, 0.0), np.maximum(np.asarray(base_future, dtype=float), 0.0), f"{method}_residual_base"
+
+
+def _sarima_residual_base_arrays(y_train: pd.Series, horizon: int, freq_alias: str, season_length: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
+    """Train-only SARIMA base for residual DL; returns None on any fitting issue."""
+    if SARIMAX is None:
+        return None, None, None
+    y = pd.to_numeric(y_train, errors="coerce").astype(float).reset_index(drop=True).ffill().bfill().fillna(0.0)
+    n = int(len(y))
+    h = max(0, int(horizon))
+    s_len = int(season_length or 1)
+    try:
+        if n < max(30, 2 * s_len + 6):
+            return None, None, None
+        seasonal_order = (0, 1, 1, s_len) if s_len > 1 and n >= (2 * s_len + 12) else (0, 0, 0, 0)
+        order = (1, 1, 1) if n >= 36 else (1, 0, 0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = SARIMAX(y, order=order, seasonal_order=seasonal_order, trend="c", enforce_stationarity=False, enforce_invertibility=False)
+            res = model.fit(disp=False, maxiter=60)
+        in_sample = np.asarray(res.get_prediction(start=0, end=n - 1).predicted_mean, dtype=float)
+        future = np.asarray(res.get_forecast(steps=h).predicted_mean, dtype=float) if h > 0 else np.asarray([], dtype=float)
+        if len(in_sample) != n or len(future) != h or not np.isfinite(in_sample).all() or not np.isfinite(future).all():
+            return None, None, None
+        return np.maximum(in_sample, 0.0), np.maximum(future, 0.0), "SARIMA_residual_base_train_only"
+    except Exception:
+        return None, None, None
+
+
+def build_residual_dl_base_arrays(y_train: pd.Series, horizon: int, freq_alias: str, season_length: int) -> Dict[str, Any]:
+    """Return base arrays used by residual-DL. The holdout values are never inspected."""
+    if str(getattr(FORECAST_RUNTIME_CONFIG, "dl_residual_base_preference", "sarima_then_seasonal")).lower().startswith("sarima"):
+        tr, fut, method = _sarima_residual_base_arrays(y_train, horizon, freq_alias, season_length)
+        if tr is not None and fut is not None:
+            return {"train_base": tr, "future_base": fut, "method": method, "backend": "sarima"}
+    tr, fut, method = _seasonal_or_drift_base_arrays(y_train, horizon, freq_alias, season_length)
+    return {"train_base": tr, "future_base": fut, "method": method, "backend": "seasonal_or_drift"}
+
+
+def _dl_training_status_summary(result: Dict[str, Any], model_family: str, horizon: int) -> pd.DataFrame:
+    """One-row status table required for interpreting every DL result."""
+    res = result if isinstance(result, dict) else {}
+    cfg = res.get("selected_config") if isinstance(res.get("selected_config"), dict) else {}
+    hist = res.get("history_df") if isinstance(res.get("history_df"), pd.DataFrame) else pd.DataFrame()
+    over = res.get("overfit_summary") if isinstance(res.get("overfit_summary"), dict) else {}
+    n_seq = res.get("n_sequences", cfg.get("candidate_sequence_count", np.nan))
+    if pd.isna(n_seq) and isinstance(hist, pd.DataFrame) and len(hist):
+        n_seq = res.get("final_train_sequence_count", np.nan)
+    row = {
+        "model": dl_public_real_name(model_family) if normalize_dl_family_label(model_family) in {"LSTM", "GRU"} else str(model_family),
+        "trained_with_tensorflow": bool(res.get("dl_backend") == "tensorflow" and res.get("real_dl_trained", False)),
+        "surrogate_used": bool(res.get("surrogate_used", False)),
+        "fallback_used": bool(res.get("fallback_used", False)),
+        "epochs_ran": int(over.get("epochs_ran", len(hist) if isinstance(hist, pd.DataFrame) else 0) or 0),
+        "min_train_loss": safe_float(over.get("min_train_loss", pd.to_numeric(hist.get("loss"), errors="coerce").min() if isinstance(hist, pd.DataFrame) and len(hist) and "loss" in hist.columns else np.nan)),
+        "min_val_loss": safe_float(over.get("min_val_loss", pd.to_numeric(hist.get("val_loss"), errors="coerce").min() if isinstance(hist, pd.DataFrame) and len(hist) and "val_loss" in hist.columns else np.nan)),
+        "overfit_gap": safe_float(over.get("overfit_gap_ratio", res.get("overfit_gap_ratio", np.nan))),
+        "n_sequences": safe_float(n_seq),
+        "selected_window": cfg.get("window"),
+        "selected_strategy": cfg.get("strategy"),
+        "validation_design": res.get("validation_design"),
+        "rolling_validation_folds": res.get("rolling_validation_folds"),
+        "rolling_val_wape_mean": res.get("validation_wape"),
+        "rolling_val_wape_std": res.get("rolling_val_wape_std"),
+        "residual_dl_used": bool(res.get("residual_dl_used", False)),
+        "residual_base_method": res.get("residual_base_method"),
+        "eligible_for_model_ranking": bool(res.get("eligible_for_model_ranking", False)),
+        "champion_eligible": bool(res.get("dl_champion_eligible", res.get("eligible_for_model_ranking", False))),
+        "ranking_exclusion_reason": res.get("ranking_exclusion_reason") or res.get("strict_dl_rejection_reason"),
+    }
+    return pd.DataFrame([row])
+
+
+def _apply_dl_contextual_suitability_gate(result: Dict[str, Any], model_family: str) -> Dict[str, Any]:
+    """Hard gate before DL can enter ranking; no contextual bonus can bypass it."""
+    out = copy.deepcopy(result) if isinstance(result, dict) else {}
+    if not bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_contextual_suitability_gate_enabled", True)):
+        return out
+    family = normalize_dl_family_label(model_family)
+    if family not in {"LSTM", "GRU"}:
+        return out
+    reasons: List[str] = []
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_real_backend_for_ranking", True)):
+        if not bool(out.get("real_dl_trained", False)) or str(out.get("dl_backend", "")).lower() != "tensorflow":
+            reasons.append("real TensorFlow/Keras recurrent training did not complete")
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_no_surrogate_for_ranking", True)):
+        if bool(out.get("surrogate_used", False)) or bool(out.get("fallback_used", False)):
+            reasons.append("surrogate/fallback output is not rankable as real DL")
+    folds = int(out.get("rolling_validation_folds", 0) or 0)
+    min_folds = int(getattr(FORECAST_RUNTIME_CONFIG, "dl_rolling_validation_min_folds", 2))
+    if folds < min_folds:
+        reasons.append(f"rolling-origin fold count {folds} < {min_folds}")
+    w_mean = safe_float(out.get("validation_wape", np.nan))
+    w_std = safe_float(out.get("rolling_val_wape_std", np.nan))
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_rolling_validation_stability_for_ranking", True)) and pd.notna(w_mean) and pd.notna(w_std) and w_mean > 0:
+        cv = float(w_std) / max(float(w_mean), 1e-8)
+        out["rolling_val_wape_cv"] = safe_float(cv)
+        if cv > float(getattr(FORECAST_RUNTIME_CONFIG, "dl_max_rolling_wape_cv_for_ranking", 0.60)):
+            reasons.append(f"rolling validation unstable: WAPE_CV={cv:.3f}")
+    over = out.get("overfit_summary") if isinstance(out.get("overfit_summary"), dict) else {}
+    gap = safe_float(over.get("overfit_gap_ratio", out.get("overfit_gap_ratio", np.nan)))
+    if pd.notna(gap) and gap > float(getattr(FORECAST_RUNTIME_CONFIG, "dl_max_overfit_gap_for_ranking", 0.35)):
+        reasons.append(f"overfit gap too high: {gap:.3f}")
+    base = safe_float(out.get("inner_baseline_wape", np.nan))
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_baseline_superiority_for_normal_regime", True)) and pd.notna(w_mean) and pd.notna(base) and base > 0:
+        margin = float(getattr(FORECAST_RUNTIME_CONFIG, "dl_normal_sample_min_baseline_improvement_pct", 0.0) or 0.0)
+        if w_mean > base * (1.0 - margin):
+            reasons.append(f"rolling DL WAPE did not beat train-only baseline: dl={w_mean:.4f}, baseline={base:.4f}")
+    if bool(out.get("dl_research_only", False)) or out.get("dl_production_role") in {"challenger_research_only", "research_surrogate_only"}:
+        reasons.append("DL production role is research/challenger only")
+    if reasons:
+        reason = " | ".join(dict.fromkeys([str(r) for r in reasons if r]))
+        out["eligible_for_model_ranking"] = False
+        out["dl_champion_eligible"] = False
+        out["ranking_exclusion_reason"] = out.get("ranking_exclusion_reason") or reason
+        out["strict_dl_rejection_reason"] = out.get("strict_dl_rejection_reason") or reason
+        out["dl_suitability_gate_passed"] = False
+    else:
+        out["dl_suitability_gate_passed"] = True
+        out["eligible_for_model_ranking"] = bool(out.get("eligible_for_model_ranking", True))
+    return out
+
+
+def attach_dl_training_status_table(result: Dict[str, Any], model_family: str, horizon: int) -> Dict[str, Any]:
+    out = copy.deepcopy(result) if isinstance(result, dict) else {}
+    out["dl_training_status_table"] = _dl_training_status_summary(out, model_family, horizon)
+    return out
+
+def apply_dl_no_test_surrogate_override_contract(result: Dict[str, Any], model_family: str, horizon: int) -> Dict[str, Any]:
+    """
+    Final contract for LSTM/GRU leakage control.
+
+    The holdout/test set may be used only after fitting, for final reporting
+    metrics. It must never be used to choose an MLP surrogate, compare a
+    surrogate against the real recurrent model, calibrate a replacement, blend
+    a surrogate into the recurrent forecast, or override LSTM/GRU output.
+    """
+    out = copy.deepcopy(result) if isinstance(result, dict) else {}
+    family = str(model_family).upper()
+
+    # Read the incoming state before normalizing the public flags. This makes
+    # the contract an actual guard instead of merely overwriting bad metadata.
+    incoming_posthoc_override = bool(out.get("posthoc_surrogate_override", False))
+    incoming_test_selection = bool(out.get("test_set_used_for_model_selection", False))
+    incoming_surrogate_test_compare = bool(out.get("surrogate_test_wape_comparison", False))
+    incoming_surrogate_after_real_dl = bool(out.get("surrogate_used", False)) and bool(out.get("real_dl_trained", False))
+
+    out["dl_surrogate_override_contract_version"] = str(getattr(FORECAST_RUNTIME_CONFIG, "dl_surrogate_override_contract_version", "no_holdout_surrogate_override_v1"))
+    out["dl_test_set_surrogate_override_removed"] = True
+    out["dl_never_compare_surrogate_to_holdout"] = True
+    out["surrogate_test_wape_comparison"] = False
+    out["surrogate_selection_metric"] = None
+    out["surrogate_override_forbidden"] = True
+    out["posthoc_surrogate_override"] = False
+    out["test_set_used_for_model_selection"] = False
+    out["leakage_guard"] = out.get("leakage_guard") or "no_holdout_surrogate_override_contract"
+
+    forbidden = []
+    if incoming_posthoc_override:
+        forbidden.append("posthoc_surrogate_override=True")
+    if incoming_test_selection:
+        forbidden.append("test_set_used_for_model_selection=True")
+    if incoming_surrogate_test_compare:
+        forbidden.append("surrogate_test_wape_comparison=True")
+    if incoming_surrogate_after_real_dl:
+        forbidden.append("surrogate_used_after_real_dl_training=True")
+
+    if family in {"LSTM", "GRU"} and forbidden:
+        return quarantine_non_real_dl_result(
+            out,
+            int(horizon),
+            family,
+            "DL no-test-surrogate-override contract violated: " + " | ".join(forbidden),
+        )
+    return out
+
+
+# =========================================================
+# DL PUBLIC IDENTITY / MODEL NAME CONTRACT
+# =========================================================
+
+def normalize_dl_family_label(model_name: Any) -> str:
+    """Normalize public/internal DL model labels to the canonical family."""
+    text = str(model_name or "").strip().upper()
+    if text.startswith("LSTM"):
+        return "LSTM"
+    if text.startswith("GRU"):
+        return "GRU"
+    if text.startswith("DL-FALLBACK") or text.startswith("DL_FALLBACK"):
+        return "DL-FALLBACK"
+    return text
+
+
+def dl_public_real_name(model_family: str) -> str:
+    family = normalize_dl_family_label(model_family)
+    if family in {"LSTM", "GRU"}:
+        return f"{family} (real)"
+    return str(model_family)
+
+
+def dl_public_surrogate_name(model_family: str) -> str:
+    family = normalize_dl_family_label(model_family)
+    if family in {"LSTM", "GRU"}:
+        return f"{family}-surrogate"
+    return f"{model_family}-surrogate"
+
+
+def classify_dl_public_result(model_family: str, result: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Return (identity_class, public_model_name) for DL outputs.
+
+    Public naming contract:
+      - real recurrent backend output: LSTM (real) / GRU (real)
+      - surrogate output: LSTM-surrogate / GRU-surrogate
+      - operational fallback output: DL-fallback
+
+    This prevents fallback/surrogate values from appearing under a plain
+    LSTM/GRU name in comparison, actual-vs-predicted, ensemble, and export
+    tables.
+    """
+    family = normalize_dl_family_label(model_family)
+    res = result if isinstance(result, dict) else {}
+    if family in {"LSTM", "GRU"} and bool(res.get("dl_strict_validation_passed", False)) and bool(res.get("real_dl_trained", False)) and not bool(res.get("fallback_used", False)) and not bool(res.get("surrogate_used", False)):
+        return "real", dl_public_real_name(family)
+    if family in {"LSTM", "GRU"} and bool(res.get("surrogate_used", False)):
+        return "surrogate", dl_public_surrogate_name(family)
+    if family in {"LSTM", "GRU"} and (bool(res.get("fallback_used", False)) or res.get("operational_fallback_forecast") is not None):
+        return "fallback", "DL-fallback"
+    if family in {"LSTM", "GRU"}:
+        return "not_real", dl_public_real_name(family)
+    return "standard", str(model_family)
+
+
+def is_dl_public_label(model_name: Any) -> bool:
+    return normalize_dl_family_label(model_name) in {"LSTM", "GRU", "DL-FALLBACK"}
+
+
+def dl_metric_identity_fields(model_family: str, result: Dict[str, Any], identity_class: Optional[str] = None) -> Dict[str, Any]:
+    family = normalize_dl_family_label(model_family)
+    res = result if isinstance(result, dict) else {}
+    inferred_class, public_name = classify_dl_public_result(family, res)
+    identity_class = identity_class or inferred_class
+    return {
+        "model_public_name": public_name,
+        "identity_model_family": family,
+        "model_identity_class": identity_class,
+        "dl_result_kind": res.get("dl_result_kind", "real_recurrent_dl" if bool(res.get("real_dl_trained", False)) else "not_real_dl_or_not_run"),
+        "real_dl_trained": bool(res.get("real_dl_trained", False)),
+        "dl_backend": res.get("dl_backend"),
+        "fallback_used": bool(res.get("fallback_used", False)),
+        "fallback_method": res.get("fallback_method"),
+        "surrogate_used": bool(res.get("surrogate_used", False)),
+        "surrogate_evaluation_disabled": bool(res.get("surrogate_evaluation_disabled", True)),
+        "posthoc_surrogate_override": bool(res.get("posthoc_surrogate_override", False)),
+        "surrogate_test_wape_comparison": bool(res.get("surrogate_test_wape_comparison", False)),
+        "surrogate_selection_metric": res.get("surrogate_selection_metric"),
+        "dl_test_set_surrogate_override_removed": bool(res.get("dl_test_set_surrogate_override_removed", True)),
+        "dl_never_compare_surrogate_to_holdout": bool(res.get("dl_never_compare_surrogate_to_holdout", True)),
+        "test_set_used_for_model_selection": bool(res.get("test_set_used_for_model_selection", False)),
+        "dl_input_mode": res.get("dl_input_mode"),
+        "dl_feature_source": res.get("dl_feature_source"),
+        "dl_feature_count": res.get("dl_feature_count"),
+        "dl_blocked_tabular_feature_count": res.get("dl_blocked_tabular_feature_count"),
+        "dl_input_contract": res.get("dl_input_contract"),
+        "validation_design": res.get("validation_design"),
+        "rolling_validation_folds": res.get("rolling_validation_folds"),
+        "model_identity_note": res.get("model_identity_note"),
+        "dl_train_observations": res.get("dl_train_observations"),
+        "dl_short_monthly_policy_state": res.get("dl_short_monthly_policy_state"),
+        "dl_production_role": res.get("dl_production_role"),
+        "dl_champion_eligible": res.get("dl_champion_eligible"),
+        "dl_research_only": res.get("dl_research_only"),
+        "ranking_exclusion_reason": res.get("ranking_exclusion_reason") or res.get("strict_dl_rejection_reason"),
+    }
+
+
+def get_dl_operational_fallback_forecast(result: Dict[str, Any], expected_horizon: int) -> Optional[np.ndarray]:
+    """Return quarantined fallback forecast for explicit DL-fallback reporting."""
+    if not isinstance(result, dict):
+        return None
+    candidates = [result.get("operational_fallback_forecast"), result.get("raw_forecast"), result.get("forecast")]
+    for cand in candidates:
+        try:
+            arr = np.asarray(cand, dtype=float).reshape(-1)
+        except Exception:
+            continue
+        if len(arr) == int(expected_horizon) and np.isfinite(arr).all():
+            return np.maximum(arr, 0.0)
+    return None
+
+def build_invalid_model_metrics(model_name: str, reason: str) -> Dict[str, Any]:
+    return {
+        "model": model_name,
+        "MAE": np.nan,
+        "RMSE": np.nan,
+        "MAPE": np.nan,
+        "sMAPE": np.nan,
+        "WAPE": np.nan,
+        "MASE": np.nan,
+        "Bias": np.nan,
+        "BiasPct": np.nan,
+        "UnderForecastRate": np.nan,
+        "OverForecastRate": np.nan,
+        "eligible_for_model_ranking": False,
+        "ranking_exclusion_reason": str(reason),
+        "dl_result_kind": "quarantined_not_real_dl" if normalize_dl_family_label(model_name) in {"LSTM", "GRU"} else None,
+        "real_dl_trained": False if normalize_dl_family_label(model_name) in {"LSTM", "GRU"} else None,
+        "fallback_used": None,
+        "surrogate_used": None,
+        "posthoc_surrogate_override": None,
+        "surrogate_test_wape_comparison": False,
+        "surrogate_selection_metric": None,
+        "dl_test_set_surrogate_override_removed": True,
+        "dl_never_compare_surrogate_to_holdout": True,
+        "dl_input_mode": None,
+        "dl_feature_source": None,
+        "dl_feature_count": None,
+        "model_identity_note": str(reason),
+    }
+
+
+def filter_usable_prediction_map(pred_map: Dict[str, np.ndarray], metrics_df: pd.DataFrame, expected_horizon: Optional[int] = None) -> Tuple[Dict[str, np.ndarray], pd.DataFrame]:
+    usable = {}
+    for name, pred in (pred_map or {}).items():
+        if _finite_prediction_array(pred, expected_horizon=expected_horizon):
+            usable[name] = np.asarray(pred, dtype=float).reshape(-1)
+    if not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
+        return usable, pd.DataFrame()
+    m = metrics_df.copy()
+    if "model" in m.columns:
+        m = m.loc[m["model"].isin(usable.keys())].copy()
+    for metric_col in ["WAPE", "sMAPE", "RMSE", "MAE"]:
+        if metric_col in m.columns:
+            m[metric_col] = pd.to_numeric(m[metric_col], errors="coerce")
+    if "WAPE" in m.columns:
+        m = m.loc[m["WAPE"].notna() & np.isfinite(m["WAPE"].astype(float))].copy()
+    if "eligible_for_model_ranking" in m.columns:
+        m = m.loc[m["eligible_for_model_ranking"].fillna(True).astype(bool)].copy()
+    usable = {k: v for k, v in usable.items() if k in set(m.get("model", pd.Series(dtype=str)).astype(str))}
+    return usable, m.reset_index(drop=True)
+
 def _fit_torch_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
     if not HAS_TORCH:
-        return _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason="PyTorch bulunamadı")
+        return _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, "PyTorch bulunamadı."),
+            model_family=model_family,
+            reason="PyTorch bulunamadı.",
+            backend_state="torch_unavailable"
+        )
     if len(train_df) < 24:
-        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz.")
+        return _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz."),
+            model_family=model_family,
+            reason=f"{model_family} için gözlem sayısı yetersiz.",
+            backend_state="torch_insufficient_observations"
+        )
 
     model_family = str(model_family).upper()
+    short_monthly_policy = get_dl_short_monthly_policy(freq_alias, len(train_df), model_family)
     cache_key = build_search_signature(
         f"dl_torch_{model_family.lower()}",
         freq_alias,
         train_df,
         test_df,
         exog_train=pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_train, pd.DataFrame) else None,
-        extra={"app_version": APP_VERSION, "dl_rev": "torch_lstm_gru_v1"},
+        extra={"app_version": APP_VERSION, "dl_rev": "torch_lstm_gru_v7_tf_missing_monthly_guard", "model_family": model_family},
     )
     cached = SEARCH_ACCELERATOR.get_result(cache_key)
     if cached is not None:
         cached["search_accelerator_cache_hit"] = True
         return cached
 
-    selected_cols = _select_dl_feature_columns(feature_train, feature_test, train_df["y"], FORECAST_RUNTIME_CONFIG.dl_sequence_max_exog_cols)
-    cov_train_df = feature_train[selected_cols].copy() if selected_cols and isinstance(feature_train, pd.DataFrame) else pd.DataFrame(index=train_df.index)
-    cov_test_df = feature_test[selected_cols].copy() if selected_cols and isinstance(feature_test, pd.DataFrame) else pd.DataFrame(index=test_df.index)
+    cov_train_df, cov_test_df, selected_cols, dl_input_meta = build_dl_sequence_native_covariates(
+        train_df=train_df,
+        test_df=test_df,
+        feature_train=feature_train,
+        feature_test=feature_test,
+        freq_alias=freq_alias,
+        model_family=model_family,
+    )
     cov_train_df = cov_train_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     cov_test_df = cov_test_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    tr_inner, val_inner = make_inner_train_val_split(train_df, val_ratio=FORECAST_RUNTIME_CONFIG.dl_validation_ratio, min_val=max(3, len(test_df)))
-    split_ix = len(tr_inner)
-    cov_tr_inner = cov_train_df.iloc[:split_ix].reset_index(drop=True)
-    cov_val_inner = cov_train_df.iloc[split_ix:].reset_index(drop=True)
     season_length = infer_season_length_from_freq(freq_alias)
+    dl_validation_folds = _build_dl_rolling_origin_folds(train_df, horizon=len(test_df), freq_alias=freq_alias, model_family=model_family)
+    insufficient_folds, insufficient_reason = _dl_insufficient_rolling_folds(dl_validation_folds, model_family)
+    if insufficient_folds and bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_rolling_validation_fail_if_insufficient_folds", True)):
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, insufficient_reason),
+            model_family=model_family,
+            reason=insufficient_reason,
+            backend_state="dl_rolling_origin_validation_insufficient"
+        )
+        result["validation_design"] = "rolling_origin_kfold_required"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+    fold_train_len = int(min(f["train_end"] for f in dl_validation_folds)) if dl_validation_folds else len(train_df)
+    fold_val_len = int(max(f["val_len"] for f in dl_validation_folds)) if dl_validation_folds else max(1, len(test_df))
 
     search_rows = []
     best = None
     best_score = np.inf
-    configs = []
-    strategies = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_strategies", ("recursive",)))
-    learning_rates = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_learning_rates", (0.001,)))
-    for window in infer_dl_window_candidates(freq_alias, len(tr_inner)):
-        for units in FORECAST_RUNTIME_CONFIG.dl_hidden_units:
-            for dropout in FORECAST_RUNTIME_CONFIG.dl_dropout_values:
-                for learning_rate in learning_rates:
-                    for strategy in strategies:
-                        if str(strategy).lower() == "direct" and len(val_inner) < 2:
-                            continue
-                        layers = 2 if int(units) >= 32 and int(window) >= 6 else 1
-                        configs.append({
-                            "window": int(window),
-                            "units": int(units),
-                            "dropout": float(dropout),
-                            "layers": int(layers),
-                            "learning_rate": float(learning_rate),
-                            "strategy": str(strategy).lower(),
-                        })
+    configs = build_family_specific_dl_configs(
+        model_family=model_family,
+        freq_alias=freq_alias,
+        train_len=fold_train_len,
+        val_len=fold_val_len,
+    )
+    configs, dl_regime_profile, regime_rejection_df = _apply_dl_data_regime_guard(
+        configs, model_family=model_family, freq_alias=freq_alias, train_len=fold_train_len, horizon=fold_val_len
+    )
+    residual_mode_active = _dl_should_use_residual_mode(freq_alias, len(train_df), model_family, short_monthly_policy)
+    if residual_mode_active:
+        for _cfg in configs:
+            _cfg["residual_mode"] = True
+            _cfg["target_learning_mode"] = "residual_over_train_only_base"
     configs = _select_diverse_dl_configs(configs, max(1, int(FORECAST_RUNTIME_CONFIG.dl_max_configs_per_family)))
-
-    for cfg in configs:
-        try:
-            y_transform = choose_target_transform(tr_inner["y"])
-            tr_y_t = apply_target_transform(tr_inner["y"], y_transform)[0].values.astype(float)
-            y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(tr_y_t, cov_tr_inner.values.astype(float) if len(cov_tr_inner) else np.zeros((len(tr_inner), 0), dtype=float))
-            strategy = str(cfg.get("strategy", "recursive")).lower()
-            if strategy == "direct":
-                X_seq, y_seq = _make_dl_sequences_direct(tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
-            else:
-                X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
-            if len(X_seq) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
-                raise ValueError("Yeterli sliding-window eğitim örneği üretilemedi.")
-            sample_weight = _make_recent_sample_weights(len(y_seq), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
-            model, hist_df = _torch_train_sequence_model(X_seq, y_seq, cfg, model_family=model_family, sample_weight=sample_weight)
-            if strategy == "direct":
-                pred_val_scaled = _torch_direct_forecast(model, tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
-            else:
-                val_cov_scaled = _transform_dl_covariates(x_scaler, cov_val_inner) if len(cov_val_inner) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim == 2 else 0), dtype=float)
-                pred_val_scaled = _torch_recursive_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
-            pred_val_t = y_scaler.inverse_transform(pred_val_scaled.reshape(-1, 1)).reshape(-1)
-            pred_val = inverse_target_transform(pred_val_t, y_transform)
-            pred_val = np.maximum(np.asarray(pred_val, dtype=float), 0.0)
-            corrected, post_cfg = compute_validation_postprocess_candidates(val_inner["y"].values, pred_val, tr_inner["y"], season_length)
-            val_w = wape(val_inner["y"].values, corrected)
-            val_s = smape(val_inner["y"].values, corrected)
-            asym = compute_asymmetric_validation_penalty(val_inner["y"].values, corrected, tr_inner["y"].values, severity=1.0)
-            min_loss = safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
-            min_val_loss = safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
-            overfit_gap = safe_float((min_val_loss - min_loss) / max(abs(min_loss), 1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
-            direction_pen = 0.0 if abs(float(asym.get("bias_pct", 0.0) or 0.0)) <= 10 else 0.12
-            strategy_bonus = -0.08 if strategy == "recursive" and len(val_inner) > 1 else 0.0
-            score = float(val_w + 0.28 * val_s + 0.85 * asym["penalty"] + 2.2 * max(overfit_gap, 0.0) + direction_pen + strategy_bonus)
-            search_rows.append({**cfg, "model": model_family, "backend": "PyTorch", "transform": y_transform.get("name", "none"), "val_wape": val_w, "val_smape": val_s, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "min_train_loss": min_loss, "min_val_loss": min_val_loss, "overfit_gap_ratio": overfit_gap, "epochs_ran": int(len(hist_df)), "selected_exog_cols": ", ".join(selected_cols), "composite_score": score})
-            if score < best_score:
-                best_score = score
-                best = {"cfg": dict(cfg), "transform_cfg": dict(y_transform), "postprocess_cfg": dict(post_cfg), "validation_wape": safe_float(val_w), "validation_smape": safe_float(val_s), "selected_cols": list(selected_cols), "history_df": hist_df.copy()}
-        except Exception as e:
-            search_rows.append({**cfg, "model": model_family, "backend": "PyTorch", "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
-
-    if best is None:
-        result = _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason=f"{model_family} PyTorch modeli kurulamadı")
+    baseline_summary = _compute_dl_rolling_baseline_summary(train_df, dl_validation_folds, freq_alias, season_length)
+    inner_baseline_method = baseline_summary.get("method", "rolling_baseline_unavailable")
+    inner_baseline_wape = safe_float(baseline_summary.get("wape", np.nan))
+    inner_baseline_smape = safe_float(baseline_summary.get("smape", np.nan))
+    rolling_baseline_table = baseline_summary.get("fold_table", pd.DataFrame())
+    if not configs:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için veri rejimi koruması sonrası yeterli DL adayı kalmadı."),
+            model_family=model_family,
+            reason=f"{model_family} veri rejimi DL için yetersiz: sequence/window/capacity guard tüm adayları eledi.",
+            backend_state="dl_data_regime_guard_no_candidate"
+        )
+        result["data_regime_profile"] = dl_regime_profile
+        result["regime_rejection_table"] = regime_rejection_df
+        result["inner_baseline_method"] = inner_baseline_method
+        result["inner_baseline_wape"] = inner_baseline_wape
+        result["inner_baseline_smape"] = inner_baseline_smape
+        result["validation_design"] = "rolling_origin_kfold_train_only"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["rolling_baseline_table"] = rolling_baseline_table
+        result["search_table"] = regime_rejection_df.copy() if isinstance(regime_rejection_df, pd.DataFrame) else pd.DataFrame()
         result["search_accelerator_cache_hit"] = False
         SEARCH_ACCELERATOR.put_result(cache_key, result)
         return result
 
-    full_y_t = apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
+    rolling_validation_tables = []
+    for cfg in configs:
+        try:
+            eval_result = _evaluate_torch_dl_config_rolling_origin(
+                cfg, train_df, cov_train_df, dl_validation_folds, freq_alias, model_family,
+                selected_cols, season_length, inner_baseline_method, inner_baseline_wape,
+                inner_baseline_smape, dl_regime_profile
+            )
+            row = dict(eval_result.get("row", {}))
+            search_rows.append(row)
+            ft = eval_result.get("fold_table", pd.DataFrame())
+            if isinstance(ft, pd.DataFrame) and len(ft):
+                tmp = ft.copy()
+                tmp["candidate_window"] = int(cfg.get("window", 0))
+                tmp["candidate_units"] = int(cfg.get("units", 0))
+                tmp["candidate_layers"] = int(cfg.get("layers", 1))
+                tmp["candidate_strategy"] = str(cfg.get("strategy", "recursive"))
+                rolling_validation_tables.append(tmp)
+            score = safe_float(row.get("composite_score", np.inf))
+            if pd.notna(score) and score < best_score:
+                best_score = score
+                best = {
+                    "cfg": dict(cfg),
+                    "transform_cfg": dict(eval_result.get("transform_cfg", {"name": "none"})),
+                    "postprocess_cfg": dict(eval_result.get("postprocess_cfg", {"name": "raw"})),
+                    "validation_wape": safe_float(row.get("val_wape", np.nan)),
+                    "validation_smape": safe_float(row.get("val_smape", np.nan)),
+                    "rolling_val_wape_std": safe_float(row.get("rolling_val_wape_std", np.nan)),
+                    "rolling_val_smape_std": safe_float(row.get("rolling_val_smape_std", np.nan)),
+                    "selected_cols": list(selected_cols),
+                    "history_df": eval_result.get("history_df", pd.DataFrame()),
+                    "rolling_validation_table": eval_result.get("fold_table", pd.DataFrame()),
+                }
+        except Exception as e:
+            search_rows.append({**cfg, "model": model_family, "backend": "PyTorch", "validation_design": "rolling_origin_kfold_train_only", "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
+
+    if best is None:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} PyTorch modeli kurulamadı."),
+            model_family=model_family,
+            reason=f"{model_family} PyTorch modeli kurulamadı.",
+            backend_state="torch_training_failed"
+        )
+        result["search_table"] = pd.concat([pd.DataFrame(search_rows), regime_rejection_df], ignore_index=True, sort=False).reset_index(drop=True) if isinstance(regime_rejection_df, pd.DataFrame) and len(regime_rejection_df) else pd.DataFrame(search_rows).reset_index(drop=True)
+        result["data_regime_profile"] = dl_regime_profile
+        result["inner_baseline_method"] = inner_baseline_method
+        result["inner_baseline_wape"] = inner_baseline_wape
+        result["inner_baseline_smape"] = inner_baseline_smape
+        result["validation_design"] = "rolling_origin_kfold_train_only"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["rolling_baseline_table"] = rolling_baseline_table
+        result.update(dl_input_meta)
+        result["used_exog_cols"] = list(selected_cols)
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+
+    baseline_ok, baseline_reason, baseline_margin = _dl_baseline_guard_decision(best.get("validation_wape", np.nan), inner_baseline_wape, dl_regime_profile)
+    if not baseline_ok:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} kısa veri rejiminde iç-validasyon baseline üstünlük eşiğini geçemedi."),
+            model_family=model_family,
+            reason=baseline_reason,
+            backend_state="torch_data_regime_baseline_guard_rejected"
+        )
+        result["search_table"] = pd.concat([pd.DataFrame(search_rows), regime_rejection_df], ignore_index=True, sort=False).reset_index(drop=True) if isinstance(regime_rejection_df, pd.DataFrame) and len(regime_rejection_df) else pd.DataFrame(search_rows).reset_index(drop=True)
+        result["data_regime_profile"] = dl_regime_profile
+        result["inner_baseline_method"] = inner_baseline_method
+        result["inner_baseline_wape"] = inner_baseline_wape
+        result["inner_baseline_smape"] = inner_baseline_smape
+        result["baseline_improvement_required_pct"] = baseline_margin
+        result["validation_design"] = "rolling_origin_kfold_train_only"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["rolling_baseline_table"] = rolling_baseline_table
+        result["dl_data_regime_guard_passed"] = False
+        result.update(dl_input_meta)
+        result["used_exog_cols"] = list(selected_cols)
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+
+    residual_mode_active = bool(best["cfg"].get("residual_mode", False))
+    residual_base_pack = None
+    if residual_mode_active:
+        residual_base_pack = build_residual_dl_base_arrays(train_df["y"], len(test_df), freq_alias, season_length)
+        residual_train_base = np.asarray(residual_base_pack.get("train_base"), dtype=float).reshape(-1)
+        residual_target = pd.to_numeric(train_df["y"], errors="coerce").astype(float).reset_index(drop=True) - residual_train_base
+        best["transform_cfg"] = {"name": "none", "lambda": None, "shift": 0.0, "allow_negative_output": True, "target_mode": "residual"}
+        full_y_t = apply_target_transform(residual_target, best["transform_cfg"])[0].values.astype(float)
+    else:
+        full_y_t = apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
     y_scaler, x_scaler, full_y_scaled, full_cov_scaled = _fit_dl_scalers(full_y_t, cov_train_df[best["selected_cols"]].values.astype(float) if best["selected_cols"] else np.zeros((len(train_df), 0), dtype=float))
     strategy = str(best["cfg"].get("strategy", "recursive")).lower()
     if strategy == "direct":
@@ -9858,11 +11852,19 @@ def _fit_torch_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFr
     else:
         X_full, y_full = _make_dl_sequences(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]))
     if len(X_full) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
-        result = _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason=f"{model_family} için final training sequence sayısı yetersiz.")
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için final training sequence sayısı yetersiz."),
+            model_family=model_family,
+            reason=f"{model_family} için final training sequence sayısı yetersiz.",
+            backend_state="torch_insufficient_sequences"
+        )
+        result["search_table"] = pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True)
+        result.update(dl_input_meta)
+        result["used_exog_cols"] = list(selected_cols)
         result["search_accelerator_cache_hit"] = False
         SEARCH_ACCELERATOR.put_result(cache_key, result)
         return result
-    sample_weight_full = _make_recent_sample_weights(len(y_full), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
+    sample_weight_full = _make_recent_sample_weights(len(y_full), float(best["cfg"].get("recent_weight", getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))))
     final_model, hist_df = _torch_train_sequence_model(X_full, y_full, best["cfg"], model_family=model_family, sample_weight=sample_weight_full)
     if strategy == "direct":
         pred_scaled = _torch_direct_forecast(final_model, full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]), int(len(test_df)))
@@ -9870,8 +11872,12 @@ def _fit_torch_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFr
         future_cov_scaled = _transform_dl_covariates(x_scaler, cov_test_df[best["selected_cols"]]) if best["selected_cols"] else np.zeros((len(test_df), 0), dtype=float)
         pred_scaled = _torch_recursive_forecast(final_model, full_y_scaled, full_cov_scaled, future_cov_scaled, int(best["cfg"]["window"]))
     pred_t = y_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).reshape(-1)
-    pred = inverse_target_transform(pred_t, best["transform_cfg"])
-    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    pred_component = inverse_target_transform(pred_t, best["transform_cfg"])
+    if residual_mode_active:
+        future_base = np.asarray((residual_base_pack or {}).get("future_base"), dtype=float).reshape(-1)
+        pred = np.maximum(future_base[:len(pred_component)] + np.asarray(pred_component, dtype=float).reshape(-1), 0.0)
+    else:
+        pred = np.maximum(np.asarray(pred_component, dtype=float), 0.0)
     pred = apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
     overfit_summary = {
         "epochs_ran": int(len(hist_df)),
@@ -9883,178 +11889,271 @@ def _fit_torch_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFr
     overfit_summary["overfit_gap_ratio"] = safe_float((overfit_summary.get("min_val_loss", np.nan) - overfit_summary.get("min_train_loss", np.nan)) / max(abs(overfit_summary.get("min_train_loss", np.nan)), 1e-8)) if pd.notna(overfit_summary.get("min_val_loss", np.nan)) and pd.notna(overfit_summary.get("min_train_loss", np.nan)) else np.nan
     result = {
         "forecast": pred,
-        "search_table": pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
+        "search_table": pd.concat([pd.DataFrame(search_rows), regime_rejection_df], ignore_index=True, sort=False).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True) if isinstance(regime_rejection_df, pd.DataFrame) and len(regime_rejection_df) else pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
         "history_df": hist_df,
         "overfit_summary": overfit_summary,
         "selected_config": dict(best["cfg"]),
+        "n_sequences": int(len(X_full)),
+        "final_train_sequence_count": int(len(X_full)),
+        "residual_dl_used": bool(residual_mode_active),
+        "residual_base_method": (residual_base_pack or {}).get("method") if residual_mode_active else None,
+        "residual_base_backend": (residual_base_pack or {}).get("backend") if residual_mode_active else None,
         "transform": best["transform_cfg"].get("name", "none"),
         "used_exog_cols": list(best["selected_cols"]),
         "validation_wape": safe_float(best.get("validation_wape", np.nan)),
         "validation_smape": safe_float(best.get("validation_smape", np.nan)),
+        "rolling_val_wape_std": safe_float(best.get("rolling_val_wape_std", np.nan)),
+        "rolling_val_smape_std": safe_float(best.get("rolling_val_smape_std", np.nan)),
+        "data_regime_profile": get_dl_data_regime_profile(freq_alias, len(train_df), len(test_df), model_family),
+        "inner_baseline_method": inner_baseline_method,
+        "inner_baseline_wape": inner_baseline_wape,
+        "inner_baseline_smape": inner_baseline_smape,
+        "baseline_guard_pass_reason": baseline_reason,
+        "validation_design": "rolling_origin_kfold_train_only",
+        "rolling_validation_folds": int(len(dl_validation_folds)),
+        "rolling_validation_table": pd.concat(rolling_validation_tables, ignore_index=True, sort=False) if rolling_validation_tables else pd.DataFrame(),
+        "rolling_baseline_table": rolling_baseline_table,
+        "dl_data_regime_guard_passed": True,
         "fallback_used": False,
         "fallback_method": None,
         "fit_mode": f"deep_learning_{model_family.lower()}_torch",
         "search_accelerator_cache_hit": False,
         "surrogate_used": False,
+        "dl_backend": "torch",
+        "real_dl_trained": True,
+        "surrogate_evaluation_disabled": True,
+        "model_identity_note": f"{model_family} sonucu gerçek PyTorch derin öğrenme eğitiminden üretilmiştir; surrogate/fallback sonuçları ile override edilmemiştir.",
+        "eligible_for_model_ranking": True,
+        "forecast_is_model_output": True,
+        "dl_strict_validation_passed": True,
+        "strict_dl_rejection_reason": None,
     }
+    result.update(dl_input_meta)
+    result = apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+    result = enforce_no_posthoc_surrogate_override(result, model_family=model_family, horizon=len(test_df))
+    result = _apply_dl_contextual_suitability_gate(result, model_family=model_family)
+    result = attach_dl_training_status_table(result, model_family=model_family, horizon=len(test_df))
     SEARCH_ACCELERATOR.put_result(cache_key, result)
     return result
 
 
 def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, feature_train: pd.DataFrame, feature_test: pd.DataFrame, freq_alias: str = "M", model_family: str = "LSTM") -> Dict[str, Any]:
     ensure_forecasting_runtime_dependencies(include_streamlit=False)
-    if not FORECAST_RUNTIME_CONFIG.dl_enabled:
-        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, "DL katmanı runtime yapılandırmasında kapalı.")
-    if not HAS_TF and HAS_TORCH:
-        return _fit_torch_deep_learning_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family)
-    if not HAS_TF:
-        return _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason="TensorFlow/Keras ve PyTorch bulunamadı")
-    if len(train_df) < 24:
-        return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz.")
-
     model_family = str(model_family).upper()
+    short_monthly_policy = get_dl_short_monthly_policy(freq_alias, len(train_df), model_family)
+
+    if not FORECAST_RUNTIME_CONFIG.dl_enabled:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, "DL katmanı runtime yapılandırmasında kapalı."),
+            model_family=model_family,
+            reason="DL katmanı runtime yapılandırmasında kapalı.",
+            backend_state="dl_disabled"
+        )
+        return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+
+    if bool(short_monthly_policy.get("skip_real_training", False)) and not bool(short_monthly_policy.get("train_real_dl_allowed", True)):
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, short_monthly_policy.get("ranking_exclusion_reason", "Aylık kısa seri DL için public ranking dışı.")),
+            model_family=model_family,
+            reason=short_monthly_policy.get("ranking_exclusion_reason", "Aylık kısa seri DL için public ranking dışı."),
+            backend_state="monthly_train_n_lt_72_real_dl_not_trained_research_only"
+        )
+        result["dl_runtime_state"] = "monthly_short_series_real_dl_not_trained_research_only"
+        result["dl_result_kind"] = "real_dl_not_trained_monthly_short_series"
+        result["model_identity_class"] = "research_surrogate_only"
+        return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+
+    if bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_require_tensorflow_backend_for_real_recurrent", True)) and not HAS_TF:
+        reason = "TensorFlow/Keras bulunamadı; gerçek LSTM/GRU eğitimi yapılmadı."
+        result = finalize_tf_missing_research_only_result(train_df, test_df, freq_alias, model_family, reason)
+        return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+
+    if not HAS_TF and HAS_TORCH:
+        result = _fit_torch_deep_learning_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family)
+        return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+    if not HAS_TF:
+        result = finalize_tf_missing_research_only_result(train_df, test_df, freq_alias, model_family, "TensorFlow/Keras ve PyTorch bulunamadı; gerçek DL eğitimi yapılmadı.")
+        return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+    if len(train_df) < 24:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz."),
+            model_family=model_family,
+            reason=f"{model_family} için gözlem sayısı yetersiz.",
+            backend_state="tf_insufficient_observations"
+        )
+        return apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+
     cache_key = build_search_signature(
         f"dl_{model_family.lower()}",
         freq_alias,
         train_df,
         test_df,
         exog_train=pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_train, pd.DataFrame) else None,
-        extra={"app_version": APP_VERSION, "dl_rev": "direct_recursive_huber_v5_diverse_hybrid"},
+        extra={"app_version": APP_VERSION, "dl_rev": "direct_recursive_huber_v11_tf_missing_monthly_guard", "model_family": model_family},
     )
     cached = SEARCH_ACCELERATOR.get_result(cache_key)
     if cached is not None:
         cached["search_accelerator_cache_hit"] = True
         return cached
 
-    selected_cols = _select_dl_feature_columns(feature_train, feature_test, train_df["y"], FORECAST_RUNTIME_CONFIG.dl_sequence_max_exog_cols)
-    cov_train_df = feature_train[selected_cols].copy() if selected_cols and isinstance(feature_train, pd.DataFrame) else pd.DataFrame(index=train_df.index)
-    cov_test_df = feature_test[selected_cols].copy() if selected_cols and isinstance(feature_test, pd.DataFrame) else pd.DataFrame(index=test_df.index)
+    cov_train_df, cov_test_df, selected_cols, dl_input_meta = build_dl_sequence_native_covariates(
+        train_df=train_df,
+        test_df=test_df,
+        feature_train=feature_train,
+        feature_test=feature_test,
+        freq_alias=freq_alias,
+        model_family=model_family,
+    )
     cov_train_df = cov_train_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     cov_test_df = cov_test_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    tr_inner, val_inner = make_inner_train_val_split(train_df, val_ratio=FORECAST_RUNTIME_CONFIG.dl_validation_ratio, min_val=max(3, len(test_df)))
-    split_ix = len(tr_inner)
-    cov_tr_inner = cov_train_df.iloc[:split_ix].reset_index(drop=True)
-    cov_val_inner = cov_train_df.iloc[split_ix:].reset_index(drop=True)
     season_length = infer_season_length_from_freq(freq_alias)
+    dl_validation_folds = _build_dl_rolling_origin_folds(train_df, horizon=len(test_df), freq_alias=freq_alias, model_family=model_family)
+    insufficient_folds, insufficient_reason = _dl_insufficient_rolling_folds(dl_validation_folds, model_family)
+    if insufficient_folds and bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_rolling_validation_fail_if_insufficient_folds", True)):
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, insufficient_reason),
+            model_family=model_family,
+            reason=insufficient_reason,
+            backend_state="dl_rolling_origin_validation_insufficient"
+        )
+        result["validation_design"] = "rolling_origin_kfold_required"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+    fold_train_len = int(min(f["train_end"] for f in dl_validation_folds)) if dl_validation_folds else len(train_df)
+    fold_val_len = int(max(f["val_len"] for f in dl_validation_folds)) if dl_validation_folds else max(1, len(test_df))
 
     search_rows = []
     best = None
     best_score = np.inf
-    configs = []
-    strategies = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_strategies", ("recursive",)))
-    learning_rates = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_learning_rates", (0.001,)))
-    for window in infer_dl_window_candidates(freq_alias, len(tr_inner)):
-        for units in FORECAST_RUNTIME_CONFIG.dl_hidden_units:
-            for dropout in FORECAST_RUNTIME_CONFIG.dl_dropout_values:
-                for learning_rate in learning_rates:
-                    for strategy in strategies:
-                        if str(strategy).lower() == "direct" and len(val_inner) < 2:
-                            continue
-                        layers = 2 if int(units) >= 32 and int(window) >= 6 else 1
-                        configs.append({
-                            "window": int(window),
-                            "units": int(units),
-                            "dropout": float(dropout),
-                            "layers": int(layers),
-                            "learning_rate": float(learning_rate),
-                            "strategy": str(strategy).lower(),
-                        })
+    configs = build_family_specific_dl_configs(
+        model_family=model_family,
+        freq_alias=freq_alias,
+        train_len=fold_train_len,
+        val_len=fold_val_len,
+    )
+    configs, dl_regime_profile, regime_rejection_df = _apply_dl_data_regime_guard(
+        configs, model_family=model_family, freq_alias=freq_alias, train_len=fold_train_len, horizon=fold_val_len
+    )
     configs = _select_diverse_dl_configs(configs, max(1, int(FORECAST_RUNTIME_CONFIG.dl_max_configs_per_family)))
-
-    for cfg in configs:
-        try:
-            y_transform = choose_target_transform(tr_inner["y"])
-            tr_y_t = apply_target_transform(tr_inner["y"], y_transform)[0].values.astype(float)
-            y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(
-                tr_y_t,
-                cov_tr_inner.values.astype(float) if len(cov_tr_inner) else np.zeros((len(tr_inner), 0), dtype=float),
-            )
-            strategy = str(cfg.get("strategy", "recursive")).lower()
-            if strategy == "direct":
-                X_seq, y_seq = _make_dl_sequences_direct(tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
-                output_dim = int(len(val_inner))
-            else:
-                X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
-                output_dim = 1
-            if len(X_seq) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
-                raise ValueError("Yeterli sliding-window eğitim örneği üretilemedi.")
-            model = _build_dl_network(
-                (X_seq.shape[1], X_seq.shape[2]),
-                model_family=model_family,
-                units=int(cfg["units"]),
-                layers=int(cfg["layers"]),
-                dropout=float(cfg["dropout"]),
-                learning_rate=float(cfg["learning_rate"]),
-                output_dim=output_dim,
-            )
-            callbacks = [KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
-            sample_weight = _make_recent_sample_weights(len(y_seq), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
-            hist = model.fit(
-                X_seq,
-                y_seq,
-                epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs),
-                batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_seq) // 2))),
-                validation_split=min(0.25, max(0.12, 1.0 / max(len(X_seq), 8))),
-                verbose=0,
-                callbacks=callbacks,
-                sample_weight=sample_weight,
-            )
-            if strategy == "direct":
-                pred_val_scaled = _direct_dl_forecast(model, tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
-            else:
-                val_cov_scaled = _transform_dl_covariates(x_scaler, cov_val_inner) if len(cov_val_inner) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim == 2 else 0), dtype=float)
-                pred_val_scaled = _recursive_dl_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
-            pred_val_t = y_scaler.inverse_transform(pred_val_scaled.reshape(-1, 1)).reshape(-1)
-            pred_val = inverse_target_transform(pred_val_t, y_transform)
-            pred_val = np.maximum(np.asarray(pred_val, dtype=float), 0.0)
-            corrected, post_cfg = compute_validation_postprocess_candidates(val_inner["y"].values, pred_val, tr_inner["y"], season_length)
-            val_w = wape(val_inner["y"].values, corrected)
-            val_s = smape(val_inner["y"].values, corrected)
-            asym = compute_asymmetric_validation_penalty(val_inner["y"].values, corrected, tr_inner["y"].values, severity=1.0)
-            hist_df = _history_to_frame(hist)
-            min_loss = safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
-            min_val_loss = safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
-            overfit_gap = safe_float((min_val_loss - min_loss) / max(abs(min_loss), 1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
-            direction_pen = 0.0 if abs(float(asym.get("bias_pct", 0.0) or 0.0)) <= 10 else 0.12
-            strategy_bonus = -0.08 if strategy == "recursive" and len(val_inner) > 1 else 0.0
-            score = float(val_w + 0.28 * val_s + 0.85 * asym["penalty"] + 2.2 * max(overfit_gap, 0.0) + direction_pen + strategy_bonus)
-            search_rows.append({
-                **cfg,
-                "model": model_family,
-                "transform": y_transform.get("name", "none"),
-                "val_wape": val_w,
-                "val_smape": val_s,
-                "bias_pct": asym["bias_pct"],
-                "under_forecast_rate": asym["under_forecast_rate"],
-                "peak_event_score": asym["peak_event_score"],
-                "min_train_loss": min_loss,
-                "min_val_loss": min_val_loss,
-                "overfit_gap_ratio": overfit_gap,
-                "epochs_ran": int(len(hist_df)),
-                "selected_exog_cols": ", ".join(selected_cols),
-                "composite_score": score,
-            })
-            if score < best_score:
-                best_score = score
-                best = {
-                    "cfg": dict(cfg),
-                    "transform_cfg": dict(y_transform),
-                    "postprocess_cfg": dict(post_cfg),
-                    "validation_wape": safe_float(val_w),
-                    "validation_smape": safe_float(val_s),
-                    "selected_cols": list(selected_cols),
-                }
-        except Exception as e:
-            search_rows.append({**cfg, "model": model_family, "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
-
-    if best is None:
-        result = build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} modeli kurulamadı.")
+    baseline_summary = _compute_dl_rolling_baseline_summary(train_df, dl_validation_folds, freq_alias, season_length)
+    inner_baseline_method = baseline_summary.get("method", "rolling_baseline_unavailable")
+    inner_baseline_wape = safe_float(baseline_summary.get("wape", np.nan))
+    inner_baseline_smape = safe_float(baseline_summary.get("smape", np.nan))
+    rolling_baseline_table = baseline_summary.get("fold_table", pd.DataFrame())
+    if not configs:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için veri rejimi koruması sonrası yeterli DL adayı kalmadı."),
+            model_family=model_family,
+            reason=f"{model_family} veri rejimi DL için yetersiz: sequence/window/capacity guard tüm adayları eledi.",
+            backend_state="dl_data_regime_guard_no_candidate"
+        )
+        result["data_regime_profile"] = dl_regime_profile
+        result["regime_rejection_table"] = regime_rejection_df
+        result["inner_baseline_method"] = inner_baseline_method
+        result["inner_baseline_wape"] = inner_baseline_wape
+        result["inner_baseline_smape"] = inner_baseline_smape
+        result["validation_design"] = "rolling_origin_kfold_train_only"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["rolling_baseline_table"] = rolling_baseline_table
+        result["search_table"] = regime_rejection_df.copy() if isinstance(regime_rejection_df, pd.DataFrame) else pd.DataFrame()
         result["search_accelerator_cache_hit"] = False
         SEARCH_ACCELERATOR.put_result(cache_key, result)
         return result
 
-    full_y_t = apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
+    rolling_validation_tables = []
+    for cfg in configs:
+        try:
+            eval_result = _evaluate_tf_dl_config_rolling_origin(
+                cfg, train_df, cov_train_df, dl_validation_folds, freq_alias, model_family,
+                selected_cols, season_length, inner_baseline_method, inner_baseline_wape,
+                inner_baseline_smape, dl_regime_profile
+            )
+            row = dict(eval_result.get("row", {}))
+            search_rows.append(row)
+            ft = eval_result.get("fold_table", pd.DataFrame())
+            if isinstance(ft, pd.DataFrame) and len(ft):
+                tmp = ft.copy()
+                tmp["candidate_window"] = int(cfg.get("window", 0))
+                tmp["candidate_units"] = int(cfg.get("units", 0))
+                tmp["candidate_layers"] = int(cfg.get("layers", 1))
+                tmp["candidate_strategy"] = str(cfg.get("strategy", "recursive"))
+                rolling_validation_tables.append(tmp)
+            score = safe_float(row.get("composite_score", np.inf))
+            if pd.notna(score) and score < best_score:
+                best_score = score
+                best = {
+                    "cfg": dict(cfg),
+                    "transform_cfg": dict(eval_result.get("transform_cfg", {"name": "none"})),
+                    "postprocess_cfg": dict(eval_result.get("postprocess_cfg", {"name": "raw"})),
+                    "validation_wape": safe_float(row.get("val_wape", np.nan)),
+                    "validation_smape": safe_float(row.get("val_smape", np.nan)),
+                    "rolling_val_wape_std": safe_float(row.get("rolling_val_wape_std", np.nan)),
+                    "rolling_val_smape_std": safe_float(row.get("rolling_val_smape_std", np.nan)),
+                    "selected_cols": list(selected_cols),
+                    "history_df": eval_result.get("history_df", pd.DataFrame()),
+                    "rolling_validation_table": eval_result.get("fold_table", pd.DataFrame()),
+                }
+        except Exception as e:
+            search_rows.append({**cfg, "model": model_family, "backend": "TensorFlow", "validation_design": "rolling_origin_kfold_train_only", "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
+
+    if best is None:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} modeli kurulamadı."),
+            model_family=model_family,
+            reason=f"{model_family} modeli kurulamadı.",
+            backend_state="tf_training_failed"
+        )
+        result["search_table"] = pd.concat([pd.DataFrame(search_rows), regime_rejection_df], ignore_index=True, sort=False).reset_index(drop=True) if isinstance(regime_rejection_df, pd.DataFrame) and len(regime_rejection_df) else pd.DataFrame(search_rows).reset_index(drop=True)
+        result["data_regime_profile"] = dl_regime_profile
+        result["inner_baseline_method"] = inner_baseline_method
+        result["inner_baseline_wape"] = inner_baseline_wape
+        result["inner_baseline_smape"] = inner_baseline_smape
+        result["validation_design"] = "rolling_origin_kfold_train_only"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["rolling_baseline_table"] = rolling_baseline_table
+        result.update(dl_input_meta)
+        result["used_exog_cols"] = list(selected_cols)
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+
+    baseline_ok, baseline_reason, baseline_margin = _dl_baseline_guard_decision(best.get("validation_wape", np.nan), inner_baseline_wape, dl_regime_profile)
+    if not baseline_ok:
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} kısa veri rejiminde iç-validasyon baseline üstünlük eşiğini geçemedi."),
+            model_family=model_family,
+            reason=baseline_reason,
+            backend_state="tf_data_regime_baseline_guard_rejected"
+        )
+        result["search_table"] = pd.concat([pd.DataFrame(search_rows), regime_rejection_df], ignore_index=True, sort=False).reset_index(drop=True) if isinstance(regime_rejection_df, pd.DataFrame) and len(regime_rejection_df) else pd.DataFrame(search_rows).reset_index(drop=True)
+        result["data_regime_profile"] = dl_regime_profile
+        result["inner_baseline_method"] = inner_baseline_method
+        result["inner_baseline_wape"] = inner_baseline_wape
+        result["inner_baseline_smape"] = inner_baseline_smape
+        result["baseline_improvement_required_pct"] = baseline_margin
+        result["validation_design"] = "rolling_origin_kfold_train_only"
+        result["rolling_validation_folds"] = int(len(dl_validation_folds))
+        result["rolling_baseline_table"] = rolling_baseline_table
+        result["dl_data_regime_guard_passed"] = False
+        result.update(dl_input_meta)
+        result["used_exog_cols"] = list(selected_cols)
+        result["search_accelerator_cache_hit"] = False
+        SEARCH_ACCELERATOR.put_result(cache_key, result)
+        return result
+
+    residual_mode_active = bool(best["cfg"].get("residual_mode", False))
+    residual_base_pack = None
+    if residual_mode_active:
+        residual_base_pack = build_residual_dl_base_arrays(train_df["y"], len(test_df), freq_alias, season_length)
+        residual_train_base = np.asarray(residual_base_pack.get("train_base"), dtype=float).reshape(-1)
+        residual_target = pd.to_numeric(train_df["y"], errors="coerce").astype(float).reset_index(drop=True) - residual_train_base
+        best["transform_cfg"] = {"name": "none", "lambda": None, "shift": 0.0, "allow_negative_output": True, "target_mode": "residual"}
+        full_y_t = apply_target_transform(residual_target, best["transform_cfg"])[0].values.astype(float)
+    else:
+        full_y_t = apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
     y_scaler, x_scaler, full_y_scaled, full_cov_scaled = _fit_dl_scalers(
         full_y_t,
         cov_train_df[best["selected_cols"]].values.astype(float) if best["selected_cols"] else np.zeros((len(train_df), 0), dtype=float),
@@ -10067,30 +12166,26 @@ def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, fe
         X_full, y_full = _make_dl_sequences(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]))
         output_dim = 1
     if len(X_full) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
-        result = build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için final training sequence sayısı yetersiz.")
+        result = _finalize_dl_backend_fallback(
+            build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için final training sequence sayısı yetersiz."),
+            model_family=model_family,
+            reason=f"{model_family} için final training sequence sayısı yetersiz.",
+            backend_state="tf_insufficient_sequences"
+        )
+        result["search_table"] = pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True)
+        result.update(dl_input_meta)
+        result["used_exog_cols"] = list(selected_cols)
         result["search_accelerator_cache_hit"] = False
         SEARCH_ACCELERATOR.put_result(cache_key, result)
         return result
 
-    final_model = _build_dl_network(
-        (X_full.shape[1], X_full.shape[2]),
-        model_family=model_family,
-        units=int(best["cfg"]["units"]),
-        layers=int(best["cfg"]["layers"]),
-        dropout=float(best["cfg"]["dropout"]),
-        learning_rate=float(best["cfg"]["learning_rate"]),
-        output_dim=output_dim,
-    )
-    callbacks = [KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
-    sample_weight_full = _make_recent_sample_weights(len(y_full), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
-    final_hist = final_model.fit(
+    sample_weight_full = _make_recent_sample_weights(len(y_full), float(best["cfg"].get("recent_weight", getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))))
+    final_model, hist_df = _fit_keras_sequence_model_time_ordered(
         X_full,
         y_full,
-        epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs),
-        batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_full) // 2))),
-        validation_split=min(0.20, max(0.10, 1.0 / max(len(X_full), 8))),
-        verbose=0,
-        callbacks=callbacks,
+        best["cfg"],
+        model_family=model_family,
+        output_dim=output_dim,
         sample_weight=sample_weight_full,
     )
     if strategy == "direct":
@@ -10099,10 +12194,13 @@ def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, fe
         future_cov_scaled = _transform_dl_covariates(x_scaler, cov_test_df[best["selected_cols"]]) if best["selected_cols"] else np.zeros((len(test_df), 0), dtype=float)
         pred_scaled = _recursive_dl_forecast(final_model, full_y_scaled, full_cov_scaled, future_cov_scaled, int(best["cfg"]["window"]))
     pred_t = y_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).reshape(-1)
-    pred = inverse_target_transform(pred_t, best["transform_cfg"])
-    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    pred_component = inverse_target_transform(pred_t, best["transform_cfg"])
+    if residual_mode_active:
+        future_base = np.asarray((residual_base_pack or {}).get("future_base"), dtype=float).reshape(-1)
+        pred = np.maximum(future_base[:len(pred_component)] + np.asarray(pred_component, dtype=float).reshape(-1), 0.0)
+    else:
+        pred = np.maximum(np.asarray(pred_component, dtype=float), 0.0)
     pred = apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
-    hist_df = _history_to_frame(final_hist)
     overfit_summary = {
         "epochs_ran": int(len(hist_df)),
         "min_train_loss": safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan,
@@ -10113,33 +12211,50 @@ def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, fe
     overfit_summary["overfit_gap_ratio"] = safe_float((overfit_summary.get("min_val_loss", np.nan) - overfit_summary.get("min_train_loss", np.nan)) / max(abs(overfit_summary.get("min_train_loss", np.nan)), 1e-8)) if pd.notna(overfit_summary.get("min_val_loss", np.nan)) and pd.notna(overfit_summary.get("min_train_loss", np.nan)) else np.nan
     result = {
         "forecast": pred,
-        "search_table": pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
+        "search_table": pd.concat([pd.DataFrame(search_rows), regime_rejection_df], ignore_index=True, sort=False).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True) if isinstance(regime_rejection_df, pd.DataFrame) and len(regime_rejection_df) else pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
         "history_df": hist_df,
         "overfit_summary": overfit_summary,
         "selected_config": dict(best["cfg"]),
+        "n_sequences": int(len(X_full)),
+        "final_train_sequence_count": int(len(X_full)),
+        "residual_dl_used": bool(residual_mode_active) if "residual_mode_active" in locals() else False,
+        "residual_base_method": (residual_base_pack or {}).get("method") if "residual_base_pack" in locals() and residual_mode_active else None,
+        "residual_base_backend": (residual_base_pack or {}).get("backend") if "residual_base_pack" in locals() and residual_mode_active else None,
         "transform": best["transform_cfg"].get("name", "none"),
         "used_exog_cols": list(best["selected_cols"]),
         "validation_wape": safe_float(best.get("validation_wape", np.nan)),
         "validation_smape": safe_float(best.get("validation_smape", np.nan)),
+        "rolling_val_wape_std": safe_float(best.get("rolling_val_wape_std", np.nan)),
+        "rolling_val_smape_std": safe_float(best.get("rolling_val_smape_std", np.nan)),
+        "data_regime_profile": get_dl_data_regime_profile(freq_alias, len(train_df), len(test_df), model_family),
+        "inner_baseline_method": inner_baseline_method,
+        "inner_baseline_wape": inner_baseline_wape,
+        "inner_baseline_smape": inner_baseline_smape,
+        "baseline_guard_pass_reason": baseline_reason,
+        "validation_design": "rolling_origin_kfold_train_only",
+        "rolling_validation_folds": int(len(dl_validation_folds)),
+        "rolling_validation_table": pd.concat(rolling_validation_tables, ignore_index=True, sort=False) if rolling_validation_tables else pd.DataFrame(),
+        "rolling_baseline_table": rolling_baseline_table,
+        "dl_data_regime_guard_passed": True,
         "fallback_used": False,
         "fallback_method": None,
         "fit_mode": f"deep_learning_{model_family.lower()}",
         "search_accelerator_cache_hit": False,
     }
-    surrogate_try = None
-    try:
-        surrogate_try = _fit_dl_surrogate_mlp_forecast(train_df, test_df, feature_train, feature_test, freq_alias=freq_alias, model_family=model_family, reason="DL kalite karşılaştırma yedeği")
-    except Exception:
-        surrogate_try = None
-    if isinstance(surrogate_try, dict) and not surrogate_try.get("fallback_used", False):
-        sur_w = wape(test_df["y"].values, np.asarray(surrogate_try.get("forecast", []), dtype=float))
-        cur_w = wape(test_df["y"].values, np.asarray(result.get("forecast", []), dtype=float))
-        if pd.notna(sur_w) and pd.notna(cur_w) and float(sur_w) + 0.15 < float(cur_w):
-            surrogate_try["search_table"] = pd.concat([result.get("search_table", pd.DataFrame()), surrogate_try.get("search_table", pd.DataFrame())], axis=0, ignore_index=True)
-            surrogate_try["history_df"] = result.get("history_df", pd.DataFrame())
-            surrogate_try["overfit_summary"] = {**(result.get("overfit_summary", {}) or {}), "surrogate_used": True, "surrogate_reason": "validation/test kalite iyileştirmesi"}
-            surrogate_try["selected_config"] = {**(result.get("selected_config", {}) or {}), "surrogate_selected": True}
-            result = surrogate_try
+    result.update(dl_input_meta)
+    result["surrogate_used"] = False
+    result["dl_backend"] = "tensorflow"
+    result["real_dl_trained"] = True
+    result["surrogate_evaluation_disabled"] = True
+    result["model_identity_note"] = f"{model_family} sonucu gerçek derin öğrenme eğitiminden üretilmiştir; surrogate/fallback sonuçları ile override edilmemiştir."
+    result["eligible_for_model_ranking"] = True
+    result["forecast_is_model_output"] = True
+    result["dl_strict_validation_passed"] = True
+    result["strict_dl_rejection_reason"] = None
+    result = apply_dl_short_monthly_policy_to_result(result, short_monthly_policy, model_family)
+    result = enforce_no_posthoc_surrogate_override(result, model_family=model_family, horizon=len(test_df))
+    result = _apply_dl_contextual_suitability_gate(result, model_family=model_family)
+    result = attach_dl_training_status_table(result, model_family=model_family, horizon=len(test_df))
     SEARCH_ACCELERATOR.put_result(cache_key, result)
     return result
 
@@ -10167,9 +12282,9 @@ def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Op
         out.loc[out["model"].eq("SARIMA/SARIMAX"), "bağlamsal_ceza"] -= 0.15
     if regime.get("trendy_like", False):
         out.loc[out["model"].eq("XGBoost"), "bağlamsal_ceza"] -= 0.10
-        out.loc[out["model"].isin(["LSTM", "GRU"]), "bağlamsal_ceza"] -= 0.12
+        out.loc[out["model"].astype(str).map(lambda _m: normalize_dl_family_label(_m) in {"LSTM", "GRU"}), "bağlamsal_ceza"] -= 0.12
     if regime.get("volatile_like", False):
-        out.loc[out["model"].isin(["LSTM", "GRU"]), "bağlamsal_ceza"] -= 0.05
+        out.loc[out["model"].astype(str).map(lambda _m: normalize_dl_family_label(_m) in {"LSTM", "GRU"}), "bağlamsal_ceza"] -= 0.05
     out["bağlamsal_doğrulama_skoru"] = pd.to_numeric(out.get("val_WAPE"), errors="coerce").fillna(99.0) + pd.to_numeric(out.get("val_sMAPE"), errors="coerce").fillna(99.0) * 0.12 + out["bağlamsal_ceza"].fillna(0.0)
     return out.sort_values(["bağlamsal_doğrulama_skoru", "val_WAPE", "val_sMAPE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
 
@@ -10189,6 +12304,15 @@ def build_weighted_ensemble(
     """
     if not pred_map:
         raise ValueError("Ansambl için model bulunamadı.")
+    expected_horizon = None
+    try:
+        lengths = [len(np.asarray(v, dtype=float).reshape(-1)) for v in pred_map.values()]
+        expected_horizon = int(max(set(lengths), key=lengths.count)) if lengths else None
+    except Exception:
+        expected_horizon = None
+    pred_map, metrics_df = filter_usable_prediction_map(pred_map, metrics_df, expected_horizon=expected_horizon)
+    if not pred_map or not isinstance(metrics_df, pd.DataFrame) or len(metrics_df) == 0:
+        raise ValueError("Ansambl için kullanılabilir gerçek model tahmini bulunamadı.")
 
     profile = profile or {}
     regime = infer_runtime_regime_from_profile(profile=profile, y_train=y_train)
@@ -10279,9 +12403,10 @@ def build_weighted_ensemble(
         use_df.loc[use_df["model"].eq("SARIMA/SARIMAX"), "regime_pen"] -= 0.08
     if regime.get("volatile_like", False):
         use_df.loc[use_df["model"].eq("XGBoost"), "regime_pen"] -= 0.05
-        use_df.loc[use_df["model"].isin(["LSTM", "GRU"]), "regime_pen"] -= 0.06
+        # DL receives no contextual bonus before suitability gates pass.
     if regime.get("trendy_like", False):
-        use_df.loc[use_df["model"].isin(["LSTM", "GRU"]), "regime_pen"] -= 0.03
+        # DL receives no contextual bonus before suitability gates pass.
+        pass
 
     # Haftalıkta rolling ve lokal yakın geçmişe daha fazla ağırlık ver
     if freq_alias == "W":
@@ -10352,18 +12477,26 @@ def build_weighted_ensemble(
 
 def build_model_level_fallback(model_name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, error_message: str) -> Dict[str, Any]:
     season_length = infer_season_length_from_freq(freq_alias)
-    pred, method_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, season_length)
+    # Critical leakage guard: fallback receives only the holdout horizon length,
+    # never the actual test/holdout target values.
+    pred, method_name = build_fallback_forecast(train_df["y"], int(len(test_df)), freq_alias, season_length)
     return {
         "forecast": np.maximum(np.asarray(pred, dtype=float), 0.0),
         "search_table": pd.DataFrame([{
             "model": model_name,
             "fallback_used": True,
             "fallback_method": method_name,
-            "error": str(error_message)[:500]
+            "error": str(error_message)[:500],
+            "test_set_used_for_model_selection": False,
+            "leakage_guard": "fallback_train_only_method_selection",
         }]),
         "fallback_used": True,
         "fallback_method": method_name,
-        "error": str(error_message)
+        "error": str(error_message),
+        "test_set_used_for_model_selection": False,
+        "posthoc_surrogate_override": False,
+        "surrogate_override_forbidden": True,
+        "leakage_guard": "fallback_train_only_method_selection",
     }
 
 
@@ -10537,7 +12670,13 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
             rows = feature_audit_df[feature_audit_df["used_in"].str.contains(area, na=False)]
             risk_by_area[area] = float(rows["availability_risk_score"].max()) if len(rows) else 0.0
     rows_out: List[Dict[str, Any]] = []
-    for model_name in ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "LSTM", "GRU", "Intermittent", "Ensemble"]:
+    default_gate_models = ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "LSTM (real)", "GRU (real)", "LSTM-surrogate", "GRU-surrogate", "DL-fallback", "Intermittent", "Ensemble"]
+    metric_models = metrics_df["model"].dropna().astype(str).tolist() if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) and "model" in metrics_df.columns else []
+    ordered_gate_models = []
+    for _m in default_gate_models + metric_models:
+        if _m not in ordered_gate_models:
+            ordered_gate_models.append(_m)
+    for model_name in ordered_gate_models:
         reasons = []
         score = 100.0
         area_risk = 0.0
@@ -10545,7 +12684,7 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
             area_risk = risk_by_area.get("statistical", 0.0)
         elif model_name == "Prophet":
             area_risk = risk_by_area.get("prophet", 0.0)
-        elif model_name in ["XGBoost", "LSTM", "GRU"]:
+        elif model_name == "XGBoost" or normalize_dl_family_label(model_name) in {"LSTM", "GRU", "DL-FALLBACK"}:
             area_risk = risk_by_area.get("ml", 0.0)
         score -= 20.0 * area_risk
         if area_risk >= 0.60:
@@ -10606,14 +12745,15 @@ def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.D
         if model_name == "XGBoost" and n_obs < 30:
             score -= 15.0
             reasons.append("Makine öğrenmesi için gözlem sayısı sınırlı.")
-        if model_name in ["LSTM", "GRU"]:
+        if normalize_dl_family_label(model_name) in {"LSTM", "GRU", "DL-FALLBACK"}:
             if n_obs < 36:
                 score -= 22.0
                 reasons.append("Derin öğrenme için gözlem sayısı sınırlı.")
             if intermittency >= 0.30:
                 score -= 14.0
                 reasons.append("Aralıklı yapı derin öğrenme modellerini zayıflatabilir.")
-            dl_pack = (outputs.get(model_name.lower()) or {})
+            dl_key = normalize_dl_family_label(model_name).lower()
+            dl_pack = (outputs.get(dl_key) or {})
             overfit_gap = safe_float((dl_pack.get("overfit_summary") or {}).get("overfit_gap_ratio", np.nan))
             if pd.notna(overfit_gap) and overfit_gap > 0.25:
                 score -= min(18.0, 36.0 * float(overfit_gap))
@@ -10663,7 +12803,7 @@ def build_forecast_value_add(outputs: Dict[str, Any], freq_alias: str) -> pd.Dat
     if train_df is None or test_df is None or len(test_df) == 0:
         return pd.DataFrame(columns=["model", "baseline_name", "baseline_WAPE", "model_WAPE", "fva_wape_pct", "baseline_MAE", "model_MAE", "fva_mae_pct"])
     season_len = infer_season_length_from_freq(freq_alias)
-    baseline_pred, baseline_name = build_fallback_forecast(train_df["y"], test_df["y"], freq_alias, season_len)
+    baseline_pred, baseline_name = build_fallback_forecast(train_df["y"], int(len(test_df)), freq_alias, season_len)
     baseline_w = wape(test_df["y"].values, baseline_pred)
     baseline_m = mae(test_df["y"].values, baseline_pred)
     rows = []
@@ -11193,6 +13333,7 @@ def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str,
     adaylar: List[Tuple[str, pd.DataFrame]] = [
         ("ModelKarşılaştırma", outputs.get("metrics_df", pd.DataFrame())),
         ("DoğrulamaMetrikleri", outputs.get("validation_metrics_df", pd.DataFrame())),
+        ("DLSeffaflik", outputs.get("dl_transparency_table", pd.DataFrame())),
         ("KararHiyerarşisi", build_karar_hiyerarsisi_ozeti(outputs)),
         ("ModelLiderleri", build_model_liderleri(outputs)),
         ("AnsamblAğırlıkları", outputs.get("ensemble_weights", pd.DataFrame())),
@@ -11229,41 +13370,122 @@ def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str,
 
 
 def build_dl_model_analysis(outputs: Dict[str, Any], profile: Dict[str, Any]) -> pd.DataFrame:
-    rows=[]
-    metrics_df=outputs.get("metrics_df", pd.DataFrame()).copy()
-    if len(metrics_df)==0:
-        return pd.DataFrame(columns=["model","analysis"])
-    best_hold=float(pd.to_numeric(metrics_df.get("WAPE"), errors="coerce").min()) if len(metrics_df) else np.nan
-    for model_name in ["LSTM","GRU"]:
-        row=metrics_df.loc[metrics_df["model"].astype(str)==model_name].head(1)
-        if len(row)==0:
-            continue
-        row=row.iloc[0]
-        notes=[]
-        hold_wape=safe_float(row.get("WAPE", np.nan))
-        val_df=outputs.get("validation_metrics_df", pd.DataFrame())
-        val_row=val_df.loc[val_df["model"].astype(str)==model_name].head(1) if isinstance(val_df,pd.DataFrame) else pd.DataFrame()
-        val_wape=safe_float(val_row.iloc[0].get("val_WAPE", np.nan)) if len(val_row) else np.nan
-        overfit_gap=safe_float(((outputs.get(model_name.lower()) or {}).get("overfit_summary") or {}).get("overfit_gap_ratio", np.nan))
+    rows = []
+    metrics_df = outputs.get("metrics_df", pd.DataFrame()).copy()
+    if len(metrics_df) == 0:
+        return pd.DataFrame(columns=["model", "analysis"])
+    best_hold = float(pd.to_numeric(metrics_df.get("WAPE"), errors="coerce").min()) if len(metrics_df) else np.nan
+    for family, key in [("LSTM", "lstm"), ("GRU", "gru")]:
+        real_label = dl_public_real_name(family)
+        row = metrics_df.loc[metrics_df["model"].astype(str) == real_label].head(1)
+        if len(row) == 0:
+            legacy_row = metrics_df.loc[metrics_df["model"].astype(str) == family].head(1)
+            row = legacy_row
+        dl_pack = (outputs.get(key) or {})
+        notes = []
+        if len(row):
+            row0 = row.iloc[0]
+            hold_wape = safe_float(row0.get("WAPE", np.nan))
+        else:
+            hold_wape = np.nan
+        val_df = outputs.get("validation_metrics_df", pd.DataFrame())
+        val_row = val_df.loc[val_df["model"].astype(str).isin([real_label, family])].head(1) if isinstance(val_df, pd.DataFrame) and len(val_df) and "model" in val_df.columns else pd.DataFrame()
+        val_wape = safe_float(val_row.iloc[0].get("val_WAPE", np.nan)) if len(val_row) else np.nan
+        overfit_gap = safe_float((dl_pack.get("overfit_summary") or {}).get("overfit_gap_ratio", np.nan))
         if pd.notna(hold_wape) and pd.notna(best_hold):
             notes.append("Holdout performansı lider modellere çok yakın veya daha iyi." if hold_wape <= best_hold + 0.5 else "Holdout performansı klasik/ML lider modellere göre daha zayıf.")
-        dl_pack = (outputs.get(model_name.lower()) or {})
         fit_mode = str(dl_pack.get("fit_mode", ""))
-        if fit_mode.endswith("_torch"):
-            notes.append("Model gerçek PyTorch tabanlı derin öğrenme eğitimi ile çalıştırıldı.")
-        elif bool(dl_pack.get("fallback_used", False)):
-            notes.append("Model gerçek DL eğitimi yerine fallback/surrogate yol ile tamamlandı; bu nedenle sonuç sınırlı yorumlanmalıdır.")
+        if bool(dl_pack.get("dl_strict_validation_passed", False)) and fit_mode.endswith("_torch"):
+            notes.append(f"{real_label} gerçek PyTorch tabanlı derin öğrenme eğitimi ile çalıştırıldı ve epoch-loss geçmişi doğrulandı.")
+        elif bool(dl_pack.get("dl_strict_validation_passed", False)):
+            notes.append(f"{real_label} gerçek TensorFlow/Keras tabanlı derin öğrenme eğitimi ile çalıştırıldı ve epoch-loss geçmişi doğrulandı.")
+        else:
+            notes.append(f"{real_label} gerçek DL eğitimi olarak doğrulanamadı; fallback/surrogate çıktısı bu isim altında raporlanmadı.")
+        if bool(dl_pack.get("surrogate_used", False)):
+            notes.append(f"Surrogate çıktısı ayrı model adıyla raporlanır: {dl_public_surrogate_name(family)}.")
+        if bool(dl_pack.get("fallback_used", False)) or dl_pack.get("operational_fallback_forecast") is not None:
+            notes.append("Operasyonel yedek tahmin ayrı model adıyla raporlanır: DL-fallback.")
         if pd.notna(val_wape) and pd.notna(hold_wape):
             notes.append("İç doğrulama ile holdout arasında ciddi ayrışma yok; genelleme kabul edilebilir." if val_wape <= hold_wape + 1.0 else "Validation-holdout farkı yüksek; yapı daha kırılgan olabilir.")
         if pd.notna(overfit_gap):
             notes.append("Epoch-loss ayrışması overfitting riskine işaret ediyor." if overfit_gap > 0.25 else "Epoch-loss davranışı aşırı overfitting göstermiyor.")
-        if float(profile.get("seasonality_strength",0) or 0) >= 0.35:
+        if float(profile.get("seasonality_strength", 0) or 0) >= 0.35:
             notes.append("Seri sezonsal; DL modeli zaman penceresi ile bu yapıyı kısmen öğrenebilir.")
-        if float(profile.get("cv",0) or 0) >= 0.45:
+        if float(profile.get("cv", 0) or 0) >= 0.45:
             notes.append("Seri oynak; DL modeli esneklik kazanabilir ancak daha fazla gözlem ister.")
         if not notes:
             notes.append("DL modeli anlamlı fark üretmedi; klasik ve ağaç tabanlı adaylarla birlikte değerlendirilmelidir.")
-        rows.append({"model": model_name, "analysis": " ".join(notes)})
+        rows.append({"model": real_label, "analysis": " ".join(notes)})
+    return pd.DataFrame(rows)
+
+def build_dl_transparency_table(outputs: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    fallback_sources = []
+    for key, family in [("lstm", "LSTM"), ("gru", "GRU")]:
+        res = (outputs or {}).get(key) or {}
+        identity_class, public_name = classify_dl_public_result(family, res)
+        base = dl_metric_identity_fields(family, res, identity_class=identity_class)
+        base.update({
+            "model": dl_public_real_name(family),
+            "public_model_name": public_name,
+            "identity_model_family": family,
+            "model_identity_class": res.get("model_identity_class") or ("real" if bool(res.get("dl_strict_validation_passed", False)) else "real_not_available"),
+            "epoch_rows": int(len(res.get("history_df"))) if isinstance(res.get("history_df"), pd.DataFrame) else 0,
+            "strict_dl_rejection_reason": res.get("strict_dl_rejection_reason"),
+            "eligible_for_model_ranking": bool(res.get("eligible_for_model_ranking", False)) and bool(res.get("dl_strict_validation_passed", False)),
+            "forecast_is_model_output": bool(res.get("forecast_is_model_output", False)) and bool(res.get("dl_strict_validation_passed", False)),
+        })
+        rows.append(base)
+
+        surrogate_row = dl_metric_identity_fields(family, res, identity_class="surrogate")
+        surrogate_row.update({
+            "model": dl_public_surrogate_name(family),
+            "public_model_name": dl_public_surrogate_name(family),
+            "identity_model_family": family,
+            "model_identity_class": "surrogate",
+            "real_dl_trained": False,
+            "fallback_used": False,
+            "surrogate_used": bool(res.get("surrogate_used", False)),
+            "eligible_for_model_ranking": False,
+            "forecast_is_model_output": bool(res.get("surrogate_used", False)),
+            "strict_dl_rejection_reason": "surrogate_separate_identity_not_allowed_to_masquerade_as_real_dl" if not bool(res.get("surrogate_used", False)) else res.get("strict_dl_rejection_reason"),
+            "epoch_rows": 0,
+        })
+        rows.append(surrogate_row)
+
+        if bool(res.get("fallback_used", False)) or res.get("operational_fallback_forecast") is not None:
+            fallback_sources.append(family)
+
+    fallback_row = {
+        "model": "DL-fallback",
+        "public_model_name": "DL-fallback",
+        "identity_model_family": "DL",
+        "model_identity_class": "fallback",
+        "dl_result_kind": "operational_fallback",
+        "real_dl_trained": False,
+        "dl_backend": "none",
+        "fallback_used": bool(fallback_sources),
+        "fallback_method": " | ".join(sorted(set(str((outputs.get(k.lower()) or {}).get("fallback_method") or "fallback") for k in fallback_sources))) if fallback_sources else None,
+        "surrogate_used": False,
+        "surrogate_evaluation_disabled": True,
+        "posthoc_surrogate_override": False,
+        "test_set_used_for_model_selection": False,
+        "eligible_for_model_ranking": False,
+        "forecast_is_model_output": bool(fallback_sources),
+        "dl_strict_validation_passed": False,
+        "strict_dl_rejection_reason": "explicit_operational_fallback_not_real_dl",
+        "dl_input_mode": None,
+        "dl_feature_source": None,
+        "dl_feature_count": 0,
+        "dl_blocked_tabular_feature_count": None,
+        "dl_input_contract": "fallback_is_separate_from_lstm_gru_real_and_surrogate_names",
+        "validation_design": None,
+        "rolling_validation_folds": None,
+        "epoch_rows": 0,
+        "model_identity_note": "DL fallback tahmini LSTM/GRU adı altında değil, yalnızca DL-fallback adıyla raporlanır.",
+        "fallback_source_families": "|".join(fallback_sources),
+    }
+    rows.append(fallback_row)
     return pd.DataFrame(rows)
 
 def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True) -> Dict[str, Any]:
@@ -11309,23 +13531,75 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         except Exception as e:
             error = str(e); res = build_model_level_fallback(label, train_df, test_df, freq_alias, error)
             progress_log("Model Araması", f"{label} beklenmeyen hata nedeniyle fallback ile tamamlandı.", level="ERROR", target=target_col, extra={"model": label, "error": error})
+        is_dl_family = label in ["LSTM", "GRU"]
+        if is_dl_family and bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_strict_real_training", True)):
+            res = sanitize_dl_result_for_reporting(res, model_family=label, horizon=len(test_df))
+            res = apply_dl_no_test_surrogate_override_contract(res, model_family=label, horizon=len(test_df))
+            if not bool(res.get("dl_strict_validation_passed", False)):
+                progress_log("DL Kimlik Doğrulama", f"{label} gerçek DL olarak doğrulanamadı; fallback/surrogate çıktısı LSTM/GRU adıyla raporlanmadı.", level="WARNING", target=target_col, extra={"model": label, "reason": res.get("strict_dl_rejection_reason")})
+        identity_class, public_label = classify_dl_public_result(label, res) if is_dl_family else ("standard", label)
+        if is_dl_family:
+            # Primary public row always represents the real recurrent model slot.
+            # Surrogate and fallback are emitted as separate public model names below.
+            public_label = dl_public_real_name(label) if identity_class in {"fallback", "not_real"} else public_label
+            res["public_model_name"] = public_label
+            res["identity_model_family"] = label
+            res["model_identity_class"] = identity_class
         raw_forecast = np.asarray(res.get("forecast", np.array([])), dtype=float)
         res["raw_forecast"] = raw_forecast.copy()
-        res["forecast"] = operational_bias_peak_postprocess(train_df["y"], raw_forecast, freq_alias=freq_alias, model_name=label, profile=profile)
+        if is_dl_family and not bool(res.get("dl_strict_validation_passed", False)):
+            res["forecast"] = np.full(len(test_df), np.nan, dtype=float)
+        else:
+            res["forecast"] = operational_bias_peak_postprocess(train_df["y"], raw_forecast, freq_alias=freq_alias, model_name=public_label, profile=profile)
         if "static_forecast" in res:
             try:
-                res["static_forecast"] = operational_bias_peak_postprocess(train_df["y"], np.asarray(res.get("static_forecast"), dtype=float), freq_alias=freq_alias, model_name=label, profile=profile)
+                res["static_forecast"] = operational_bias_peak_postprocess(train_df["y"], np.asarray(res.get("static_forecast"), dtype=float), freq_alias=freq_alias, model_name=public_label, profile=profile)
             except Exception:
                 pass
-        metric = build_model_metrics(label, train_df["y"].values, test_df["y"].values, res["forecast"])
-        table = build_actual_vs_pred_df(test_df, res["forecast"], label)
+        if is_dl_family and not bool(res.get("dl_strict_validation_passed", False)):
+            metric = build_invalid_model_metrics(dl_public_real_name(label), res.get("strict_dl_rejection_reason", "strict_real_dl_gate_failed"))
+            metric["eligible_for_model_ranking"] = False
+            metric["ranking_exclusion_reason"] = res.get("strict_dl_rejection_reason", "strict_real_dl_gate_failed")
+        else:
+            metric = build_model_metrics(public_label, train_df["y"].values, test_df["y"].values, res["forecast"])
+            metric["eligible_for_model_ranking"] = bool(res.get("eligible_for_model_ranking", True))
+            metric["ranking_exclusion_reason"] = res.get("strict_dl_rejection_reason")
+        if is_dl_family and bool(getattr(FORECAST_RUNTIME_CONFIG, "dl_report_input_contract_in_metrics", True)):
+            metric.update(dl_metric_identity_fields(label, res, identity_class="real" if bool(res.get("dl_strict_validation_passed", False)) else "real_not_available"))
+            metric["model_public_name"] = dl_public_real_name(label)
+        extra_public_outputs = []
+        if is_dl_family:
+            # If a surrogate path ever exists, it is emitted under its own name.
+            if bool(res.get("surrogate_used", False)):
+                surrogate_pred = get_dl_operational_fallback_forecast(res, len(test_df))
+                if surrogate_pred is not None:
+                    surrogate_name = dl_public_surrogate_name(label)
+                    surrogate_metric = build_model_metrics(surrogate_name, train_df["y"].values, test_df["y"].values, surrogate_pred)
+                    surrogate_metric.update(dl_metric_identity_fields(label, res, identity_class="surrogate"))
+                    surrogate_metric["eligible_for_model_ranking"] = False
+                    surrogate_metric["ranking_exclusion_reason"] = "surrogate_separate_identity_not_real_dl"
+                    extra_public_outputs.append({"name": surrogate_name, "prediction": surrogate_pred, "metric": surrogate_metric, "table": build_actual_vs_pred_df(test_df, surrogate_pred, surrogate_name)})
+            # Operational fallback is visible, but it is not LSTM/GRU.
+            fallback_pred = get_dl_operational_fallback_forecast(res, len(test_df)) if (bool(res.get("fallback_used", False)) or res.get("operational_fallback_forecast") is not None) else None
+            if fallback_pred is not None:
+                fb_name = "DL-fallback"
+                fb_metric = build_model_metrics(fb_name, train_df["y"].values, test_df["y"].values, fallback_pred)
+                fb_metric.update(dl_metric_identity_fields(label, res, identity_class="fallback"))
+                fb_metric["model"] = fb_name
+                fb_metric["model_public_name"] = fb_name
+                fb_metric["identity_model_family"] = label
+                fb_metric["fallback_source_family"] = label
+                fb_metric["eligible_for_model_ranking"] = False
+                fb_metric["ranking_exclusion_reason"] = "DL fallback ayrı isimle görünür; gerçek LSTM/GRU sıralamasına girmez."
+                extra_public_outputs.append({"name": fb_name, "prediction": fallback_pred, "metric": fb_metric, "table": build_actual_vs_pred_df(test_df, fallback_pred, fb_name)})
+        table = build_actual_vs_pred_df(test_df, res["forecast"], public_label)
         fallback_used = bool((res or {}).get("fallback_used", False))
         status_level = "WARNING" if fallback_used else "SUCCESS"
-        msg = f"{label} tamamlandı."
+        msg = f"{public_label} tamamlandı."
         if fallback_used:
-            msg += " Fallback kullanıldı."
-        progress_log("Model Araması", msg, level=status_level, target=target_col, extra={"model": label, "seconds": round(time.perf_counter() - start, 2), "WAPE": round(float(metric.get('WAPE', np.nan)), 4) if pd.notna(metric.get('WAPE', np.nan)) else np.nan, "fallback": fallback_used})
-        return {"name": label, "result": res, "metric": metric, "table": table, "error": error, "timing": time.perf_counter() - start}
+            msg += " DL-fallback ayrı satırda raporlandı."
+        progress_log("Model Araması", msg, level=status_level, target=target_col, extra={"model": public_label, "seconds": round(time.perf_counter() - start, 2), "WAPE": round(float(metric.get('WAPE', np.nan)), 4) if pd.notna(metric.get('WAPE', np.nan)) else np.nan, "fallback": fallback_used})
+        return {"name": public_label, "internal_name": label, "result": res, "metric": metric, "table": table, "extra_public_outputs": extra_public_outputs, "error": error, "timing": time.perf_counter() - start}
     progress_log("Model Araması", "Model aileleri paralel olarak başlatılıyor.", target=target_col)
     family_outputs = SEARCH_ACCELERATOR.run_parallel_tasks({
         "xgboost": lambda: _wrap_model_run("XGBoost", lambda: fit_xgboost_forecast(train_df, test_df, ml_train_X, ml_test_X, freq_alias=freq_alias)),
@@ -11341,11 +13615,27 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     alias_map = {"xgboost": "xgboost", "lstm": "lstm", "gru": "gru", "prophet": "prophet", "sarima": "sarima", "arima": "arima", "intermittent": "intermittent"}
     for key, label in [("xgboost", "XGBoost"), ("lstm", "LSTM"), ("gru", "GRU"), ("prophet", "Prophet"), ("sarima", "SARIMA/SARIMAX"), ("arima", "ARIMA"), ("intermittent", "Intermittent")]:
         block = family_outputs[key]
+        public_name = block.get("name", label)
         if block["error"]:
-            model_errors[label] = block["error"]
+            model_errors[public_name] = block["error"]
         outputs["metrics"].append(block["metric"])
-        outputs["predictions"][label] = block["result"]["forecast"]
-        outputs["tables"][label] = block["table"]
+        outputs["predictions"][public_name] = block["result"]["forecast"]
+        outputs["tables"][public_name] = block["table"]
+        for extra in block.get("extra_public_outputs", []) or []:
+            extra_name = str(extra.get("name"))
+            if extra_name == "DL-fallback" and extra_name in outputs["predictions"]:
+                # Avoid duplicate DL-fallback rows when both LSTM and GRU fall back.
+                # Preserve the additional source family in the existing metric if possible.
+                for _m in outputs["metrics"]:
+                    if isinstance(_m, dict) and _m.get("model") == "DL-fallback":
+                        existing_src = str(_m.get("fallback_source_family", "") or "")
+                        new_src = str((extra.get("metric") or {}).get("fallback_source_family", "") or "")
+                        srcs = [x for x in (existing_src + "|" + new_src).split("|") if x]
+                        _m["fallback_source_family"] = "|".join(sorted(set(srcs)))
+                continue
+            outputs["metrics"].append(extra.get("metric"))
+            outputs["predictions"][extra_name] = extra.get("prediction")
+            outputs["tables"][extra_name] = extra.get("table")
         outputs[alias_map[key]] = block["result"]
         stage_timings[f"{alias_map[key]}_seconds"] = block["timing"]
     validation_df = pd.DataFrame([
@@ -11353,8 +13643,11 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
         extract_validation_metrics_from_result("ARIMA", outputs["arima"]),
         extract_validation_metrics_from_result("Prophet", outputs["prophet"]),
         extract_validation_metrics_from_result("XGBoost", outputs["xgboost"]),
-        extract_validation_metrics_from_result("LSTM", outputs["lstm"]),
-        extract_validation_metrics_from_result("GRU", outputs["gru"]),
+        extract_validation_metrics_from_result(dl_public_real_name("LSTM"), outputs["lstm"]),
+        extract_validation_metrics_from_result(dl_public_real_name("GRU"), outputs["gru"]),
+        {"model": "LSTM-surrogate", "val_WAPE": np.nan, "val_sMAPE": np.nan, "eligible_for_model_ranking": False, "ranking_exclusion_reason": "surrogate_separate_identity"},
+        {"model": "GRU-surrogate", "val_WAPE": np.nan, "val_sMAPE": np.nan, "eligible_for_model_ranking": False, "ranking_exclusion_reason": "surrogate_separate_identity"},
+        {"model": "DL-fallback", "val_WAPE": np.nan, "val_sMAPE": np.nan, "eligible_for_model_ranking": False, "ranking_exclusion_reason": "operational_fallback_not_validation_selected"},
         extract_validation_metrics_from_result("Intermittent", outputs["intermittent"]),
     ]).sort_values(["val_WAPE", "val_sMAPE"], ascending=[True, True], na_position="last").reset_index(drop=True)
     outputs["validation_metrics_df"] = validation_df
@@ -11364,13 +13657,24 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     progress_log("Backtest", "Rolling-origin backtest tamamlandı.", level="SUCCESS", target=target_col)
     rolling_summary_df = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
     progress_log("Ansambl", "Ansambl ağırlıkları ve birleşik tahmin hesaplanıyor.", target=target_col)
-    ensemble_pred, ensemble_weights = build_weighted_ensemble(outputs["predictions"], metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values, rolling_summary=rolling_summary_df, profile=profile)
+    usable_predictions, usable_metrics_df = filter_usable_prediction_map(outputs["predictions"], metrics_df, expected_horizon=len(test_df))
+    if len(usable_predictions) == 0 or len(usable_metrics_df) == 0:
+        ensemble_pred, ensemble_weights = build_fallback_forecast(train_df["y"], int(len(test_df)), freq_alias, infer_season_length_from_freq(freq_alias))[0], pd.DataFrame([{"model": "fallback_only", "weight": 1.0}])
+        ensemble_pred = np.maximum(np.asarray(ensemble_pred, dtype=float), 0.0)
+    else:
+        ensemble_pred, ensemble_weights = build_weighted_ensemble(usable_predictions, usable_metrics_df, validation_df=validation_df, y_train=train_df["y"].values, y_true=test_df["y"].values, rolling_summary=rolling_summary_df, profile=profile)
     outputs["predictions"]["Ensemble"] = ensemble_pred
     outputs["metrics"].append(build_model_metrics("Ensemble", train_df["y"].values, test_df["y"].values, ensemble_pred))
     outputs["tables"]["Ensemble"] = build_actual_vs_pred_df(test_df, ensemble_pred, "Ensemble")
-    metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True]).reset_index(drop=True)
-    cc = build_champion_challenger(metrics_df)
+    metrics_df = pd.DataFrame(outputs["metrics"]).sort_values(["WAPE", "sMAPE", "RMSE"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
+    ranking_metrics_df = metrics_df.copy()
+    if "eligible_for_model_ranking" in ranking_metrics_df.columns:
+        ranking_metrics_df = ranking_metrics_df.loc[ranking_metrics_df["eligible_for_model_ranking"].fillna(True).astype(bool)].copy()
+    if "WAPE" in ranking_metrics_df.columns:
+        ranking_metrics_df = ranking_metrics_df.loc[pd.to_numeric(ranking_metrics_df["WAPE"], errors="coerce").notna()].copy()
+    cc = build_champion_challenger(ranking_metrics_df if len(ranking_metrics_df) else metrics_df)
     outputs["metrics_df"] = metrics_df
+    outputs["ranking_metrics_df"] = ranking_metrics_df
     outputs["champion_challenger"] = cc
     outputs["best_model"] = cc["champion"]
     outputs["ensemble_weights"] = ensemble_weights
@@ -11378,15 +13682,23 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     outputs["model_errors"] = model_errors
     outputs["stage_timings"] = stage_timings
     outputs["stage_timing_table"] = build_stage_timer_rows(stage_timings)
+    dl_fb_sources = []
+    for _fam, _key in [("LSTM", "lstm"), ("GRU", "gru")]:
+        if bool((outputs.get(_key) or {}).get("fallback_used", False)) or (outputs.get(_key) or {}).get("operational_fallback_forecast") is not None:
+            dl_fb_sources.append(_fam)
     outputs["fallback_summary"] = pd.DataFrame([
         {"model": "XGBoost", "fallback_used": bool((outputs.get("xgboost") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("xgboost") or {}).get("fallback_method")},
-        {"model": "LSTM", "fallback_used": bool((outputs.get("lstm") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("lstm") or {}).get("fallback_method")},
-        {"model": "GRU", "fallback_used": bool((outputs.get("gru") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("gru") or {}).get("fallback_method")},
+        {"model": "LSTM (real)", "fallback_used": False, "fallback_method": None, "dl_strict_validation_passed": bool((outputs.get("lstm") or {}).get("dl_strict_validation_passed", False)), "ranking_excluded": not bool((outputs.get("lstm") or {}).get("eligible_for_model_ranking", False)), "ranking_exclusion_reason": (outputs.get("lstm") or {}).get("strict_dl_rejection_reason")},
+        {"model": "LSTM-surrogate", "fallback_used": False, "fallback_method": None, "surrogate_used": bool((outputs.get("lstm") or {}).get("surrogate_used", False)), "ranking_excluded": True, "ranking_exclusion_reason": "surrogate ayrı model kimliği; gerçek LSTM değildir"},
+        {"model": "GRU (real)", "fallback_used": False, "fallback_method": None, "dl_strict_validation_passed": bool((outputs.get("gru") or {}).get("dl_strict_validation_passed", False)), "ranking_excluded": not bool((outputs.get("gru") or {}).get("eligible_for_model_ranking", False)), "ranking_exclusion_reason": (outputs.get("gru") or {}).get("strict_dl_rejection_reason")},
+        {"model": "GRU-surrogate", "fallback_used": False, "fallback_method": None, "surrogate_used": bool((outputs.get("gru") or {}).get("surrogate_used", False)), "ranking_excluded": True, "ranking_exclusion_reason": "surrogate ayrı model kimliği; gerçek GRU değildir"},
+        {"model": "DL-fallback", "fallback_used": bool(dl_fb_sources), "fallback_method": " | ".join(sorted(set(str((outputs.get(_k.lower()) or {}).get("fallback_method") or "fallback") for _k in dl_fb_sources))) if dl_fb_sources else None, "fallback_source_family": "|".join(dl_fb_sources), "ranking_excluded": True, "ranking_exclusion_reason": "DL fallback ayrı operasyonel modeldir; LSTM/GRU real veya surrogate değildir"},
         {"model": "Prophet", "fallback_used": bool((outputs.get("prophet") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("prophet") or {}).get("fallback_method")},
         {"model": "SARIMA/SARIMAX", "fallback_used": bool((outputs.get("sarima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("sarima") or {}).get("fallback_method")},
         {"model": "ARIMA", "fallback_used": bool((outputs.get("arima") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("arima") or {}).get("fallback_method")},
         {"model": "Intermittent", "fallback_used": bool((outputs.get("intermittent") or {}).get("fallback_used", False)), "fallback_method": (outputs.get("intermittent") or {}).get("fallback_method")},
     ])
+    outputs["dl_transparency_table"] = build_dl_transparency_table(outputs)
     outputs["deep_learning_analysis"] = build_dl_model_analysis(outputs, profile)
     prophet_info = outputs.get("prophet") or {}
     if bool(prophet_info.get("fallback_used", False)):
@@ -11842,22 +14154,27 @@ def run_rolling_origin_backtest_full(export_payload: Dict[str, pd.DataFrame], ta
         except Exception:
             pass
         try:
-            res = fit_deep_learning_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias, model_family="LSTM")
+            res = sanitize_dl_result_for_reporting(fit_deep_learning_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias, model_family="LSTM"), model_family="LSTM", horizon=len(te))
             model_results["LSTM"] = res
-            _record("LSTM", np.asarray(res["forecast"], dtype=float))
+            if bool(res.get("dl_strict_validation_passed", False)):
+                _record("LSTM", np.asarray(res["forecast"], dtype=float))
         except Exception:
             pass
         try:
-            res = fit_deep_learning_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias, model_family="GRU")
+            res = sanitize_dl_result_for_reporting(fit_deep_learning_forecast(tr, te, ml_tr, ml_te, freq_alias=freq_alias, model_family="GRU"), model_family="GRU", horizon=len(te))
             model_results["GRU"] = res
-            _record("GRU", np.asarray(res["forecast"], dtype=float))
+            if bool(res.get("dl_strict_validation_passed", False)):
+                _record("GRU", np.asarray(res["forecast"], dtype=float))
         except Exception:
             pass
         try:
-            pred_map = {k: operational_bias_peak_postprocess(tr["y"], np.asarray(v["forecast"], dtype=float), freq_alias=freq_alias, model_name=k, profile=profile) for k, v in model_results.items()}
+            pred_map = {k: operational_bias_peak_postprocess(tr["y"], np.asarray(v["forecast"], dtype=float), freq_alias=freq_alias, model_name=k, profile=profile) for k, v in model_results.items() if _finite_prediction_array(v.get("forecast"), expected_horizon=len(te))}
             metrics_rows = [build_model_metrics(k, tr["y"].values, te["y"].values, v) for k, v in pred_map.items()]
             val_rows = [extract_validation_metrics_from_result(k, model_results[k]) for k in model_results.keys()]
-            ens_pred, _ = build_weighted_ensemble(pred_map, pd.DataFrame(metrics_rows), validation_df=pd.DataFrame(val_rows), y_train=tr["y"].values, y_true=te["y"].values, profile=profile)
+            pred_map, metrics_df_fold = filter_usable_prediction_map(pred_map, pd.DataFrame(metrics_rows), expected_horizon=len(te))
+            if len(pred_map) == 0 or len(metrics_df_fold) == 0:
+                raise ValueError("Rolling ensemble için kullanılabilir model yok.")
+            ens_pred, _ = build_weighted_ensemble(pred_map, metrics_df_fold, validation_df=pd.DataFrame(val_rows), y_train=tr["y"].values, y_true=te["y"].values, profile=profile)
             _record("Ensemble", ens_pred)
         except Exception:
             pass
@@ -12082,6 +14399,7 @@ def build_benzersiz_rapor_katalogu(outputs: Dict[str, Any], prod_pack: Dict[str,
     adaylar: List[Tuple[str, pd.DataFrame]] = [
         ("ModelKarşılaştırma", outputs.get("metrics_df", pd.DataFrame())),
         ("DoğrulamaMetrikleri", outputs.get("validation_metrics_df", pd.DataFrame())),
+        ("DLSeffaflik", outputs.get("dl_transparency_table", pd.DataFrame())),
         ("KararHiyerarşisi", build_karar_hiyerarsisi_ozeti(outputs)),
         ("AnsamblAğırlıkları", outputs.get("ensemble_weights", pd.DataFrame())),
         ("RollingOrigin", outputs.get("rolling_origin_backtest", pd.DataFrame())),
@@ -12526,7 +14844,7 @@ def render_streamlit_app():
             suggestions.append("SARIMA residual white-noise testi zayıf; challenger olarak Prophet veya XGBoost önceliklendirilmeli.")
         if outputs.get("best_model") == "Ensemble":
             suggestions.append("Bu seride tek bir champion yerine ensemble daha iyi; operasyonel kullanımda champion-challenger izleme önerilir.")
-        if outputs.get("best_model") in ["LSTM", "GRU"]:
+        if normalize_dl_family_label(outputs.get("best_model")) in {"LSTM", "GRU"}:
             suggestions.append("Derin öğrenme modeli öne çıktı; epoch-loss eğrileri ve validation-holdout ayrışması özellikle kontrol edilmelidir.")
         if not suggestions:
             suggestions.append("Seri dengeli; champion-challenger ve ensemble izlemesi yeterli görünüyor.")
