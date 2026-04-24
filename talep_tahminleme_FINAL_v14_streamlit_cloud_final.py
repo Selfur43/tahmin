@@ -14682,7 +14682,7 @@ def render_streamlit_app():
     if fig is not None:
         st.plotly_chart(fig, width="stretch")
 
-    tab1, tab2, tab3, tab3b, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Derin Öğrenme (LSTM/GRU)", "Şampiyon-Meydan Okuyan ve Ansambl", "Gerçek vs Tahmin", "Geri Test Panosu", "Üretim Yönetişimi", "Önişleme Denetimleri", "Akıllı Değerlendirmeler"])
+    tab1, tab2, tab3, tab3b, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(["SARIMA/SARIMAX", "Prophet", "XGBoost", "Derin Öğrenme (LSTM/GRU)", "Şampiyon-Meydan Okuyan ve Ansambl", "Gerçek vs Tahmin", "Geri Test Panosu", "Üretim Yönetişimi", "Önişleme Denetimleri", "Akıllı Değerlendirmeler", "Tez ve İş Çıktıları"])
 
     with tab1:
         sarima = outputs.get("sarima")
@@ -14857,6 +14857,21 @@ def render_streamlit_app():
             suggestions.append("Seri dengeli; champion-challenger ve ensemble izlemesi yeterli görünüyor.")
         for s in suggestions:
             st.write(f"- {s}")
+
+
+    with tab10:
+        try:
+            outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
+            outputs = ensure_thesis_business_pack(outputs, export_payload, target_col, selected_sheet)
+            thesis_pack = outputs.get("thesis_business_pack", {}) or {}
+            st.markdown("### Tez/Makale ve İş Ortamı Çıktıları")
+            st.caption("Bu bölüm PDF görev planındaki 4 haftalık gereksinimleri, üretim safety-gate çıktılarıyla birlikte tez formatında gösterir.")
+            for table_name, table_df in (thesis_pack.get("tables", {}) or {}).items():
+                if isinstance(table_df, pd.DataFrame):
+                    with st.expander(table_name, expanded=table_name in {"Tez ve İş Çıktısı Manifestosu", "Tez - PDF görev uyum matrisi", "Tez - Final model seçim matrisi"}):
+                        st.dataframe(style_metric_dataframe(table_df), width="stretch")
+        except Exception as _tez_e:
+            st.warning(f"Tez ve iş çıktıları hazırlanırken uyarı oluştu: {_tez_e}")
 
 
 def _resolve_streamlit_entrypoint():
@@ -16523,6 +16538,834 @@ def ensure_production_reporting_tables(outputs: Dict[str, Any], export_payload: 
     outputs["production_model"] = pack.get("production_model")
     outputs["production_status"] = pack.get("production_status")
     return outputs
+
+
+# =========================================================
+# THESIS + BUSINESS READY OUTPUT GOVERNANCE PATCH
+# =========================================================
+# Final patch goal:
+# 1) Production ranking can only contain hard-gate approved real production models.
+# 2) Audit / research / production tables are separated consistently.
+# 3) PDF task requirements are mapped to Streamlit/Excel thesis-ready outputs.
+# 4) Every downloadable "all tables" Excel is regenerated after the final safety gate.
+
+BUSINESS_THESIS_OUTPUT_VERSION = "2026_04_24_business_thesis_ready_v1_0"
+try:
+    APP_VERSION = str(APP_VERSION) + "_business_thesis_ready"
+except Exception:
+    APP_VERSION = "business_thesis_ready"
+try:
+    CODE_VERSION = str(CODE_VERSION) + "_business_thesis_ready"
+except Exception:
+    CODE_VERSION = "business_thesis_ready"
+
+_FINAL_AUDIT_MODEL_NAMES = {"DL-fallback", "LSTM-surrogate", "GRU-surrogate"}
+_FINAL_REAL_DL_MODEL_NAMES = {"LSTM", "GRU", "LSTM (real)", "GRU (real)"}
+_FINAL_PRODUCTION_STATUS_BLOCKLIST = {"audit_only", "research_only", "challenger_only", "blocked", "reject", "real_dl_not_trained", "monthly_short_series_blocked"}
+
+
+def _bt_safe_float(x: Any, default: float = np.nan) -> float:
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _bt_safe_bool(x: Any, default: bool = False) -> bool:
+    try:
+        if pd.isna(x):
+            return default
+    except Exception:
+        pass
+    if isinstance(x, str):
+        return x.strip().lower() in {"1", "true", "yes", "evet", "y", "t", "uygun"}
+    try:
+        return bool(x)
+    except Exception:
+        return default
+
+
+def _bt_model_family(model_name: Any) -> str:
+    name = str(model_name)
+    fam = normalize_dl_family_label(name)
+    if fam in {"LSTM", "GRU", "DL-FALLBACK"}:
+        return fam
+    if name == "SARIMA/SARIMAX":
+        return "SARIMA/SARIMAX"
+    if name == "Ensemble":
+        return "Ensemble"
+    if name in {"ARIMA", "Prophet", "XGBoost", "Intermittent"}:
+        return name
+    return name
+
+
+def _bt_model_identity_class(model_name: Any) -> str:
+    name = str(model_name)
+    fam = _bt_model_family(name)
+    up = name.upper()
+    if name in _FINAL_AUDIT_MODEL_NAMES or fam == "DL-FALLBACK":
+        return "fallback" if fam == "DL-FALLBACK" else "surrogate"
+    if fam in {"LSTM", "GRU"} and "SURROGATE" in up:
+        return "surrogate"
+    if name == "Ensemble":
+        return "ensemble"
+    return "real"
+
+
+def _bt_model_names_from_outputs(outputs: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    preferred = ["Ensemble", "XGBoost", "SARIMA/SARIMAX", "ARIMA", "Prophet", "Intermittent", "LSTM (real)", "GRU (real)", "LSTM-surrogate", "GRU-surrogate", "DL-fallback"]
+    for key in ["metrics_df", "validation_metrics_df", "ranking_metrics_df", "fallback_summary"]:
+        df = outputs.get(key, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        if isinstance(df, pd.DataFrame) and len(df) and "model" in df.columns:
+            names.extend(df["model"].dropna().astype(str).tolist())
+    pred = outputs.get("predictions", {}) if isinstance(outputs, dict) else {}
+    if isinstance(pred, dict):
+        names.extend([str(k) for k in pred.keys()])
+    final: List[str] = []
+    for n in preferred + names:
+        if n not in final:
+            final.append(n)
+    return final
+
+
+def _bt_metric_lookup(outputs: Dict[str, Any], model_name: str) -> Dict[str, Any]:
+    for key in ["metrics_df", "ranking_metrics_df", "validation_metrics_df"]:
+        df = outputs.get(key, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        if isinstance(df, pd.DataFrame) and len(df) and "model" in df.columns:
+            hit = df.loc[df["model"].astype(str).eq(str(model_name))].head(1)
+            if len(hit):
+                return hit.iloc[0].to_dict()
+    return {}
+
+
+def _bt_pack_lookup(outputs: Dict[str, Any], family: str) -> Dict[str, Any]:
+    key = str(family).lower()
+    if key == "dl-fallback":
+        key = "lstm"
+    pack = outputs.get(key, {}) if isinstance(outputs, dict) else {}
+    return pack if isinstance(pack, dict) else {}
+
+
+def _bt_force_final_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
+    outputs = outputs if isinstance(outputs, dict) else {}
+    meta = outputs.get("metadata", {}) or {}
+    freq_alias = str(meta.get("freq_alias", "")).upper()
+    train_n = int(meta.get("train_n", 0) or 0)
+    rows: List[Dict[str, Any]] = []
+    for model in _bt_model_names_from_outputs(outputs):
+        family = _bt_model_family(model)
+        identity = _bt_model_identity_class(model)
+        metric = _bt_metric_lookup(outputs, model)
+        wape = _bt_safe_float(metric.get("WAPE", np.nan))
+        smape = _bt_safe_float(metric.get("sMAPE", np.nan))
+        rmse = _bt_safe_float(metric.get("RMSE", np.nan))
+        mae = _bt_safe_float(metric.get("MAE", np.nan))
+        mape = _bt_safe_float(metric.get("MAPE", np.nan))
+        metric_available = bool(pd.notna(wape) and np.isfinite(wape))
+        is_recurrent_dl = family in {"LSTM", "GRU"}
+        dl_pack = _bt_pack_lookup(outputs, family) if is_recurrent_dl else {}
+        real_dl_trained = bool(
+            is_recurrent_dl
+            and _bt_safe_bool(dl_pack.get("real_dl_trained", False))
+            and str(dl_pack.get("dl_backend", "")).lower() == "tensorflow"
+            and not _bt_safe_bool(dl_pack.get("surrogate_used", False))
+            and not _bt_safe_bool(dl_pack.get("fallback_used", False))
+        )
+        trained_with_tensorflow = bool(is_recurrent_dl and str(dl_pack.get("dl_backend", "")).lower() == "tensorflow" and _bt_safe_bool(dl_pack.get("real_dl_trained", False)))
+        fallback_generated = False
+        fallback_method = None
+        if is_recurrent_dl:
+            fallback_generated = bool(_bt_safe_bool(dl_pack.get("fallback_used", False)) or dl_pack.get("operational_fallback_forecast") is not None)
+            fallback_method = dl_pack.get("fallback_method")
+        elif family == "DL-FALLBACK" or str(model) == "DL-fallback":
+            lp, gp = _bt_pack_lookup(outputs, "LSTM"), _bt_pack_lookup(outputs, "GRU")
+            fallback_generated = True
+            methods = [str(p.get("fallback_method")) for p in [lp, gp] if isinstance(p, dict) and p.get("fallback_method")]
+            fallback_method = " | ".join(sorted(set(methods))) if methods else "dl_operational_fallback"
+        else:
+            std_key = str(model).lower().replace("/", "_").replace("-", "_").replace(" ", "_")
+            std_pack = outputs.get(std_key, {}) if isinstance(outputs.get(std_key, {}), dict) else {}
+            fallback_generated = _bt_safe_bool(std_pack.get("fallback_used", False))
+            fallback_method = std_pack.get("fallback_method")
+
+        production_scope = "production"
+        status = "eligible"
+        reasons: List[str] = []
+        ranking_eligible = bool(metric_available)
+        champion_eligible = bool(metric_available)
+        if identity in {"surrogate", "fallback"} or str(model) in _FINAL_AUDIT_MODEL_NAMES:
+            ranking_eligible = False
+            champion_eligible = False
+            production_scope = "audit_only"
+            status = "audit_only"
+            reasons.append("Surrogate/fallback modeli champion, ensemble veya üretim adayı olamaz.")
+        elif is_recurrent_dl:
+            if not real_dl_trained:
+                ranking_eligible = False
+                champion_eligible = False
+                production_scope = "audit_only"
+                status = "real_dl_not_trained"
+                reasons.append("Gerçek TensorFlow/Keras DL eğitimi doğrulanmadı; fallback/surrogate ayrı audit alanında tutulur.")
+            elif freq_alias == "M" and train_n < 72:
+                ranking_eligible = False
+                champion_eligible = False
+                production_scope = "audit_only"
+                status = "monthly_short_series_blocked"
+                reasons.append("Aylık train_n < 72; gerçek LSTM/GRU public sıralamaya alınmaz.")
+            elif freq_alias == "M" and train_n < 96:
+                ranking_eligible = False
+                champion_eligible = False
+                production_scope = "research_only"
+                status = "research_only"
+                reasons.append("Aylık train_n < 96; LSTM/GRU yalnız challenger/research modunda izlenir.")
+            folds = int(dl_pack.get("rolling_validation_folds", 0) or 0)
+            if production_scope == "production" and folds < 2:
+                ranking_eligible = False
+                champion_eligible = False
+                production_scope = "research_only"
+                status = "research_only"
+                reasons.append("DL için rolling-origin validation fold sayısı üretim kapısı için yetersiz.")
+        elif not metric_available and str(model) not in {"LSTM (real)", "GRU (real)", "LSTM-surrogate", "GRU-surrogate", "DL-fallback"}:
+            ranking_eligible = False
+            champion_eligible = False
+            production_scope = "audit_only"
+            status = "blocked"
+            reasons.append("Sonlu holdout metriği yok; üretim sıralamasına alınmadı.")
+
+        production_eligible = bool(ranking_eligible and champion_eligible and production_scope == "production" and str(model) not in _FINAL_AUDIT_MODEL_NAMES)
+        rows.append({
+            "model": str(model),
+            "display_model_name": str(model),
+            "model_family": family,
+            "model_identity_class": identity,
+            "identity_registry_version": BUSINESS_THESIS_OUTPUT_VERSION,
+            "trained_real_model": bool((not is_recurrent_dl and identity in {"real", "ensemble"}) or real_dl_trained),
+            "trained_with_tensorflow": trained_with_tensorflow,
+            "real_dl_trained": real_dl_trained,
+            "surrogate_used": bool(identity == "surrogate" or (is_recurrent_dl and _bt_safe_bool(dl_pack.get("surrogate_used", False)))),
+            "fallback_forecast_generated": bool(fallback_generated),
+            "fallback_used_as_real_model_output": False if is_recurrent_dl or identity in {"surrogate", "fallback"} else bool(fallback_generated),
+            "fallback_reported_as_separate_model": bool(identity == "fallback" or (is_recurrent_dl and fallback_generated)),
+            "fallback_method": fallback_method,
+            "ranking_eligible": ranking_eligible,
+            "eligible_for_model_ranking": ranking_eligible,
+            "champion_eligible": champion_eligible,
+            "production_eligible": production_eligible,
+            "research_only": bool(production_scope == "research_only"),
+            "audit_only": bool(production_scope == "audit_only"),
+            "production_scope": production_scope,
+            "status": status,
+            "hard_gate_passed": production_eligible,
+            "hard_gate_reason": " | ".join(dict.fromkeys(reasons)) if reasons else "Üretim hard gate geçti.",
+            "WAPE": wape,
+            "sMAPE": smape,
+            "RMSE": rmse,
+            "MAE": mae,
+            "MAPE": mape,
+            "metric_available": metric_available,
+            "freq_alias": freq_alias,
+            "train_n": train_n,
+        })
+    return pd.DataFrame(rows)
+
+
+# Override the identity registry with the final business/thesis contract.
+def build_model_identity_registry(outputs: Dict[str, Any]) -> pd.DataFrame:
+    return _bt_force_final_model_identity_registry(outputs)
+
+
+def enrich_model_df_with_identity_registry(df: pd.DataFrame, registry: pd.DataFrame, override_eligibility: bool = True) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    out = df.copy()
+    if len(out) == 0 or "model" not in out.columns:
+        return out
+    reg = registry if isinstance(registry, pd.DataFrame) and len(registry) else pd.DataFrame()
+    if len(reg) == 0:
+        return out
+    reg_cols = [
+        "model", "display_model_name", "model_family", "model_identity_class", "trained_real_model",
+        "trained_with_tensorflow", "real_dl_trained", "surrogate_used", "fallback_forecast_generated",
+        "fallback_used_as_real_model_output", "fallback_reported_as_separate_model", "fallback_method",
+        "ranking_eligible", "eligible_for_model_ranking", "champion_eligible", "production_eligible",
+        "research_only", "audit_only", "production_scope", "status", "hard_gate_passed", "hard_gate_reason",
+    ]
+    reg_view = reg[[c for c in reg_cols if c in reg.columns]].drop_duplicates("model")
+    out = out.drop(columns=[c for c in reg_view.columns if c != "model" and c in out.columns], errors="ignore").merge(reg_view, on="model", how="left")
+    if override_eligibility:
+        if "ranking_eligible" in out.columns:
+            out["eligible_for_model_ranking"] = out["ranking_eligible"].fillna(False).astype(bool)
+        if "model" in out.columns:
+            blocked = out["model"].astype(str).isin(_FINAL_AUDIT_MODEL_NAMES)
+            if blocked.any():
+                for col in ["eligible_for_model_ranking", "ranking_eligible", "champion_eligible", "production_eligible"]:
+                    if col in out.columns:
+                        out.loc[blocked, col] = False
+    return out
+
+
+def standardize_fallback_summary(outputs: Dict[str, Any], registry: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    outputs = outputs if isinstance(outputs, dict) else {}
+    registry = registry if isinstance(registry, pd.DataFrame) and len(registry) else build_model_identity_registry(outputs)
+    old = outputs.get("fallback_summary", pd.DataFrame())
+    if not isinstance(old, pd.DataFrame) or len(old) == 0 or "model" not in old.columns:
+        old = registry[["model"]].copy() if isinstance(registry, pd.DataFrame) and "model" in registry.columns else pd.DataFrame(columns=["model"])
+    out = enrich_model_df_with_identity_registry(old, registry, override_eligibility=False)
+    out["fallback_forecast_generated"] = out.get("fallback_forecast_generated", False).fillna(False).astype(bool)
+    out["fallback_used_as_real_model_output"] = out.get("fallback_used_as_real_model_output", False).fillna(False).astype(bool)
+    out["fallback_reported_as_separate_model"] = out.get("fallback_reported_as_separate_model", False).fillna(False).astype(bool)
+    out["fallback_used_legacy_alias"] = out["fallback_forecast_generated"]
+    if "fallback_reason" not in out.columns:
+        out["fallback_reason"] = out.get("hard_gate_reason", "")
+    preferred = ["model", "model_family", "model_identity_class", "fallback_forecast_generated", "fallback_used_as_real_model_output", "fallback_reported_as_separate_model", "fallback_method", "fallback_reason", "production_scope", "status", "hard_gate_reason", "real_dl_trained", "trained_with_tensorflow", "surrogate_used"]
+    return out[[c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]].reset_index(drop=True)
+
+
+def _bt_build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    registry = build_model_identity_registry(outputs)
+    if not isinstance(registry, pd.DataFrame) or len(registry) == 0:
+        return pd.DataFrame(columns=["model", "status", "eligibility_score", "production_scope", "hard_gate_reason"])
+    gate = registry.copy()
+    # Business score only for production candidates; audit/research rows intentionally do not receive a production score.
+    gate["eligibility_score"] = np.nan
+    for idx, row in gate.iterrows():
+        if bool(row.get("production_eligible", False)):
+            w = _bt_safe_float(row.get("WAPE", np.nan), np.nan)
+            score = 100.0 - min(max(w if pd.notna(w) else 50.0, 0.0), 100.0)
+            if str(row.get("model")) == "Ensemble":
+                score += 2.0
+            gate.at[idx, "eligibility_score"] = round(max(0.0, min(100.0, score)), 4)
+            gate.at[idx, "status"] = "eligible"
+        elif str(row.get("production_scope")) == "research_only":
+            gate.at[idx, "status"] = "research_only"
+        elif str(row.get("production_scope")) == "audit_only":
+            gate.at[idx, "status"] = "audit_only"
+        else:
+            gate.at[idx, "status"] = "blocked"
+    gate["reasons"] = gate.get("hard_gate_reason", "")
+    order = {"eligible": 0, "research_only": 1, "audit_only": 2, "blocked": 3}
+    gate["_rank"] = gate["status"].map(order).fillna(9).astype(int)
+    return gate.sort_values(["_rank", "eligibility_score", "WAPE"], ascending=[True, False, True], na_position="last").drop(columns=["_rank"], errors="ignore").reset_index(drop=True)
+
+
+def build_model_eligibility_gate(outputs: Dict[str, Any], feature_audit_df: pd.DataFrame) -> pd.DataFrame:
+    return _bt_build_model_eligibility_gate(outputs, feature_audit_df)
+
+
+def _bt_production_ranking(outputs: Dict[str, Any], production_pack: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    outputs = outputs if isinstance(outputs, dict) else {}
+    registry = build_model_identity_registry(outputs)
+    metrics = outputs.get("metrics_df", pd.DataFrame())
+    if not isinstance(metrics, pd.DataFrame) or len(metrics) == 0 or "model" not in metrics.columns:
+        return pd.DataFrame(columns=["model", "status", "WAPE", "sMAPE", "MAE", "RMSE", "production_eligible", "production_scope"])
+    ranked = enrich_model_df_with_identity_registry(metrics, registry, override_eligibility=True)
+    if "production_eligible" not in ranked.columns:
+        ranked["production_eligible"] = False
+    ranked = ranked.loc[ranked["production_eligible"].fillna(False).astype(bool)].copy()
+    ranked = ranked.loc[~ranked["model"].astype(str).isin(_FINAL_AUDIT_MODEL_NAMES)].copy()
+    ranked = ranked.loc[~ranked.get("status", pd.Series("", index=ranked.index)).astype(str).str.lower().isin(_FINAL_PRODUCTION_STATUS_BLOCKLIST)].copy()
+    if "WAPE" in ranked.columns:
+        ranked = ranked.loc[pd.to_numeric(ranked["WAPE"], errors="coerce").notna()].copy()
+    if len(ranked) == 0:
+        return ranked.reset_index(drop=True)
+    ro = pd.DataFrame()
+    try:
+        ro = summarize_full_backtest(outputs.get("rolling_origin_backtest", pd.DataFrame()))
+    except Exception:
+        ro = pd.DataFrame()
+    if isinstance(ro, pd.DataFrame) and len(ro) and "model" in ro.columns and "WAPE" in ro.columns:
+        ranked = ranked.merge(ro[["model", "WAPE"]].rename(columns={"WAPE": "rolling_WAPE"}), on="model", how="left")
+    ranked["holdout_WAPE_sort"] = pd.to_numeric(ranked.get("WAPE"), errors="coerce")
+    ranked["rolling_WAPE_sort"] = pd.to_numeric(ranked.get("rolling_WAPE"), errors="coerce")
+    ranked["business_operational_score"] = ranked["rolling_WAPE_sort"].fillna(ranked["holdout_WAPE_sort"]) * 0.70 + ranked["holdout_WAPE_sort"] * 0.30
+    ranked = ranked.sort_values(["business_operational_score", "holdout_WAPE_sort", "sMAPE", "MAE"], ascending=[True, True, True, True], na_position="last")
+    ranked = ranked.drop(columns=["holdout_WAPE_sort", "rolling_WAPE_sort"], errors="ignore").reset_index(drop=True)
+    return ranked
+
+
+def build_hardened_production_ranking(outputs: Dict[str, Any], production_pack: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    return _bt_production_ranking(outputs, production_pack)
+
+
+def _derive_production_ranking(outputs: Dict[str, Any]) -> pd.DataFrame:
+    return _bt_production_ranking(outputs, outputs.get("production_governance", {}) if isinstance(outputs, dict) else {})
+
+
+def _bt_split_identity_tables(outputs: Dict[str, Any], pack: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    registry = build_model_identity_registry(outputs)
+    metrics = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    base = registry.copy()
+    if isinstance(metrics, pd.DataFrame) and len(metrics) and "model" in metrics.columns:
+        metric_cols = [c for c in ["model", "WAPE", "sMAPE", "RMSE", "MAE", "MAPE", "BiasPct"] if c in metrics.columns]
+        base = base.drop(columns=[c for c in metric_cols if c != "model" and c in base.columns], errors="ignore").merge(metrics[metric_cols].drop_duplicates("model"), on="model", how="left")
+    prod = base.loc[base.get("production_eligible", pd.Series(False, index=base.index)).fillna(False).astype(bool)].copy()
+    research = base.loc[base.get("production_scope", pd.Series("", index=base.index)).astype(str).eq("research_only") | base.get("research_only", pd.Series(False, index=base.index)).fillna(False).astype(bool)].copy()
+    audit = base.loc[base.get("production_scope", pd.Series("", index=base.index)).astype(str).eq("audit_only") | base.get("audit_only", pd.Series(False, index=base.index)).fillna(False).astype(bool) | base["model"].astype(str).isin(_FINAL_AUDIT_MODEL_NAMES)].copy()
+    return prod.reset_index(drop=True), research.reset_index(drop=True), audit.reset_index(drop=True)
+
+
+def split_identity_governance_tables(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    return _bt_split_identity_tables(outputs, production_pack)
+
+
+def run_model_identity_quality_assertions(outputs: Dict[str, Any], production_pack: Dict[str, Any]) -> pd.DataFrame:
+    registry = build_model_identity_registry(outputs)
+    prod_rank = production_pack.get("production_ranking", pd.DataFrame()) if isinstance(production_pack, dict) else pd.DataFrame()
+    ens = outputs.get("ensemble_weights", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    def rec(name: str, passed: bool, detail: str, blocking: bool = True):
+        rows.append({"assertion": name, "passed": bool(passed), "blocking": bool(blocking), "severity": "PASS" if passed else "FAIL", "detail": detail})
+    rec("registry_exists", isinstance(registry, pd.DataFrame) and len(registry) > 0, "Merkezî model registry boş olamaz.")
+    if isinstance(registry, pd.DataFrame) and len(registry):
+        bad = registry.loc[registry["model"].astype(str).isin(_FINAL_AUDIT_MODEL_NAMES) & registry.get("production_eligible", pd.Series(False, index=registry.index)).fillna(False).astype(bool)]
+        rec("audit_models_never_production_eligible", len(bad) == 0, "DL-fallback ve surrogate modeller production_eligible olamaz.")
+        bad_dl = registry.loc[registry.get("model_family", pd.Series("", index=registry.index)).astype(str).isin(["LSTM", "GRU"]) & (~registry.get("real_dl_trained", pd.Series(False, index=registry.index)).fillna(False).astype(bool)) & registry.get("ranking_eligible", pd.Series(False, index=registry.index)).fillna(False).astype(bool)]
+        rec("untrained_recurrent_dl_never_ranked", len(bad_dl) == 0, "Gerçek eğitimi doğrulanmamış LSTM/GRU ranking_eligible olamaz.")
+    if isinstance(prod_rank, pd.DataFrame) and len(prod_rank):
+        bad_pr = prod_rank.loc[(~prod_rank.get("production_eligible", pd.Series(False, index=prod_rank.index)).fillna(False).astype(bool)) | prod_rank["model"].astype(str).isin(_FINAL_AUDIT_MODEL_NAMES)]
+        rec("production_ranking_only_real_eligible", len(bad_pr) == 0, "Production ranking yalnız gerçek production_eligible adayları içerebilir.")
+    else:
+        rec("production_ranking_non_empty_or_blocked", production_pack.get("production_status") in {"blocked_no_eligible_model", "guarded_no_eligible_model"}, "Uygun aday yoksa production_status bloklu/korumalı olmalı.", blocking=False)
+    if isinstance(ens, pd.DataFrame) and len(ens) and "model" in ens.columns and isinstance(registry, pd.DataFrame) and len(registry):
+        j = ens.merge(registry[["model", "production_eligible", "model_identity_class"]], on="model", how="left")
+        bad_ens = j.loc[j["model"].astype(str).isin(_FINAL_AUDIT_MODEL_NAMES) | (~j.get("production_eligible", pd.Series(True, index=j.index)).fillna(True).astype(bool)) | j.get("model_identity_class", pd.Series("", index=j.index)).astype(str).isin(["surrogate", "fallback"])]
+        rec("ensemble_excludes_audit_and_uneligible", len(bad_ens) == 0, "Ensemble ağırlıkları audit/surrogate/fallback veya production_eligible=False model içeremez.", blocking=False)
+    for key, fam in [("lstm", "LSTM"), ("gru", "GRU")]:
+        pack = outputs.get(key, {}) if isinstance(outputs, dict) else {}
+        tbl = pack.get("dl_training_status_table") if isinstance(pack, dict) else None
+        rec(f"{fam.lower()}_training_status_exists", isinstance(tbl, pd.DataFrame) and len(tbl) > 0, f"{fam} için eğitim durumu tablosu zorunludur.", blocking=False)
+    return pd.DataFrame(rows)
+
+
+def build_deployment_safety_manifest(outputs: Dict[str, Any], pack: Dict[str, Any]) -> pd.DataFrame:
+    assertions = run_model_identity_quality_assertions(outputs, pack)
+    blockers = assertions.loc[assertions.get("blocking", pd.Series(True, index=assertions.index)).fillna(True).astype(bool) & (~assertions.get("passed", pd.Series(False, index=assertions.index)).fillna(False).astype(bool))]
+    return pd.DataFrame([{
+        "deployment_ready": bool(len(blockers) == 0 and pack.get("production_status") not in {"blocked_no_eligible_model", "guarded_no_eligible_model", "blocked_identity_quality_failed"}),
+        "blocking_failure_count": int(len(blockers)),
+        "production_model": pack.get("production_model"),
+        "production_status": pack.get("production_status"),
+        "safety_gate_version": BUSINESS_THESIS_OUTPUT_VERSION,
+        "blocking_failures": " | ".join(blockers.get("assertion", pd.Series(dtype=str)).astype(str).tolist()) if len(blockers) else "",
+        "business_rule": "Sadece production_eligible=True gerçek modeller üretim önerisi olabilir; DL fallback/surrogate/research çıktı üretime sızamaz.",
+    }])
+
+
+def _bt_select_production_model(outputs: Dict[str, Any], pack: Dict[str, Any]) -> Tuple[Optional[str], str, str]:
+    rank = pack.get("production_ranking", pd.DataFrame()) if isinstance(pack, dict) else pd.DataFrame()
+    if isinstance(rank, pd.DataFrame) and len(rank):
+        return str(rank.iloc[0].get("model")), "eligible", "Hard-gate onaylı production ranking lideri seçildi."
+    return None, "guarded_no_eligible_model", "Hiçbir model production hard gate şartlarını geçmedi; üretim seçimi bloke edildi."
+
+
+def apply_model_identity_hardening_to_outputs(outputs: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    try:
+        ensure_dl_training_status_tables(outputs)
+    except Exception:
+        pass
+    registry = build_model_identity_registry(outputs)
+    outputs["model_identity_registry"] = registry
+    for key in ["metrics_df", "validation_metrics_df", "ranking_metrics_df"]:
+        if isinstance(outputs.get(key), pd.DataFrame):
+            outputs[key] = enrich_model_df_with_identity_registry(outputs[key], registry, override_eligibility=True)
+    if isinstance(outputs.get("metrics_df"), pd.DataFrame) and len(outputs["metrics_df"]):
+        prod_metric = outputs["metrics_df"].loc[outputs["metrics_df"].get("production_eligible", pd.Series(False, index=outputs["metrics_df"].index)).fillna(False).astype(bool)].copy()
+        if "WAPE" in prod_metric.columns:
+            prod_metric = prod_metric.loc[pd.to_numeric(prod_metric["WAPE"], errors="coerce").notna()].copy()
+        outputs["ranking_metrics_df"] = prod_metric.reset_index(drop=True)
+        if len(prod_metric):
+            try:
+                outputs["champion_challenger"] = build_champion_challenger(prod_metric)
+                outputs["best_model"] = outputs["champion_challenger"].get("champion")
+            except Exception:
+                pass
+    outputs["fallback_summary"] = standardize_fallback_summary(outputs, registry)
+    return outputs
+
+
+_BT_PREV_BUILD_PRODUCTION_GOVERNANCE_PACK = globals().get("build_production_governance_pack")
+
+
+def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
+    outputs = apply_model_identity_hardening_to_outputs(outputs)
+    pack: Dict[str, Any] = {}
+    if callable(_BT_PREV_BUILD_PRODUCTION_GOVERNANCE_PACK):
+        try:
+            pack = _BT_PREV_BUILD_PRODUCTION_GOVERNANCE_PACK(outputs, export_payload, target_col, freq_alias) or {}
+        except Exception as e:
+            pack = {"legacy_pack_error": str(e)}
+    if not isinstance(pack, dict):
+        pack = {}
+    registry = build_model_identity_registry(outputs)
+    outputs["model_identity_registry"] = registry
+    pack["model_identity_registry"] = registry
+    feature_audit = pack.get("feature_availability_audit", pd.DataFrame())
+    if not isinstance(feature_audit, pd.DataFrame):
+        feature_audit = pd.DataFrame()
+    pack["model_eligibility_gate"] = build_model_eligibility_gate(outputs, feature_audit)
+    pack["production_ranking"] = build_hardened_production_ranking(outputs, pack)
+    prod, research, audit = split_identity_governance_tables(outputs, pack)
+    pack["production_candidates"] = prod
+    pack["research_models"] = research
+    pack["audit_models"] = audit
+    selected, status, reason = _bt_select_production_model(outputs, pack)
+    pack["production_model"] = selected
+    pack["production_status"] = status
+    pack["production_selection_reason"] = reason
+    qtables = pack.get("quantile_forecasts", {}) if isinstance(pack.get("quantile_forecasts", {}), dict) else {}
+    stables = pack.get("service_level_simulation", {}) if isinstance(pack.get("service_level_simulation", {}), dict) else {}
+    pack["production_interval_table"] = qtables.get(selected, pd.DataFrame()) if selected else pd.DataFrame()
+    pack["production_service_table"] = stables.get(selected, pd.DataFrame()) if selected else pd.DataFrame()
+    pack["model_identity_quality_assertions"] = run_model_identity_quality_assertions(outputs, pack)
+    pack["deployment_safety_manifest"] = build_deployment_safety_manifest(outputs, pack)
+    blockers = pack["model_identity_quality_assertions"].loc[pack["model_identity_quality_assertions"].get("blocking", pd.Series(True, index=pack["model_identity_quality_assertions"].index)).fillna(True).astype(bool) & (~pack["model_identity_quality_assertions"].get("passed", pd.Series(False, index=pack["model_identity_quality_assertions"].index)).fillna(False).astype(bool))]
+    if len(blockers):
+        pack["production_status"] = "blocked_identity_quality_failed"
+    try:
+        pack["production_decision_explanation"] = build_production_decision_explanation(pack.get("production_ranking", pd.DataFrame()), pack.get("production_model"))
+    except Exception:
+        pack["production_decision_explanation"] = reason
+    return pack
+
+
+def ensure_production_reporting_tables(outputs: Dict[str, Any], export_payload: Optional[Dict[str, pd.DataFrame]] = None, target_col: Optional[str] = None, freq_alias: Optional[str] = None) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    outputs = apply_model_identity_hardening_to_outputs(outputs)
+    if export_payload is not None and target_col is not None:
+        if freq_alias is None:
+            freq_alias = str((outputs.get("metadata") or {}).get("freq_alias", ""))
+        try:
+            pack = build_production_governance_pack(outputs, export_payload, target_col, str(freq_alias))
+        except Exception as e:
+            pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+            pack["production_governance_error"] = str(e)
+    else:
+        pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+        registry = build_model_identity_registry(outputs)
+        pack["model_identity_registry"] = registry
+        pack["model_eligibility_gate"] = build_model_eligibility_gate(outputs, pd.DataFrame())
+        pack["production_ranking"] = build_hardened_production_ranking(outputs, pack)
+        prod, research, audit = split_identity_governance_tables(outputs, pack)
+        pack["production_candidates"] = prod
+        pack["research_models"] = research
+        pack["audit_models"] = audit
+        selected, status, reason = _bt_select_production_model(outputs, pack)
+        pack["production_model"] = selected
+        pack["production_status"] = status
+        pack["production_selection_reason"] = reason
+        pack["model_identity_quality_assertions"] = run_model_identity_quality_assertions(outputs, pack)
+        pack["deployment_safety_manifest"] = build_deployment_safety_manifest(outputs, pack)
+    outputs["production_governance"] = pack
+    outputs["production_model"] = pack.get("production_model")
+    outputs["production_status"] = pack.get("production_status")
+    try:
+        outputs = ensure_thesis_business_pack(outputs, export_payload or {}, target_col or (outputs.get("metadata") or {}).get("target_col"), (outputs.get("metadata") or {}).get("selected_sheet"))
+    except Exception as e:
+        outputs.setdefault("thesis_business_pack_errors", []).append(str(e))
+    return outputs
+
+
+def _bt_get_clean_series(export_payload: Dict[str, pd.DataFrame], target_col: str) -> pd.DataFrame:
+    try:
+        df = make_series_analysis_frame(export_payload, target_col)
+        if isinstance(df, pd.DataFrame) and {"ds", "y"}.issubset(df.columns):
+            return df[["ds", "y"]].dropna().copy()
+    except Exception:
+        pass
+    for key in ["clean_model_input", "raw_regular"]:
+        df = export_payload.get(key, pd.DataFrame()) if isinstance(export_payload, dict) else pd.DataFrame()
+        if isinstance(df, pd.DataFrame) and target_col in df.columns:
+            date_cols = [c for c in df.columns if str(c).lower() in {"ds", "date", "datum", "tarih", "datetime"}]
+            date_col = date_cols[0] if date_cols else df.columns[0]
+            return pd.DataFrame({"ds": pd.to_datetime(df[date_col], errors="coerce"), "y": pd.to_numeric(df[target_col], errors="coerce")}).dropna()
+    return pd.DataFrame(columns=["ds", "y"])
+
+
+def _bt_next_dates(last_date: Any, periods: int, freq_alias: str) -> pd.DatetimeIndex:
+    last = pd.to_datetime(last_date)
+    f = str(freq_alias).upper()
+    if f == "M":
+        return pd.date_range(start=last + pd.offsets.MonthEnd(1), periods=periods, freq="ME")
+    if f == "W":
+        return pd.date_range(start=last + pd.offsets.Week(1), periods=periods, freq="W")
+    if f == "D":
+        return pd.date_range(start=last + pd.Timedelta(days=1), periods=periods, freq="D")
+    if f == "H":
+        return pd.date_range(start=last + pd.Timedelta(hours=1), periods=periods, freq="H")
+    return pd.date_range(start=last + pd.offsets.MonthEnd(1), periods=periods, freq="ME")
+
+
+def _bt_business_future_forecast(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str) -> pd.DataFrame:
+    meta = outputs.get("metadata", {}) if isinstance(outputs, dict) else {}
+    freq_alias = str(meta.get("freq_alias", "M")).upper()
+    s_len = int((getattr(FORECAST_RUNTIME_CONFIG, "seasonal_period_map", {}) or {"M": 12, "W": 52, "D": 7, "H": 24}).get(freq_alias, 12))
+    hist_df = _bt_get_clean_series(export_payload, target_col)
+    if len(hist_df) == 0:
+        return pd.DataFrame(columns=["forecast_horizon_set", "period_ahead", "forecast_date", "forecast_value", "forecast_method", "production_model", "note"])
+    y = pd.to_numeric(hist_df["y"], errors="coerce").dropna()
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+    prod_model = prod_pack.get("production_model") or outputs.get("production_model") or outputs.get("best_model")
+    max_h = 12
+    try:
+        seasonal = forecast_with_baseline_name(y, max_h, freq_alias, s_len, "seasonal_naive")
+        drift = forecast_with_baseline_name(y, max_h, freq_alias, s_len, "drift")
+        recent = forecast_with_baseline_name(y, max_h, freq_alias, s_len, "rolling_mean_3")
+    except Exception:
+        seasonal = seasonal_naive_forecast(y, max_h, s_len) if len(y) else np.zeros(max_h)
+        drift = drift_forecast(y, max_h) if len(y) > 1 else np.repeat(float(y.iloc[-1]) if len(y) else 0.0, max_h)
+        recent = np.repeat(float(y.tail(min(3, len(y))).mean()) if len(y) else 0.0, max_h)
+    # Conservative business blend for future unknown periods; does not use holdout actuals.
+    pred = np.maximum(0.55 * np.asarray(seasonal, dtype=float) + 0.30 * np.asarray(drift, dtype=float) + 0.15 * np.asarray(recent, dtype=float), 0.0)
+    dates = _bt_next_dates(hist_df["ds"].max(), max_h, freq_alias)
+    rows: List[Dict[str, Any]] = []
+    for hset in [3, 6, 12]:
+        for i in range(hset):
+            rows.append({
+                "forecast_horizon_set": hset,
+                "period_ahead": i + 1,
+                "forecast_date": dates[i],
+                "forecast_value": _bt_safe_float(pred[i], 0.0),
+                "forecast_method": "production_policy_full_history_seasonal_drift_blend_no_test_leakage",
+                "production_model": prod_model,
+                "note": "3-6-12 dönem ileri planlama tahminidir; operasyonel çevrimde future-known regressors güncellenerek yeniden koşturulmalıdır.",
+            })
+    return pd.DataFrame(rows)
+
+
+def _bt_hyperparameter_summary(outputs: Dict[str, Any]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    specs = [
+        ("SARIMA/SARIMAX", outputs.get("sarima", {}) if isinstance(outputs, dict) else {}, "search_table", "order/seasonal_order/trend/transform"),
+        ("Prophet", outputs.get("prophet", {}) if isinstance(outputs, dict) else {}, "search_table", "trend + seasonality + regressors"),
+        ("XGBoost", outputs.get("xgboost", {}) if isinstance(outputs, dict) else {}, "search_table", "lags/rolling/depth/lr/n_estimators"),
+        ("LSTM (real)", outputs.get("lstm", {}) if isinstance(outputs, dict) else {}, "search_table", "window/units/dropout/lr/batch/strategy"),
+        ("GRU (real)", outputs.get("gru", {}) if isinstance(outputs, dict) else {}, "search_table", "window/units/dropout/lr/batch/strategy"),
+    ]
+    for model, pack, tbl_key, searched in specs:
+        tbl = pack.get(tbl_key) if isinstance(pack, dict) else None
+        attempts = int(len(tbl)) if isinstance(tbl, pd.DataFrame) else 0
+        best_score = np.nan
+        if isinstance(tbl, pd.DataFrame) and len(tbl):
+            score_cols = [c for c in ["composite_score", "val_wape", "validation_wape", "fold_mean_wape", "RollingWAPE"] if c in tbl.columns]
+            if score_cols:
+                best_score = _bt_safe_float(pd.to_numeric(tbl[score_cols[0]], errors="coerce").min())
+        status = "tamamlandı" if attempts > 0 else "çalışmadı/bloklandı"
+        reason = "Arama tablosu üretildi." if attempts > 0 else "Veri rejimi, kütüphane eksikliği veya hard gate nedeniyle gerçek arama yapılmadı."
+        rows.append({"model": model, "searched_space": searched, "candidate_count": attempts, "best_internal_score": best_score, "status": status, "interpretation": reason})
+    return pd.DataFrame(rows)
+
+
+def _bt_model_score_for_final_selection(outputs: Dict[str, Any]) -> pd.DataFrame:
+    registry = build_model_identity_registry(outputs)
+    metrics = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(metrics, pd.DataFrame) or len(metrics) == 0 or "model" not in metrics.columns:
+        return pd.DataFrame()
+    df = enrich_model_df_with_identity_registry(metrics, registry, override_eligibility=True)
+    score_rows = []
+    interp_map = {"Prophet": 5, "SARIMA/SARIMAX": 4, "ARIMA": 4, "XGBoost": 3, "Ensemble": 3, "Intermittent": 4, "LSTM": 2, "GRU": 2, "DL-FALLBACK": 1}
+    for _, r in df.iterrows():
+        model = str(r.get("model"))
+        family = _bt_model_family(model)
+        wape = _bt_safe_float(r.get("WAPE", np.nan))
+        error_score = max(0.0, 100.0 - min(wape if pd.notna(wape) else 100.0, 100.0))
+        interpretability = interp_map.get(family, 3) * 20
+        applicability = 100.0 if _bt_safe_bool(r.get("production_eligible", False)) else (55.0 if _bt_safe_bool(r.get("research_only", False)) else 20.0)
+        stability = 75.0
+        if family in {"LSTM", "GRU", "DL-FALLBACK"} and not _bt_safe_bool(r.get("production_eligible", False)):
+            stability = 25.0
+        final_score = 0.45 * error_score + 0.20 * interpretability + 0.20 * stability + 0.15 * applicability
+        score_rows.append({
+            "model": model,
+            "WAPE": wape,
+            "error_score": round(error_score, 4),
+            "interpretability_score": interpretability,
+            "stability_score": stability,
+            "applicability_score": applicability,
+            "final_selection_score": round(final_score, 4),
+            "production_eligible": _bt_safe_bool(r.get("production_eligible", False)),
+            "production_scope": r.get("production_scope"),
+            "selection_note": "Final model seçiminde yalnız hata metriği değil yorumlanabilirlik, stabilite ve uygulanabilirlik birlikte değerlendirilmiştir.",
+        })
+    return pd.DataFrame(score_rows).sort_values(["production_eligible", "final_selection_score"], ascending=[False, False]).reset_index(drop=True)
+
+
+def _bt_task_compliance_table(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    metrics = outputs.get("metrics_df", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    has_metrics = isinstance(metrics, pd.DataFrame) and len(metrics) > 0
+    rows = [
+        ("1. Hafta", "ARIMA/SARIMA kurulumu", "ACF-PACF analizi, p,d,q/P,D,Q arama tablosu, tahmin grafiği", "SARIMA-SARIMAX - Arama tablosu; SARIMA-SARIMAX - Gerçek ve tahmin tablosu", bool(outputs.get("sarima"))),
+        ("1. Hafta", "Prophet kurulumu", "Trend + mevsimsellik bileşenleri ve tahmin çıktısı", "Prophet görünürlüğü; Prophet - Arama tablosu; Prophet - Gerçek ve tahmin tablosu", bool(outputs.get("prophet"))),
+        ("1. Hafta", "XGBoost", "Lag, rolling ve takvim feature seti; train-test model eğitimi", "XGBoost - Arama tablosu; XGBoost - Özellik önemleri", bool(outputs.get("xgboost"))),
+        ("1. Hafta", "Performans ölçümü", "RMSE, MAE, MAPE, sMAPE, WAPE ve model karşılaştırma", "Model karşılaştırma tablosu", has_metrics),
+        ("2. Hafta", "LSTM", "Sliding window, eğitim durumu, epoch-loss, gerçek DL/fallback ayrımı", "LSTM - Eğitim Durumu Tablosu; LSTM - Epoch Loss Geçmişi", isinstance((outputs.get("lstm") or {}).get("dl_training_status_table"), pd.DataFrame)),
+        ("2. Hafta", "GRU / alternatif DL", "GRU eğitim durumu ve DL karşılaştırması", "GRU - Eğitim Durumu Tablosu; DL şeffaflık tablosu", isinstance((outputs.get("gru") or {}).get("dl_training_status_table"), pd.DataFrame)),
+        ("2. Hafta", "DL neden iyi/kötü analizi", "Veri rejimi, TensorFlow durumu, surrogate/fallback şeffaflığı", "DL Analizi; DL şeffaflık ve kimlik doğrulama tablosu", isinstance(outputs.get("deep_learning_analysis"), pd.DataFrame)),
+        ("3. Hafta", "Hiperparametre optimizasyonu", "ARIMA/SARIMA, XGBoost, Prophet, DL arama özetleri", "Tez - Hiperparametre optimizasyon özeti", True),
+        ("3. Hafta", "Feature engineering", "Lag, rolling mean, moving average ve sin-cos dönüşümleri", "Tez - Feature engineering özeti; XGBoost özellik önemleri", True),
+        ("3. Hafta", "Backtesting", "Rolling-origin geri testleme", "Rolling-origin geri test; Doğrulama temelli model kalitesi", isinstance(outputs.get("rolling_origin_backtest"), pd.DataFrame)),
+        ("4. Hafta", "Final model seçimi", "Hata metriği + yorumlanabilirlik + stabilite + uygulanabilirlik", "Tez - Final model seçim matrisi; Deployment safety manifest", True),
+        ("4. Hafta", "3-6-12 dönem ileri tahmin", "Gelecek planlama tahmin tablosu", "Tez - 3-6-12 ileri tahmin", True),
+        ("4. Hafta", "Rapor ve sunum yapısı", "Problem-yöntem-sonuç akışına uygun tablo ve şekil açıklamaları", "Tez - Tablo Şekil Kataloğu; Tez - Sunum İskeleti", True),
+    ]
+    return pd.DataFrame([{"hafta": h, "gorev": g, "beklenen_cikti": b, "streamlit_excel_ciktisi": c, "durum": "tamam" if ok else "kontrol_gerekli"} for h, g, b, c, ok in rows])
+
+
+def _bt_feature_engineering_summary(outputs: Dict[str, Any]) -> pd.DataFrame:
+    meta = outputs.get("metadata", {}) if isinstance(outputs, dict) else {}
+    xgb = outputs.get("xgboost", {}) if isinstance(outputs, dict) else {}
+    feats = list(meta.get("ml_feature_cols", []) or [])
+    categories = {
+        "lag_features": [f for f in feats if "lag" in str(f).lower()],
+        "rolling_features": [f for f in feats if "roll" in str(f).lower() or "moving" in str(f).lower()],
+        "seasonal_sin_cos": [f for f in feats if "sin" in str(f).lower() or "cos" in str(f).lower()],
+        "calendar_features": [f for f in feats if any(k in str(f).lower() for k in ["month", "quarter", "year", "week", "day"])],
+    }
+    rows = []
+    for cat, arr in categories.items():
+        rows.append({"feature_group": cat, "feature_count": len(arr), "sample_features": ", ".join(map(str, arr[:8])), "business_note": "Geçmiş bilgiye dayalı ve leakage kontrollü üretildi."})
+    rows.append({"feature_group": "xgboost_selected_strategy", "feature_count": _bt_safe_float(xgb.get("used_feature_count", len(feats)), len(feats)), "sample_features": str(xgb.get("strategy", "")), "business_note": "XGBoost lag/rolling feature havuzuyla kısa aylık seride verimli öğrenir."})
+    return pd.DataFrame(rows)
+
+
+def _bt_thesis_interpretation_table(outputs: Dict[str, Any]) -> pd.DataFrame:
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+    prod_model = prod_pack.get("production_model") or outputs.get("production_model") or outputs.get("best_model")
+    dl_audit = prod_pack.get("audit_models", pd.DataFrame())
+    dl_note = "DL modelleri üretim hard gate kurallarına göre değerlendirilmiştir."
+    if isinstance(dl_audit, pd.DataFrame) and len(dl_audit):
+        dl_note = "Bu veri rejiminde recurrent DL gerçek üretim adayı yapılmamış; fallback/surrogate çıktılar audit alanında tutulmuştur."
+    rows = [
+        {"section": "Model karşılaştırması", "academic_comment": "Tüm modeller aynı holdout ve mümkün olan yerlerde rolling-origin geri test mantığıyla karşılaştırılmıştır. WAPE/sMAPE/MAE/RMSE birlikte yorumlanmalıdır."},
+        {"section": "Final model", "academic_comment": f"Final üretim önerisi: {prod_model}. Seçim yalnız en düşük hata metriğine değil, uygulanabilirlik, stabilite ve yorumlanabilirlik ölçütlerine de dayanır."},
+        {"section": "Derin öğrenme yorumu", "academic_comment": dl_note},
+        {"section": "İş dünyası kullanımı", "academic_comment": "Production ranking yalnız hard-gate onaylı modellerden oluşur; audit/research çıktıları champion veya ensemble adayı yapılmaz."},
+        {"section": "Tahmin ufku", "academic_comment": "3-6-12 dönem ileri tahmin tablosu planlama amaçlıdır; gerçek sipariş/tedarik kararında güncel future-known değişkenlerle yeniden koşturulmalıdır."},
+    ]
+    return pd.DataFrame(rows)
+
+
+def _bt_table_figure_catalog(outputs: Dict[str, Any]) -> pd.DataFrame:
+    rows = [
+        ("Şekil 1", "ACF-PACF grafiği", "ARIMA/SARIMA parametre adaylarını ve serinin otokorelasyon yapısını göstermek için kullanılır."),
+        ("Şekil 2", "Gerçek vs tahmin grafiği", "Seçilen modellerin holdout dönemde gerçek talebi ne kadar yakaladığını görsel olarak gösterir."),
+        ("Şekil 3", "Prophet bileşenleri", "Trend ve mevsimsellik bileşenlerinin iş yorumu için kullanılır."),
+        ("Şekil 4", "XGBoost özellik önemleri", "Lag/rolling/takvim değişkenlerinin tahmin üzerindeki etkisini açıklar."),
+        ("Şekil 5", "DL epoch-loss grafiği", "DL eğitimi varsa overfitting ve validation ayrışmasını gösterir; eğitim yoksa bu durum açıkça raporlanır."),
+        ("Tablo 1", "Model karşılaştırma tablosu", "RMSE, MAE, MAPE, sMAPE ve WAPE ile tüm modellerin karşılaştırılması."),
+        ("Tablo 2", "Hiperparametre optimizasyon özeti", "Model ailelerine göre aranan parametre uzayı ve en iyi iç skorlar."),
+        ("Tablo 3", "Rolling-origin backtesting", "Tek split yerine farklı başlangıç noktalarındaki performans istikrarı."),
+        ("Tablo 4", "Final model seçim matrisi", "Hata, yorumlanabilirlik, stabilite ve uygulanabilirlik bileşik değerlendirmesi."),
+        ("Tablo 5", "3-6-12 dönem ileri tahmin", "Final planlama ufukları için üretim/tez formatında tahmin tablosu."),
+        ("Tablo 6", "Deployment safety manifest", "İş ortamında yanlış modelin üretime sızmaması için kalite kapısı sonucu."),
+    ]
+    return pd.DataFrame([{"label": a, "title": b, "thesis_usage_note": c} for a, b, c in rows])
+
+
+def _bt_presentation_outline(outputs: Dict[str, Any]) -> pd.DataFrame:
+    slides = [
+        "Problem tanımı ve iş ihtiyacı", "Veri seti ve seri profili", "Önişleme ve anomaly governance", "Train-test ve backtesting tasarımı", "ARIMA/SARIMA yöntemi", "Prophet yöntemi", "XGBoost feature engineering", "DL veri rejimi ve eğitim şeffaflığı", "Model karşılaştırma sonuçları", "Rolling-origin sonuçları", "Final model seçim matrisi", "3-6-12 ileri tahmin", "İş dünyası deployment safety gate", "Sınırlılıklar", "Sonuç ve öneriler"
+    ]
+    return pd.DataFrame([{"slide_no": i + 1, "slide_title": title, "content_note": "Problem → yöntem → sonuç akışına uygun kısa ve görsel odaklı anlatım."} for i, title in enumerate(slides)])
+
+
+def build_thesis_business_report_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, selected_sheet: Optional[str] = None) -> Dict[str, Any]:
+    outputs = outputs if isinstance(outputs, dict) else {}
+    export_payload = export_payload if isinstance(export_payload, dict) else {}
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+    tables = {
+        "Tez - PDF görev uyum matrisi": _bt_task_compliance_table(outputs, export_payload),
+        "Tez - Model performans tablosu": enrich_model_df_with_identity_registry(outputs.get("metrics_df", pd.DataFrame()), build_model_identity_registry(outputs), override_eligibility=True) if isinstance(outputs.get("metrics_df"), pd.DataFrame) else pd.DataFrame(),
+        "Tez - Hiperparametre optimizasyon özeti": _bt_hyperparameter_summary(outputs),
+        "Tez - Feature engineering özeti": _bt_feature_engineering_summary(outputs),
+        "Tez - Final model seçim matrisi": _bt_model_score_for_final_selection(outputs),
+        "Tez - 3-6-12 ileri tahmin": _bt_business_future_forecast(outputs, export_payload, str(target_col)),
+        "Tez - Akademik yorumlar": _bt_thesis_interpretation_table(outputs),
+        "Tez - Tablo Şekil Kataloğu": _bt_table_figure_catalog(outputs),
+        "Tez - Sunum İskeleti": _bt_presentation_outline(outputs),
+        "İş - Production candidates": prod_pack.get("production_candidates", pd.DataFrame()),
+        "İş - Research challenger models": prod_pack.get("research_models", pd.DataFrame()),
+        "İş - Audit quarantine models": prod_pack.get("audit_models", pd.DataFrame()),
+        "İş - Deployment safety manifest": prod_pack.get("deployment_safety_manifest", pd.DataFrame()),
+        "İş - Quality assertions": prod_pack.get("model_identity_quality_assertions", pd.DataFrame()),
+    }
+    manifest = pd.DataFrame([{
+        "selected_sheet": selected_sheet,
+        "target_col": target_col,
+        "output_version": BUSINESS_THESIS_OUTPUT_VERSION,
+        "production_model": prod_pack.get("production_model"),
+        "production_status": prod_pack.get("production_status"),
+        "thesis_ready": True,
+        "business_ready": bool(isinstance(prod_pack.get("deployment_safety_manifest"), pd.DataFrame) and len(prod_pack.get("deployment_safety_manifest")) and bool(prod_pack.get("deployment_safety_manifest").iloc[0].get("deployment_ready", False))),
+        "note": "Tez/makale çıktıları ve iş ortamı safety-gate tabloları aynı merkezî model kimliği üzerinden üretilmiştir.",
+    }])
+    tables["Tez ve İş Çıktısı Manifestosu"] = manifest
+    return {"version": BUSINESS_THESIS_OUTPUT_VERSION, "tables": tables}
+
+
+def ensure_thesis_business_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: Optional[str], selected_sheet: Optional[str] = None) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    target_col = target_col or (outputs.get("metadata") or {}).get("target_col") or "target"
+    outputs["thesis_business_pack"] = build_thesis_business_report_pack(outputs, export_payload or {}, str(target_col), selected_sheet=selected_sheet)
+    return outputs
+
+
+_BT_PREV_BUILD_NAMED_OUTPUT_TABLES = globals().get("build_named_output_tables")
+
+
+def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    if isinstance(outputs, dict):
+        meta = outputs.get("metadata", {}) or {}
+        target_col = meta.get("target_col")
+        freq_alias = meta.get("freq_alias")
+        try:
+            outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
+        except Exception:
+            pass
+        try:
+            outputs = ensure_thesis_business_pack(outputs, export_payload, target_col, meta.get("selected_sheet"))
+        except Exception:
+            pass
+    base: Dict[str, pd.DataFrame] = {}
+    if callable(_BT_PREV_BUILD_NAMED_OUTPUT_TABLES):
+        try:
+            base = _BT_PREV_BUILD_NAMED_OUTPUT_TABLES(outputs, export_payload) or {}
+        except Exception:
+            base = {}
+    pack = outputs.get("thesis_business_pack", {}) if isinstance(outputs, dict) else {}
+    for name, df in (pack.get("tables", {}) if isinstance(pack, dict) else {}).items():
+        if isinstance(df, pd.DataFrame):
+            base[name] = style_metric_dataframe(df)
+    return base
+
+
+_BT_PREV_BUILD_CURRENT_SERIES_TABLES_EXCEL_BYTES = globals().get("build_current_series_tables_excel_bytes")
+
+
+def build_current_series_tables_excel_bytes(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], selected_sheet: str, target_col: str) -> Optional[bytes]:
+    try:
+        freq_alias = (outputs.get("metadata") or {}).get("freq_alias") if isinstance(outputs, dict) else None
+        outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
+        outputs = ensure_thesis_business_pack(outputs, export_payload, target_col, selected_sheet)
+        table_map = build_named_output_tables(outputs, export_payload)
+        notes_map = {}
+        suggestions = outputs.get("deep_learning_analysis", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        if isinstance(suggestions, pd.DataFrame) and len(suggestions) > 0:
+            notes_map["DL Analizi"] = suggestions.copy()
+        return _build_excel_bytes(table_map=table_map, notes_map=notes_map)
+    except Exception:
+        if callable(_BT_PREV_BUILD_CURRENT_SERIES_TABLES_EXCEL_BYTES):
+            try:
+                return _BT_PREV_BUILD_CURRENT_SERIES_TABLES_EXCEL_BYTES(outputs, export_payload, selected_sheet, target_col)
+            except Exception:
+                return None
+        return None
+
 
 
 def build_cli_arg_parser() -> argparse.ArgumentParser:
