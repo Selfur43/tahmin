@@ -5333,7 +5333,7 @@ try:
 except Exception:
     ParameterGrid = None
 
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.5.0"
 
 
 
@@ -5362,16 +5362,19 @@ class ForecastRuntimeConfig:
     xgb_search_wall_seconds: float = 900.0
     xgb_inner_train_max_rows: int = 240
     dl_enabled: bool = True
-    dl_max_configs_per_family: int = 4
-    dl_max_epochs: int = 80
-    dl_patience: int = 10
+    dl_max_configs_per_family: int = 10
+    dl_max_epochs: int = 160
+    dl_patience: int = 18
     dl_batch_size: int = 8
     dl_validation_ratio: float = 0.20
-    dl_sequence_max_exog_cols: int = 12
-    dl_min_train_sequences: int = 16
-    dl_window_candidates: Tuple[int, ...] = (4, 6, 12, 18)
-    dl_hidden_units: Tuple[int, ...] = (24, 40)
-    dl_dropout_values: Tuple[float, ...] = (0.0, 0.15)
+    dl_sequence_max_exog_cols: int = 8
+    dl_min_train_sequences: int = 12
+    dl_window_candidates: Tuple[int, ...] = (3, 4, 6, 9, 12, 18)
+    dl_hidden_units: Tuple[int, ...] = (12, 24, 32, 48)
+    dl_dropout_values: Tuple[float, ...] = (0.0, 0.10, 0.20)
+    dl_learning_rates: Tuple[float, ...] = (0.001, 0.0005)
+    dl_strategies: Tuple[str, ...] = ("direct", "recursive")
+    dl_recent_sample_weight_max: float = 1.35
     search_accelerator_enabled: bool = True
     search_accelerator_model_parallel: bool = True
     search_accelerator_candidate_parallel: bool = True
@@ -6357,7 +6360,20 @@ def style_metric_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return _turkcelestir_df_kolonlari(out)
 
 def dataframe_to_download_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
+    out_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    return _build_excel_bytes({"data": out_df}) or b""
+
+
+def build_current_series_tables_excel_bytes(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], selected_sheet: str, target_col: str) -> Optional[bytes]:
+    try:
+        table_map = build_named_output_tables(outputs, export_payload)
+        notes_map = {}
+        suggestions = outputs.get("deep_learning_analysis", pd.DataFrame())
+        if isinstance(suggestions, pd.DataFrame) and len(suggestions) > 0:
+            notes_map["DL Analizi"] = suggestions.copy()
+        return _build_excel_bytes(table_map=table_map, notes_map=notes_map)
+    except Exception:
+        return None
 
 def _safe_artifact_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", str(name)).strip()
@@ -9121,17 +9137,53 @@ def infer_dl_window_candidates(freq_alias: str, train_len: int) -> List[int]:
     return sorted(set(out or [max(3, min(6, max_allowed))]))
 
 
-def _select_dl_feature_columns(feature_train: pd.DataFrame, feature_test: pd.DataFrame, max_cols: int) -> List[str]:
+def _rank_dl_feature_columns_by_signal(feature_train: pd.DataFrame, target_train: pd.Series) -> List[Tuple[str, float, float, float]]:
+    if not isinstance(feature_train, pd.DataFrame) or feature_train.empty:
+        return []
+    y = pd.to_numeric(target_train, errors="coerce").astype(float)
+    rows = []
+    for col in feature_train.columns:
+        s = pd.to_numeric(feature_train[col], errors="coerce").replace([np.inf, -np.inf], np.nan).astype(float)
+        completeness = float(s.notna().mean())
+        if completeness < 0.70:
+            continue
+        std_val = float(s.std(skipna=True) or 0.0)
+        corr_abs = 0.0
+        valid = s.notna() & y.notna()
+        if int(valid.sum()) >= max(10, int(len(feature_train) * 0.45)):
+            try:
+                corr_val = np.corrcoef(s.loc[valid].values.astype(float), y.loc[valid].values.astype(float))[0, 1]
+                if np.isfinite(corr_val):
+                    corr_abs = abs(float(corr_val))
+            except Exception:
+                corr_abs = 0.0
+        name_bonus = 0.0
+        lower = str(col).lower()
+        if any(tok in lower for tok in ["lag", "rolling", "roll", "season", "trend", "ewm"]):
+            name_bonus += 0.08
+        if any(tok in lower for tok in ["month", "quarter", "holiday", "sin", "cos", "dow", "week", "is_"]):
+            name_bonus += 0.05
+        score = 2.8 * corr_abs + 0.55 * completeness + 0.03 * math.log1p(max(std_val, 0.0)) + name_bonus
+        rows.append((col, float(score), float(corr_abs), float(completeness)))
+    rows.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+    return rows
+
+
+def _select_dl_feature_columns(feature_train: pd.DataFrame, feature_test: pd.DataFrame, target_train: pd.Series, max_cols: int) -> List[str]:
+    ranked = _rank_dl_feature_columns_by_signal(feature_train, target_train)
+    chosen = [c for c, _, _, _ in ranked[:max(1, int(max_cols))]]
+    if chosen:
+        return chosen
     if not isinstance(feature_train, pd.DataFrame):
         return []
     combined = pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_test, pd.DataFrame) else feature_train.copy()
-    scores=[]
+    scores = []
     for col in combined.columns:
-        s=pd.to_numeric(combined[col], errors="coerce").replace([np.inf,-np.inf], np.nan)
-        if s.notna().mean() >= 0.60:
+        s = pd.to_numeric(combined[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if s.notna().mean() >= 0.70:
             scores.append((col, float(s.notna().mean()), float(s.std(skipna=True) or 0.0)))
-    scores=sorted(scores, key=lambda x:(x[1],x[2]), reverse=True)
-    return [c for c,_,_ in scores[:max(1,int(max_cols))]]
+    scores = sorted(scores, key=lambda x: (x[1], x[2]), reverse=True)
+    return [c for c, _, _ in scores[:max(1, int(max_cols))]]
 
 
 def _fit_dl_scalers(train_y_t: np.ndarray, train_cov: np.ndarray):
@@ -9165,7 +9217,33 @@ def _make_dl_sequences(y_scaled: np.ndarray, cov_scaled: np.ndarray, window: int
     return np.asarray(Xs, dtype=float), np.asarray(ys, dtype=float)
 
 
-def _build_dl_network(input_shape: Tuple[int, int], model_family: str, units: int, layers: int, dropout: float, learning_rate: float = 0.001):
+def _make_dl_sequences_direct(y_scaled: np.ndarray, cov_scaled: np.ndarray, window: int, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    y_scaled = np.asarray(y_scaled, dtype=float).reshape(-1)
+    cov_scaled = np.asarray(cov_scaled, dtype=float) if cov_scaled is not None else np.zeros((len(y_scaled), 0), dtype=float)
+    Xs = []
+    ys = []
+    for anchor in range(int(window), len(y_scaled) - int(horizon) + 1):
+        yw = y_scaled[anchor - int(window):anchor].reshape(int(window), 1)
+        xw = cov_scaled[anchor - int(window):anchor] if cov_scaled.size else np.zeros((int(window), 0), dtype=float)
+        Xs.append(np.concatenate([yw, xw], axis=1))
+        ys.append(y_scaled[anchor:anchor + int(horizon)])
+    feat_dim = 1 + (cov_scaled.shape[1] if cov_scaled.ndim == 2 else 0)
+    if not Xs:
+        return np.zeros((0, int(window), feat_dim), dtype=float), np.zeros((0, int(horizon)), dtype=float)
+    return np.asarray(Xs, dtype=float), np.asarray(ys, dtype=float)
+
+
+def _make_recent_sample_weights(n_samples: int, max_weight: float) -> np.ndarray:
+    n_samples = int(n_samples)
+    if n_samples <= 0:
+        return np.asarray([], dtype=float)
+    if n_samples == 1:
+        return np.asarray([1.0], dtype=float)
+    max_weight = max(1.0, float(max_weight))
+    return np.linspace(1.0, max_weight, n_samples, dtype=float)
+
+
+def _build_dl_network(input_shape: Tuple[int, int], model_family: str, units: int, layers: int, dropout: float, learning_rate: float = 0.001, output_dim: int = 1):
     if not HAS_TF or Sequential is None:
         raise ImportError("TensorFlow/Keras bulunamadı.")
     fam = str(model_family).upper()
@@ -9184,12 +9262,13 @@ def _build_dl_network(input_shape: Tuple[int, int], model_family: str, units: in
         model.add(recurrent_cls(int(units), input_shape=input_shape, return_sequences=True))
         if float(dropout) > 0:
             model.add(KerasDropout(float(dropout)))
-        model.add(recurrent_cls(max(12, int(units)//2), return_sequences=False))
+        model.add(recurrent_cls(max(10, int(units)//2), return_sequences=False))
         if float(dropout) > 0:
             model.add(KerasDropout(float(dropout)))
     model.add(KerasDense(max(8, int(units)//2), activation="relu"))
-    model.add(KerasDense(1))
-    model.compile(optimizer=KerasAdam(learning_rate=float(learning_rate)), loss="mse", metrics=["mae"])
+    model.add(KerasDense(int(max(1, output_dim))))
+    loss_fn = tf.keras.losses.Huber(delta=1.0) if HAS_TF else "mse"
+    model.compile(optimizer=KerasAdam(learning_rate=float(learning_rate)), loss=loss_fn, metrics=["mae"])
     return model
 
 
@@ -9210,6 +9289,19 @@ def _recursive_dl_forecast(model, history_y_scaled: np.ndarray, history_cov_scal
         hist_y.append(pred_scaled)
         hist_cov.append(np.asarray(future_cov_scaled[i], dtype=float))
     return np.asarray(preds, dtype=float)
+
+
+def _direct_dl_forecast(model, history_y_scaled: np.ndarray, history_cov_scaled: np.ndarray, window: int, horizon: int) -> np.ndarray:
+    hist_y = np.asarray(history_y_scaled, dtype=float).reshape(-1)
+    hist_cov = np.asarray(history_cov_scaled, dtype=float) if history_cov_scaled is not None else np.zeros((len(hist_y), 0), dtype=float)
+    yw = hist_y[-int(window):].reshape(int(window), 1)
+    xw = hist_cov[-int(window):] if hist_cov.size else np.zeros((int(window), 0), dtype=float)
+    X = np.concatenate([yw, xw], axis=1)[None, :, :]
+    pred = model.predict(X, verbose=0).reshape(-1)
+    if len(pred) < int(horizon):
+        pad = np.repeat(pred[-1] if len(pred) else 0.0, int(horizon) - len(pred))
+        pred = np.concatenate([pred, pad])
+    return np.asarray(pred[:int(horizon)], dtype=float)
 
 
 def _history_to_frame(history_obj) -> pd.DataFrame:
@@ -9241,101 +9333,212 @@ def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, fe
         return build_model_level_fallback(model_family, train_df, test_df, freq_alias, "TensorFlow/Keras bulunamadı.")
     if len(train_df) < 24:
         return build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için gözlem sayısı yetersiz.")
-    model_family=str(model_family).upper()
-    cache_key = build_search_signature(f"dl_{model_family.lower()}", freq_alias, train_df, test_df, exog_train=pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_train, pd.DataFrame) else None, extra={"app_version": APP_VERSION})
-    cached=SEARCH_ACCELERATOR.get_result(cache_key)
+
+    model_family = str(model_family).upper()
+    cache_key = build_search_signature(
+        f"dl_{model_family.lower()}",
+        freq_alias,
+        train_df,
+        test_df,
+        exog_train=pd.concat([feature_train, feature_test], axis=0, ignore_index=True) if isinstance(feature_train, pd.DataFrame) else None,
+        extra={"app_version": APP_VERSION, "dl_rev": "direct_recursive_huber_v2"},
+    )
+    cached = SEARCH_ACCELERATOR.get_result(cache_key)
     if cached is not None:
-        cached["search_accelerator_cache_hit"]=True
+        cached["search_accelerator_cache_hit"] = True
         return cached
-    selected_cols=_select_dl_feature_columns(feature_train, feature_test, FORECAST_RUNTIME_CONFIG.dl_sequence_max_exog_cols)
+
+    selected_cols = _select_dl_feature_columns(feature_train, feature_test, train_df["y"], FORECAST_RUNTIME_CONFIG.dl_sequence_max_exog_cols)
     cov_train_df = feature_train[selected_cols].copy() if selected_cols and isinstance(feature_train, pd.DataFrame) else pd.DataFrame(index=train_df.index)
     cov_test_df = feature_test[selected_cols].copy() if selected_cols and isinstance(feature_test, pd.DataFrame) else pd.DataFrame(index=test_df.index)
-    cov_train_df=cov_train_df.replace([np.inf,-np.inf], np.nan).fillna(0.0)
-    cov_test_df=cov_test_df.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    cov_train_df = cov_train_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    cov_test_df = cov_test_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     tr_inner, val_inner = make_inner_train_val_split(train_df, val_ratio=FORECAST_RUNTIME_CONFIG.dl_validation_ratio, min_val=max(3, len(test_df)))
-    split_ix=len(tr_inner)
-    cov_tr_inner=cov_train_df.iloc[:split_ix].reset_index(drop=True)
-    cov_val_inner=cov_train_df.iloc[split_ix:].reset_index(drop=True)
-    season_length=infer_season_length_from_freq(freq_alias)
-    search_rows=[]
-    best=None
-    best_score=np.inf
-    configs=[]
+    split_ix = len(tr_inner)
+    cov_tr_inner = cov_train_df.iloc[:split_ix].reset_index(drop=True)
+    cov_val_inner = cov_train_df.iloc[split_ix:].reset_index(drop=True)
+    season_length = infer_season_length_from_freq(freq_alias)
+
+    search_rows = []
+    best = None
+    best_score = np.inf
+    configs = []
+    strategies = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_strategies", ("recursive",)))
+    learning_rates = list(getattr(FORECAST_RUNTIME_CONFIG, "dl_learning_rates", (0.001,)))
     for window in infer_dl_window_candidates(freq_alias, len(tr_inner)):
         for units in FORECAST_RUNTIME_CONFIG.dl_hidden_units:
             for dropout in FORECAST_RUNTIME_CONFIG.dl_dropout_values:
-                layers=2 if int(units) >= 40 and int(window) >= 8 else 1
-                configs.append({"window": int(window), "units": int(units), "dropout": float(dropout), "layers": int(layers), "learning_rate": 0.001})
-    configs=configs[:max(1, int(FORECAST_RUNTIME_CONFIG.dl_max_configs_per_family))]
+                for learning_rate in learning_rates:
+                    for strategy in strategies:
+                        if str(strategy).lower() == "direct" and len(val_inner) < 2:
+                            continue
+                        layers = 2 if int(units) >= 32 and int(window) >= 6 else 1
+                        configs.append({
+                            "window": int(window),
+                            "units": int(units),
+                            "dropout": float(dropout),
+                            "layers": int(layers),
+                            "learning_rate": float(learning_rate),
+                            "strategy": str(strategy).lower(),
+                        })
+    configs = configs[:max(1, int(FORECAST_RUNTIME_CONFIG.dl_max_configs_per_family))]
+
     for cfg in configs:
         try:
-            y_transform=choose_target_transform(tr_inner["y"])
-            tr_y_t=apply_target_transform(tr_inner["y"], y_transform)[0].values.astype(float)
-            y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(tr_y_t, cov_tr_inner.values.astype(float) if len(cov_tr_inner) else np.zeros((len(tr_inner),0), dtype=float))
-            X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
+            y_transform = choose_target_transform(tr_inner["y"])
+            tr_y_t = apply_target_transform(tr_inner["y"], y_transform)[0].values.astype(float)
+            y_scaler, x_scaler, tr_y_scaled, tr_cov_scaled = _fit_dl_scalers(
+                tr_y_t,
+                cov_tr_inner.values.astype(float) if len(cov_tr_inner) else np.zeros((len(tr_inner), 0), dtype=float),
+            )
+            strategy = str(cfg.get("strategy", "recursive")).lower()
+            if strategy == "direct":
+                X_seq, y_seq = _make_dl_sequences_direct(tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
+                output_dim = int(len(val_inner))
+            else:
+                X_seq, y_seq = _make_dl_sequences(tr_y_scaled, tr_cov_scaled, int(cfg["window"]))
+                output_dim = 1
             if len(X_seq) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
                 raise ValueError("Yeterli sliding-window eğitim örneği üretilemedi.")
-            model=_build_dl_network((X_seq.shape[1], X_seq.shape[2]), model_family=model_family, units=int(cfg["units"]), layers=int(cfg["layers"]), dropout=float(cfg["dropout"]), learning_rate=float(cfg["learning_rate"]))
-            callbacks=[KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
-            hist=model.fit(X_seq, y_seq, epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs), batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_seq)//2))), validation_split=min(0.25, max(0.12, 1.0/max(len(X_seq),8))), verbose=0, callbacks=callbacks)
-            val_cov_scaled=_transform_dl_covariates(x_scaler, cov_val_inner) if len(cov_val_inner) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim==2 else 0), dtype=float)
-            pred_val_scaled=_recursive_dl_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
-            pred_val_t=y_scaler.inverse_transform(pred_val_scaled.reshape(-1,1)).reshape(-1)
-            pred_val=inverse_target_transform(pred_val_t, y_transform)
-            pred_val=np.maximum(np.asarray(pred_val, dtype=float),0.0)
+            model = _build_dl_network(
+                (X_seq.shape[1], X_seq.shape[2]),
+                model_family=model_family,
+                units=int(cfg["units"]),
+                layers=int(cfg["layers"]),
+                dropout=float(cfg["dropout"]),
+                learning_rate=float(cfg["learning_rate"]),
+                output_dim=output_dim,
+            )
+            callbacks = [KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
+            sample_weight = _make_recent_sample_weights(len(y_seq), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
+            hist = model.fit(
+                X_seq,
+                y_seq,
+                epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs),
+                batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_seq) // 2))),
+                validation_split=min(0.25, max(0.12, 1.0 / max(len(X_seq), 8))),
+                verbose=0,
+                callbacks=callbacks,
+                sample_weight=sample_weight,
+            )
+            if strategy == "direct":
+                pred_val_scaled = _direct_dl_forecast(model, tr_y_scaled, tr_cov_scaled, int(cfg["window"]), int(len(val_inner)))
+            else:
+                val_cov_scaled = _transform_dl_covariates(x_scaler, cov_val_inner) if len(cov_val_inner) else np.zeros((0, tr_cov_scaled.shape[1] if tr_cov_scaled.ndim == 2 else 0), dtype=float)
+                pred_val_scaled = _recursive_dl_forecast(model, tr_y_scaled, tr_cov_scaled, val_cov_scaled, int(cfg["window"]))
+            pred_val_t = y_scaler.inverse_transform(pred_val_scaled.reshape(-1, 1)).reshape(-1)
+            pred_val = inverse_target_transform(pred_val_t, y_transform)
+            pred_val = np.maximum(np.asarray(pred_val, dtype=float), 0.0)
             corrected, post_cfg = compute_validation_postprocess_candidates(val_inner["y"].values, pred_val, tr_inner["y"], season_length)
-            val_w=wape(val_inner["y"].values, corrected)
-            val_s=smape(val_inner["y"].values, corrected)
-            asym=compute_asymmetric_validation_penalty(val_inner["y"].values, corrected, tr_inner["y"].values, severity=1.0)
-            hist_df=_history_to_frame(hist)
-            min_loss=safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
-            min_val_loss=safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
-            overfit_gap=safe_float((min_val_loss-min_loss)/max(abs(min_loss),1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
-            score=float(val_w + 0.35*val_s + asym["penalty"] + 4.0*max(overfit_gap,0.0) + 0.02*float(cfg["layers"]-1))
-            search_rows.append({**cfg, "model": model_family, "transform": y_transform.get("name","none"), "val_wape": val_w, "val_smape": val_s, "bias_pct": asym["bias_pct"], "under_forecast_rate": asym["under_forecast_rate"], "peak_event_score": asym["peak_event_score"], "min_train_loss": min_loss, "min_val_loss": min_val_loss, "overfit_gap_ratio": overfit_gap, "epochs_ran": int(len(hist_df)), "selected_exog_cols": ", ".join(selected_cols), "composite_score": score})
+            val_w = wape(val_inner["y"].values, corrected)
+            val_s = smape(val_inner["y"].values, corrected)
+            asym = compute_asymmetric_validation_penalty(val_inner["y"].values, corrected, tr_inner["y"].values, severity=1.0)
+            hist_df = _history_to_frame(hist)
+            min_loss = safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan
+            min_val_loss = safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan
+            overfit_gap = safe_float((min_val_loss - min_loss) / max(abs(min_loss), 1e-8)) if pd.notna(min_loss) and pd.notna(min_val_loss) else np.nan
+            direction_pen = 0.0 if abs(float(asym.get("bias_pct", 0.0) or 0.0)) <= 10 else 0.12
+            score = float(val_w + 0.30 * val_s + asym["penalty"] + 3.0 * max(overfit_gap, 0.0) + direction_pen + (0.02 if strategy == "recursive" and len(val_inner) > 1 else 0.0))
+            search_rows.append({
+                **cfg,
+                "model": model_family,
+                "transform": y_transform.get("name", "none"),
+                "val_wape": val_w,
+                "val_smape": val_s,
+                "bias_pct": asym["bias_pct"],
+                "under_forecast_rate": asym["under_forecast_rate"],
+                "peak_event_score": asym["peak_event_score"],
+                "min_train_loss": min_loss,
+                "min_val_loss": min_val_loss,
+                "overfit_gap_ratio": overfit_gap,
+                "epochs_ran": int(len(hist_df)),
+                "selected_exog_cols": ", ".join(selected_cols),
+                "composite_score": score,
+            })
             if score < best_score:
-                best_score=score
-                best={"cfg": dict(cfg), "transform_cfg": dict(y_transform), "postprocess_cfg": dict(post_cfg), "validation_wape": safe_float(val_w), "validation_smape": safe_float(val_s), "selected_cols": list(selected_cols)}
+                best_score = score
+                best = {
+                    "cfg": dict(cfg),
+                    "transform_cfg": dict(y_transform),
+                    "postprocess_cfg": dict(post_cfg),
+                    "validation_wape": safe_float(val_w),
+                    "validation_smape": safe_float(val_s),
+                    "selected_cols": list(selected_cols),
+                }
         except Exception as e:
             search_rows.append({**cfg, "model": model_family, "val_wape": np.nan, "val_smape": np.nan, "fit_error": str(e)[:250], "selected_exog_cols": ", ".join(selected_cols)})
+
     if best is None:
-        result=build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} modeli kurulamadı.")
-        result["search_accelerator_cache_hit"]=False
+        result = build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} modeli kurulamadı.")
+        result["search_accelerator_cache_hit"] = False
         SEARCH_ACCELERATOR.put_result(cache_key, result)
         return result
-    full_y_t=apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
-    y_scaler, x_scaler, full_y_scaled, full_cov_scaled = _fit_dl_scalers(full_y_t, cov_train_df[best["selected_cols"]].values.astype(float) if best["selected_cols"] else np.zeros((len(train_df),0), dtype=float))
-    X_full, y_full = _make_dl_sequences(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]))
+
+    full_y_t = apply_target_transform(train_df["y"], best["transform_cfg"])[0].values.astype(float)
+    y_scaler, x_scaler, full_y_scaled, full_cov_scaled = _fit_dl_scalers(
+        full_y_t,
+        cov_train_df[best["selected_cols"]].values.astype(float) if best["selected_cols"] else np.zeros((len(train_df), 0), dtype=float),
+    )
+    strategy = str(best["cfg"].get("strategy", "recursive")).lower()
+    if strategy == "direct":
+        X_full, y_full = _make_dl_sequences_direct(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]), int(len(test_df)))
+        output_dim = int(len(test_df))
+    else:
+        X_full, y_full = _make_dl_sequences(full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]))
+        output_dim = 1
     if len(X_full) < int(FORECAST_RUNTIME_CONFIG.dl_min_train_sequences):
-        result=build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için final training sequence sayısı yetersiz.")
-        result["search_accelerator_cache_hit"]=False
+        result = build_model_level_fallback(model_family, train_df, test_df, freq_alias, f"{model_family} için final training sequence sayısı yetersiz.")
+        result["search_accelerator_cache_hit"] = False
         SEARCH_ACCELERATOR.put_result(cache_key, result)
         return result
-    final_model=_build_dl_network((X_full.shape[1], X_full.shape[2]), model_family=model_family, units=int(best["cfg"]["units"]), layers=int(best["cfg"]["layers"]), dropout=float(best["cfg"]["dropout"]), learning_rate=float(best["cfg"]["learning_rate"]))
-    callbacks=[KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
-    final_hist=final_model.fit(X_full, y_full, epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs), batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_full)//2))), validation_split=min(0.20, max(0.10, 1.0/max(len(X_full),8))), verbose=0, callbacks=callbacks)
-    future_cov_scaled=_transform_dl_covariates(x_scaler, cov_test_df[best["selected_cols"]]) if best["selected_cols"] else np.zeros((len(test_df),0), dtype=float)
-    pred_scaled=_recursive_dl_forecast(final_model, full_y_scaled, full_cov_scaled, future_cov_scaled, int(best["cfg"]["window"]))
-    pred_t=y_scaler.inverse_transform(pred_scaled.reshape(-1,1)).reshape(-1)
-    pred=inverse_target_transform(pred_t, best["transform_cfg"])
-    pred=np.maximum(np.asarray(pred,dtype=float),0.0)
-    pred=apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
-    hist_df=_history_to_frame(final_hist)
-    overfit_summary={
+
+    final_model = _build_dl_network(
+        (X_full.shape[1], X_full.shape[2]),
+        model_family=model_family,
+        units=int(best["cfg"]["units"]),
+        layers=int(best["cfg"]["layers"]),
+        dropout=float(best["cfg"]["dropout"]),
+        learning_rate=float(best["cfg"]["learning_rate"]),
+        output_dim=output_dim,
+    )
+    callbacks = [KerasEarlyStopping(monitor="val_loss", patience=int(FORECAST_RUNTIME_CONFIG.dl_patience), restore_best_weights=True)]
+    sample_weight_full = _make_recent_sample_weights(len(y_full), getattr(FORECAST_RUNTIME_CONFIG, "dl_recent_sample_weight_max", 1.0))
+    final_hist = final_model.fit(
+        X_full,
+        y_full,
+        epochs=int(FORECAST_RUNTIME_CONFIG.dl_max_epochs),
+        batch_size=int(min(FORECAST_RUNTIME_CONFIG.dl_batch_size, max(4, len(X_full) // 2))),
+        validation_split=min(0.20, max(0.10, 1.0 / max(len(X_full), 8))),
+        verbose=0,
+        callbacks=callbacks,
+        sample_weight=sample_weight_full,
+    )
+    if strategy == "direct":
+        pred_scaled = _direct_dl_forecast(final_model, full_y_scaled, full_cov_scaled, int(best["cfg"]["window"]), int(len(test_df)))
+    else:
+        future_cov_scaled = _transform_dl_covariates(x_scaler, cov_test_df[best["selected_cols"]]) if best["selected_cols"] else np.zeros((len(test_df), 0), dtype=float)
+        pred_scaled = _recursive_dl_forecast(final_model, full_y_scaled, full_cov_scaled, future_cov_scaled, int(best["cfg"]["window"]))
+    pred_t = y_scaler.inverse_transform(pred_scaled.reshape(-1, 1)).reshape(-1)
+    pred = inverse_target_transform(pred_t, best["transform_cfg"])
+    pred = np.maximum(np.asarray(pred, dtype=float), 0.0)
+    pred = apply_postprocess_cfg(pred, best.get("postprocess_cfg", {}), train_df["y"], season_length)
+    hist_df = _history_to_frame(final_hist)
+    overfit_summary = {
         "epochs_ran": int(len(hist_df)),
         "min_train_loss": safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").min()) if len(hist_df) else np.nan,
         "min_val_loss": safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").min()) if len(hist_df) and "val_loss" in hist_df.columns else np.nan,
         "final_train_loss": safe_float(pd.to_numeric(hist_df.get("loss"), errors="coerce").iloc[-1]) if len(hist_df) else np.nan,
         "final_val_loss": safe_float(pd.to_numeric(hist_df.get("val_loss"), errors="coerce").iloc[-1]) if len(hist_df) and "val_loss" in hist_df.columns else np.nan,
     }
-    overfit_summary["overfit_gap_ratio"] = safe_float((overfit_summary.get("min_val_loss", np.nan)-overfit_summary.get("min_train_loss", np.nan))/max(abs(overfit_summary.get("min_train_loss", np.nan)),1e-8)) if pd.notna(overfit_summary.get("min_val_loss", np.nan)) and pd.notna(overfit_summary.get("min_train_loss", np.nan)) else np.nan
-    result={
+    overfit_summary["overfit_gap_ratio"] = safe_float((overfit_summary.get("min_val_loss", np.nan) - overfit_summary.get("min_train_loss", np.nan)) / max(abs(overfit_summary.get("min_train_loss", np.nan)), 1e-8)) if pd.notna(overfit_summary.get("min_val_loss", np.nan)) and pd.notna(overfit_summary.get("min_train_loss", np.nan)) else np.nan
+    result = {
         "forecast": pred,
-        "search_table": pd.DataFrame(search_rows).sort_values(["composite_score","val_wape"], ascending=[True,True], na_position="last").reset_index(drop=True),
+        "search_table": pd.DataFrame(search_rows).sort_values(["composite_score", "val_wape"], ascending=[True, True], na_position="last").reset_index(drop=True),
         "history_df": hist_df,
         "overfit_summary": overfit_summary,
         "selected_config": dict(best["cfg"]),
-        "transform": best["transform_cfg"].get("name","none"),
+        "transform": best["transform_cfg"].get("name", "none"),
         "used_exog_cols": list(best["selected_cols"]),
         "validation_wape": safe_float(best.get("validation_wape", np.nan)),
         "validation_smape": safe_float(best.get("validation_smape", np.nan)),
@@ -9346,6 +9549,7 @@ def fit_deep_learning_forecast(train_df: pd.DataFrame, test_df: pd.DataFrame, fe
     }
     SEARCH_ACCELERATOR.put_result(cache_key, result)
     return result
+
 
 def build_contextual_validation_ranking(validation_df: pd.DataFrame, profile: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     if not isinstance(validation_df, pd.DataFrame) or len(validation_df) == 0:
@@ -11506,7 +11710,15 @@ def render_streamlit_app():
     st.subheader("Model karşılaştırma tablosu")
     metrics_df = style_metric_dataframe(outputs["metrics_df"])
     st.dataframe(metrics_df, width="stretch")
-    st.download_button("Karşılaştırma tablosunu indir (CSV)", data=dataframe_to_download_bytes(metrics_df), file_name=f"{selected_sheet}_{target_col}_model_karsilastirma.csv", mime="text/csv")
+    st.download_button("Karşılaştırma tablosunu indir (Excel)", data=dataframe_to_download_bytes(metrics_df), file_name=f"{selected_sheet}_{target_col}_model_karsilastirma.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    full_tables_excel = build_current_series_tables_excel_bytes(outputs, export_payload, selected_sheet, target_col)
+    if full_tables_excel is not None:
+        st.download_button(
+            "Bu seri için tüm tabloları indir (Excel)",
+            data=full_tables_excel,
+            file_name=f"{selected_sheet}_{target_col}_tum_tablolar.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     if isinstance(outputs.get("stage_timing_table"), pd.DataFrame) and len(outputs.get("stage_timing_table")):
         with st.expander("Çalışma süresi / performans özeti", expanded=False):
@@ -11646,7 +11858,7 @@ def render_streamlit_app():
     with tab5:
         combined = outputs["all_predictions_long"].copy()
         st.dataframe(style_metric_dataframe(combined), width="stretch")
-        st.download_button("Gerçek vs tahmin tablosunu indir (CSV)", data=dataframe_to_download_bytes(combined), file_name=f"{selected_sheet}_{target_col}_actual_vs_forecast.csv", mime="text/csv")
+        st.download_button("Gerçek vs tahmin tablosunu indir (Excel)", data=dataframe_to_download_bytes(combined), file_name=f"{selected_sheet}_{target_col}_actual_vs_forecast.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     with tab6:
         if "rolling_origin_backtest" in outputs and len(outputs["rolling_origin_backtest"]) > 0:
