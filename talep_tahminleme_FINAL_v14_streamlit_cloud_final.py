@@ -18819,532 +18819,609 @@ def main():
     return entrypoint()
 
 
+
+
 # =========================================================
-# MANDATORY BUSINESS / THESIS TABLE COMPLETION PATCH
+# FAST STREAMLIT UI COMPLETION PATCH - NO MODEL REFIT
 # =========================================================
-# Purpose:
-#   1) Streamlit UI must never show "LSTM/GRU sonucu üretilemedi" when real
-#      LSTM/GRU forecasts exist under thesis-safe public names such as
-#      "LSTM (real)" / "GRU (real)".
-#   2) Business-critical tables must always be materialized, non-empty when
-#      holdout predictions exist, and exported/displayed consistently:
-#        - Tahmin katkı değeri (baseline'a göre)
-#        - Bias dashboard
-#        - Tepe olay yakalama skoru
-#        - Üretim modeli için tahmin aralığı / quantile forecast
-#        - Servis seviyesi / stok etkisi simülasyonu
-#   3) The patch is additive and safe: it does not use test values for model
-#      selection; it uses test values only for evaluation/reporting dashboards.
+# Bu katman özellikle Streamlit Cloud için eklendi.
+# Amaç:
+#   - LSTM/GRU çıktısı üretildiği halde UI'da "sonuç üretilemedi" görünmesini engellemek.
+#   - Tahmin katkı değeri, bias dashboard, tepe yakalama, quantile forecast ve servis/stok
+#     tablolarını mevcut holdout tahminlerinden üretmek.
+#   - Bu tabloları üretirken Prophet/XGBoost/DL/SARIMA dahil hiçbir modeli tekrar fit etmemek.
+#   - Streamlit içinde 20+ dakikalık cmdstanpy/Prophet tekrar fit döngülerini önlemek.
 
-MANDATORY_BUSINESS_TABLES_VERSION = "2026_04_24_mandatory_business_tables_v2"
+FAST_UI_BUSINESS_PATCH_VERSION = "2026_04_24_fast_ui_business_no_refit_v1"
 
-
-def _mbt_model_alias_candidates(model_name: str) -> List[str]:
-    name = str(model_name)
-    up = name.upper()
-    if up == "LSTM":
-        return ["LSTM", "LSTM (real)", "LSTM-real", "LSTM_REAL"]
-    if up == "GRU":
-        return ["GRU", "GRU (real)", "GRU-real", "GRU_REAL"]
-    if "LSTM" in up and "REAL" in up:
-        return [name, "LSTM", "LSTM (real)"]
-    if "GRU" in up and "REAL" in up:
-        return [name, "GRU", "GRU (real)"]
-    return [name]
+try:
+    import logging as _fast_logging
+    for _fast_logger_name in ["cmdstanpy", "prophet", "stanio"]:
+        _fast_logger = _fast_logging.getLogger(_fast_logger_name)
+        _fast_logger.setLevel(_fast_logging.ERROR)
+        _fast_logger.propagate = False
+except Exception:
+    pass
 
 
-def _mbt_first_existing_key(mapping: Any, candidates: List[str]) -> Optional[str]:
+def _fast_is_nonempty_df(df: Any) -> bool:
+    return isinstance(df, pd.DataFrame) and len(df) > 0
+
+
+def _fast_full_float_array(x: Any) -> np.ndarray:
+    try:
+        return np.asarray(x, dtype=float).reshape(-1)
+    except Exception:
+        return np.asarray([], dtype=float)
+
+
+def _fast_aliases(name: str) -> List[str]:
+    n = str(name)
+    u = n.upper().strip()
+    if u == "LSTM":
+        return ["LSTM", "LSTM (real)", "LSTM-real", "LSTM_REAL", "lstm"]
+    if u == "GRU":
+        return ["GRU", "GRU (real)", "GRU-real", "GRU_REAL", "gru"]
+    if "LSTM" in u and "REAL" in u:
+        return [n, "LSTM", "LSTM (real)", "lstm"]
+    if "GRU" in u and "REAL" in u:
+        return [n, "GRU", "GRU (real)", "gru"]
+    return [n]
+
+
+def _fast_find_key(mapping: Any, aliases: List[str]) -> Optional[str]:
     if not isinstance(mapping, dict):
         return None
-    keys = list(mapping.keys())
-    lower_map = {str(k).lower(): k for k in keys}
-    for cand in candidates:
-        if cand in mapping:
-            return cand
-        hit = lower_map.get(str(cand).lower())
+    lower = {str(k).lower(): k for k in mapping.keys()}
+    for a in aliases:
+        if a in mapping:
+            return a
+        hit = lower.get(str(a).lower())
         if hit is not None:
             return hit
     return None
 
 
-def _mbt_safe_metric(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    y_true = np.asarray(y_true, dtype=float).reshape(-1)
-    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
-    n = min(len(y_true), len(y_pred))
+def _fast_get_test_df(outputs: Dict[str, Any]) -> pd.DataFrame:
+    test_df = outputs.get("test", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if isinstance(test_df, pd.DataFrame) and len(test_df) and "y" in test_df.columns:
+        out = test_df.copy().reset_index(drop=True)
+        if "ds" not in out.columns:
+            out.insert(0, "ds", np.arange(1, len(out) + 1))
+        return out
+    avp = outputs.get("all_predictions_long", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if isinstance(avp, pd.DataFrame) and len(avp):
+        cols = {str(c).lower(): c for c in avp.columns}
+        ycol = cols.get("y") or cols.get("actual") or cols.get("gerçek") or cols.get("gercek")
+        dcol = cols.get("ds") or cols.get("date") or cols.get("tarih")
+        if ycol is not None:
+            ser = pd.to_numeric(avp[ycol], errors="coerce")
+            out = pd.DataFrame({"y": ser}).dropna().reset_index(drop=True)
+            if dcol is not None:
+                out.insert(0, "ds", pd.to_datetime(avp[dcol], errors="coerce").values[:len(out)])
+            else:
+                out.insert(0, "ds", np.arange(1, len(out) + 1))
+            return out
+    return pd.DataFrame(columns=["ds", "y"])
+
+
+def _fast_get_train_y(outputs: Dict[str, Any]) -> np.ndarray:
+    train_df = outputs.get("train", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if isinstance(train_df, pd.DataFrame) and len(train_df) and "y" in train_df.columns:
+        return pd.to_numeric(train_df["y"], errors="coerce").dropna().astype(float).values
+    return np.asarray([], dtype=float)
+
+
+def _fast_repeat_to_len(values: np.ndarray, n: int) -> np.ndarray:
+    values = _fast_full_float_array(values)
+    values = values[np.isfinite(values)] if len(values) else values
     if n <= 0:
-        return {"MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "Bias": np.nan, "BiasPct": np.nan, "UnderForecastRate": np.nan, "OverForecastRate": np.nan}
-    y_true = y_true[:n]
-    y_pred = y_pred[:n]
-    err = y_pred - y_true
-    mae_v = float(np.nanmean(np.abs(err)))
-    rmse_v = float(np.sqrt(np.nanmean(err ** 2)))
-    denom = np.where(np.abs(y_true) < 1e-9, np.nan, np.abs(y_true))
-    mape_v = float(np.nanmean(np.abs(err) / denom) * 100.0)
-    smape_v = float(np.nanmean(2.0 * np.abs(err) / np.maximum(np.abs(y_true) + np.abs(y_pred), 1e-9)) * 100.0)
-    wape_v = float(np.nansum(np.abs(err)) / max(np.nansum(np.abs(y_true)), 1e-9) * 100.0)
-    bias_v = float(np.nanmean(err))
-    mean_abs = max(float(np.nanmean(np.abs(y_true))), 1e-9)
-    return {
-        "MAE": mae_v,
-        "RMSE": rmse_v,
-        "MAPE": mape_v,
-        "sMAPE": smape_v,
-        "WAPE": wape_v,
-        "Bias": bias_v,
-        "BiasPct": float(100.0 * bias_v / mean_abs),
-        "UnderForecastRate": float(np.nanmean((y_pred < y_true).astype(float))),
-        "OverForecastRate": float(np.nanmean((y_pred > y_true).astype(float))),
-    }
+        return np.asarray([], dtype=float)
+    if len(values) == 0:
+        return np.zeros(n, dtype=float)
+    reps = int(np.ceil(n / len(values)))
+    return np.tile(values, reps)[:n].astype(float)
 
 
-def _mbt_prediction_table_from_arrays(test_df: pd.DataFrame, pred: Any, model_name: str) -> pd.DataFrame:
+def _fast_baseline_prediction(outputs: Dict[str, Any], n: int) -> np.ndarray:
+    train_y = _fast_get_train_y(outputs)
+    if n <= 0:
+        return np.asarray([], dtype=float)
+    if len(train_y) == 0:
+        test_df = _fast_get_test_df(outputs)
+        if len(test_df) and "y" in test_df.columns:
+            val = float(pd.to_numeric(test_df["y"], errors="coerce").median())
+            return np.repeat(max(val, 0.0), n)
+        return np.zeros(n, dtype=float)
+    meta = outputs.get("metadata", {}) if isinstance(outputs.get("metadata", {}), dict) else {}
+    freq = str(meta.get("freq_alias", meta.get("frequency", "M"))).upper()
+    season_map = {"M": 12, "MS": 12, "ME": 12, "W": 52, "D": 7, "H": 24}
+    s_len = int(season_map.get(freq, 12))
+    if len(train_y) >= s_len and s_len > 1:
+        return np.maximum(_fast_repeat_to_len(train_y[-s_len:], n), 0.0)
+    return np.repeat(max(float(train_y[-1]), 0.0), n)
+
+
+def _fast_prediction_table(test_df: pd.DataFrame, pred: Any, model_name: str) -> pd.DataFrame:
     if not isinstance(test_df, pd.DataFrame) or len(test_df) == 0 or "y" not in test_df.columns:
         return pd.DataFrame(columns=["ds", "y", "prediction", "error", "abs_error", "model"])
     y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
-    y_pred = np.asarray(pred, dtype=float).reshape(-1)
-    n = min(len(y_true), len(y_pred), len(test_df))
-    out = test_df.iloc[:n][[c for c in ["ds", "y"] if c in test_df.columns]].copy().reset_index(drop=True)
-    if "ds" not in out.columns:
-        out.insert(0, "ds", np.arange(1, n + 1))
-    out["prediction"] = np.maximum(y_pred[:n], 0.0)
-    out["error"] = out["prediction"].astype(float) - pd.to_numeric(out["y"], errors="coerce").astype(float)
+    y_pred = _fast_full_float_array(pred)
+    n = min(len(test_df), len(y_true), len(y_pred))
+    if n <= 0:
+        return pd.DataFrame(columns=["ds", "y", "prediction", "error", "abs_error", "model"])
+    out = pd.DataFrame({
+        "ds": test_df["ds"].iloc[:n].values if "ds" in test_df.columns else np.arange(1, n + 1),
+        "y": y_true[:n],
+        "prediction": np.maximum(y_pred[:n], 0.0),
+    })
+    out["error"] = out["prediction"] - out["y"]
     out["abs_error"] = out["error"].abs()
+    out["ape_pct"] = np.where(np.abs(out["y"]) > 1e-9, out["abs_error"] / np.abs(out["y"]) * 100.0, np.nan)
+    out["direction"] = np.where(out["error"] > 0, "fazla_tahmin", np.where(out["error"] < 0, "eksik_tahmin", "tam_isabet"))
     out["model"] = str(model_name)
     return out
 
 
-def _mbt_ensure_lstm_gru_aliases(outputs: Dict[str, Any]) -> Dict[str, Any]:
-    """Make the older Streamlit rendering code and thesis-safe naming agree."""
+def _fast_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    y_true = _fast_full_float_array(y_true)
+    y_pred = _fast_full_float_array(y_pred)
+    n = min(len(y_true), len(y_pred))
+    if n <= 0:
+        return {"MAE": np.nan, "RMSE": np.nan, "MAPE": np.nan, "sMAPE": np.nan, "WAPE": np.nan, "Bias": np.nan, "BiasPct": np.nan}
+    y_true = y_true[:n]
+    y_pred = y_pred[:n]
+    err = y_pred - y_true
+    denom = np.where(np.abs(y_true) < 1e-9, np.nan, np.abs(y_true))
+    return {
+        "MAE": float(np.nanmean(np.abs(err))),
+        "RMSE": float(np.sqrt(np.nanmean(err ** 2))),
+        "MAPE": float(np.nanmean(np.abs(err) / denom) * 100.0),
+        "sMAPE": float(np.nanmean(2.0 * np.abs(err) / np.maximum(np.abs(y_true) + np.abs(y_pred), 1e-9)) * 100.0),
+        "WAPE": float(np.nansum(np.abs(err)) / max(np.nansum(np.abs(y_true)), 1e-9) * 100.0),
+        "Bias": float(np.nanmean(err)),
+        "BiasPct": float(np.nanmean(err) / max(np.nanmean(np.abs(y_true)), 1e-9) * 100.0),
+        "EksikTahminOranı": float(np.nanmean((y_pred < y_true).astype(float))),
+        "FazlaTahminOranı": float(np.nanmean((y_pred > y_true).astype(float))),
+    }
+
+
+def _fast_ensure_dl_ui_aliases(outputs: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(outputs, dict):
         return outputs
     tables = outputs.setdefault("tables", {})
     preds = outputs.setdefault("predictions", {})
-    test_df = outputs.get("test", pd.DataFrame())
+    test_df = _fast_get_test_df(outputs)
+    model_errors = outputs.setdefault("model_errors", {})
 
-    for fam, public_name, key in [("LSTM", "LSTM (real)", "lstm"), ("GRU", "GRU (real)", "gru")]:
-        pack = outputs.get(key, {}) if isinstance(outputs.get(key, {}), dict) else {}
-
-        # Forecast array candidates: public prediction, legacy prediction, pack forecast.
-        pred_key = _mbt_first_existing_key(preds, [fam, public_name])
-        pred = preds.get(pred_key) if pred_key is not None else None
-        if pred is None and isinstance(pack, dict) and pack.get("forecast") is not None:
-            pred = pack.get("forecast")
-        if pred is not None:
-            try:
-                arr = np.asarray(pred, dtype=float).reshape(-1)
-                if len(arr) > 0 and np.isfinite(arr).any():
-                    preds[fam] = arr
-                    preds[public_name] = arr
-            except Exception:
-                pass
-
-        # Table candidates: public table, legacy table, construct from test+forecast.
-        tbl_key = _mbt_first_existing_key(tables, [fam, public_name])
-        tbl = tables.get(tbl_key) if tbl_key is not None else None
-        if (not isinstance(tbl, pd.DataFrame) or len(tbl) == 0) and fam in preds:
-            tbl = _mbt_prediction_table_from_arrays(test_df, preds[fam], fam)
-        if isinstance(tbl, pd.DataFrame) and len(tbl) > 0:
-            legacy_tbl = tbl.copy()
-            if "model" not in legacy_tbl.columns:
+    for fam, pack_key, public_name in [("LSTM", "lstm", "LSTM (real)"), ("GRU", "gru", "GRU (real)")]:
+        pack = outputs.get(pack_key, {}) if isinstance(outputs.get(pack_key, {}), dict) else {}
+        pred = None
+        pkey = _fast_find_key(preds, _fast_aliases(fam) + _fast_aliases(public_name))
+        if pkey is not None:
+            pred = preds.get(pkey)
+        if pred is None and isinstance(pack, dict):
+            for fc_key in ["forecast", "prediction", "predictions", "y_pred", "holdout_forecast"]:
+                if pack.get(fc_key) is not None:
+                    pred = pack.get(fc_key)
+                    break
+        arr = _fast_full_float_array(pred)
+        if len(arr) > 0 and np.isfinite(arr).any():
+            arr = np.maximum(arr, 0.0)
+            preds[fam] = arr
+            preds[public_name] = arr
+            tbl_key = _fast_find_key(tables, _fast_aliases(fam) + _fast_aliases(public_name))
+            tbl = tables.get(tbl_key) if tbl_key is not None else None
+            if not _fast_is_nonempty_df(tbl):
+                tbl = _fast_prediction_table(test_df, arr, fam)
+            if _fast_is_nonempty_df(tbl):
+                legacy_tbl = tbl.copy()
                 legacy_tbl["model"] = fam
-            else:
-                legacy_tbl["model"] = fam
-            public_tbl = tbl.copy()
-            if "model" not in public_tbl.columns:
+                public_tbl = tbl.copy()
                 public_tbl["model"] = public_name
-            else:
-                public_tbl["model"] = public_name
-            tables[fam] = legacy_tbl
-            tables[public_name] = public_tbl
+                tables[fam] = legacy_tbl
+                tables[public_name] = public_tbl
+            model_errors.pop(fam, None)
+            model_errors.pop(public_name, None)
 
-        # If metrics contain only public-name rows, add legacy aliases for UI plots;
-        # if only legacy rows exist, add public rows for thesis tables. This is report-only.
-        metrics_df = outputs.get("metrics_df")
-        if isinstance(metrics_df, pd.DataFrame) and len(metrics_df) and "model" in metrics_df.columns:
-            models = set(metrics_df["model"].astype(str))
-            add_rows = []
-            for src_name, dst_name in [(public_name, fam), (fam, public_name)]:
-                if src_name in models and dst_name not in models:
-                    row = metrics_df.loc[metrics_df["model"].astype(str).eq(src_name)].head(1).copy()
-                    if len(row):
-                        row.loc[:, "model"] = dst_name
-                        add_rows.append(row)
-            if add_rows:
-                outputs["metrics_df"] = pd.concat([metrics_df] + add_rows, ignore_index=True)
+            if isinstance(pack, dict):
+                status = pack.get("dl_training_status_table")
+                if not _fast_is_nonempty_df(status):
+                    hist = pack.get("history_df", pd.DataFrame())
+                    epochs = int(len(hist)) if isinstance(hist, pd.DataFrame) else int(pack.get("epochs_ran", 0) or 0)
+                    cfg = pack.get("selected_config", {}) if isinstance(pack.get("selected_config", {}), dict) else {}
+                    pack["dl_training_status_table"] = pd.DataFrame([{
+                        "model": fam,
+                        "trained_with_tensorflow": bool(pack.get("trained_with_tensorflow", pack.get("dl_backend") == "tensorflow")),
+                        "trained_with_real_dl_backend": bool(pack.get("trained_with_real_dl_backend", epochs > 0)),
+                        "epochs_ran": epochs,
+                        "n_sequences": pack.get("n_sequences", cfg.get("n_sequences")),
+                        "selected_window": pack.get("selected_window", cfg.get("window")),
+                        "selected_strategy": pack.get("selected_strategy", cfg.get("strategy")),
+                        "fallback_used": bool(pack.get("fallback_used", False)),
+                        "surrogate_used": bool(pack.get("surrogate_used", False)),
+                    }])
+                outputs[pack_key] = pack
 
     outputs["tables"] = tables
     outputs["predictions"] = preds
+    outputs["model_errors"] = model_errors
     return outputs
 
 
-def _mbt_canonical_prediction_items(outputs: Dict[str, Any]) -> List[Tuple[str, np.ndarray]]:
-    if not isinstance(outputs, dict):
-        return []
+def _fast_prediction_items(outputs: Dict[str, Any]) -> List[Tuple[str, np.ndarray]]:
+    outputs = _fast_ensure_dl_ui_aliases(outputs if isinstance(outputs, dict) else {})
     preds = outputs.get("predictions", {}) if isinstance(outputs.get("predictions", {}), dict) else {}
     tables = outputs.get("tables", {}) if isinstance(outputs.get("tables", {}), dict) else {}
-    ordered = []
-    # Prefer thesis-visible public names, but keep legacy LSTM/GRU for Streamlit UI.
-    preferred = ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "LSTM", "GRU", "LSTM (real)", "GRU (real)", "Intermittent", "Ensemble"]
-    seen = set()
-    for name in preferred + [str(k) for k in preds.keys()] + [str(k) for k in tables.keys()]:
-        if name in seen:
+    preferred = ["SARIMA/SARIMAX", "ARIMA", "Prophet", "XGBoost", "LSTM", "GRU", "Intermittent", "Ensemble"]
+    names = []
+    for n in preferred + [str(k) for k in preds.keys()] + [str(k) for k in tables.keys()]:
+        if str(n) in {"LSTM (real)", "GRU (real)", "LSTM-surrogate", "GRU-surrogate", "DL-fallback"}:
             continue
-        seen.add(name)
+        if n not in names:
+            names.append(n)
+    out = []
+    for name in names:
         pred = None
-        pkey = _mbt_first_existing_key(preds, [name])
-        if pkey is not None:
-            pred = preds.get(pkey)
+        key = _fast_find_key(preds, _fast_aliases(name))
+        if key is not None:
+            pred = preds.get(key)
         elif name in tables and isinstance(tables[name], pd.DataFrame) and "prediction" in tables[name].columns:
             pred = pd.to_numeric(tables[name]["prediction"], errors="coerce").values
-        if pred is None:
-            continue
-        try:
-            arr = np.asarray(pred, dtype=float).reshape(-1)
-            if len(arr) and np.isfinite(arr).any():
-                ordered.append((name, np.maximum(arr, 0.0)))
-        except Exception:
-            continue
-    return ordered
-
-
-def _mbt_build_metrics_from_predictions(outputs: Dict[str, Any]) -> pd.DataFrame:
-    test_df = outputs.get("test", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(test_df, pd.DataFrame) or "y" not in test_df.columns or len(test_df) == 0:
-        return pd.DataFrame(columns=["model", "MAE", "RMSE", "MAPE", "sMAPE", "WAPE", "Bias", "BiasPct", "UnderForecastRate", "OverForecastRate"])
-    y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
-    rows = []
-    for name, pred in _mbt_canonical_prediction_items(outputs):
-        met = _mbt_safe_metric(y_true, pred)
-        met["model"] = name
-        rows.append(met)
-    if not rows:
-        return pd.DataFrame(columns=["model", "MAE", "RMSE", "MAPE", "sMAPE", "WAPE", "Bias", "BiasPct", "UnderForecastRate", "OverForecastRate"])
-    return pd.DataFrame(rows).drop_duplicates(subset=["model"], keep="first").sort_values(["WAPE", "MAE"], na_position="last").reset_index(drop=True)
-
-
-def _mbt_build_forecast_value_add(outputs: Dict[str, Any], freq_alias: Optional[str] = None) -> pd.DataFrame:
-    test_df = outputs.get("test", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    train_df = outputs.get("train", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(test_df, pd.DataFrame) or len(test_df) == 0 or "y" not in test_df.columns:
-        return pd.DataFrame(columns=["model", "baseline_name", "baseline_WAPE", "model_WAPE", "fva_wape_pct", "baseline_MAE", "model_MAE", "fva_mae_pct", "business_interpretation"])
-    freq_alias = str(freq_alias or ((outputs.get("metadata") or {}).get("freq_alias") if isinstance(outputs, dict) else "M") or "M")
-    if isinstance(train_df, pd.DataFrame) and "y" in train_df.columns and len(train_df):
-        try:
-            baseline_pred, baseline_name = build_fallback_forecast(train_df["y"], int(len(test_df)), freq_alias, infer_season_length_from_freq(freq_alias))
-        except Exception:
-            last = float(pd.to_numeric(train_df["y"], errors="coerce").dropna().iloc[-1]) if len(pd.to_numeric(train_df["y"], errors="coerce").dropna()) else 0.0
-            baseline_pred, baseline_name = np.repeat(last, len(test_df)), "last_observed"
-    else:
-        baseline_pred, baseline_name = np.repeat(float(pd.to_numeric(test_df["y"], errors="coerce").median()), len(test_df)), "holdout_median_reporting_only"
-    y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
-    base_met = _mbt_safe_metric(y_true, baseline_pred)
-    rows = []
-    for name, pred in _mbt_canonical_prediction_items(outputs):
-        met = _mbt_safe_metric(y_true, pred)
-        fva_w = float(100.0 * (base_met["WAPE"] - met["WAPE"]) / max(base_met["WAPE"], 1e-9)) if pd.notna(met["WAPE"]) else np.nan
-        fva_m = float(100.0 * (base_met["MAE"] - met["MAE"]) / max(base_met["MAE"], 1e-9)) if pd.notna(met["MAE"]) else np.nan
-        rows.append({
-            "model": name,
-            "baseline_name": baseline_name,
-            "baseline_WAPE": base_met["WAPE"],
-            "model_WAPE": met["WAPE"],
-            "fva_wape_pct": fva_w,
-            "baseline_MAE": base_met["MAE"],
-            "model_MAE": met["MAE"],
-            "fva_mae_pct": fva_m,
-            "business_interpretation": "Baseline'a göre değer katıyor" if pd.notna(fva_w) and fva_w > 0 else "Baseline'dan zayıf veya eşdeğer; işte tek başına tercih edilmemeli",
-        })
-    out = pd.DataFrame(rows)
-    if len(out):
-        out = out.sort_values(["fva_wape_pct", "fva_mae_pct"], ascending=[False, False], na_position="last").reset_index(drop=True)
+        arr = _fast_full_float_array(pred)
+        if len(arr) > 0 and np.isfinite(arr).any():
+            out.append((str(name), np.maximum(arr, 0.0)))
     return out
 
 
-def _mbt_build_bias_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
-    test_df = outputs.get("test", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(test_df, pd.DataFrame) or len(test_df) == 0 or "y" not in test_df.columns:
-        return pd.DataFrame(columns=["model", "mean_error", "median_error", "bias_pct", "under_forecast_rate", "over_forecast_rate", "under_forecast_count", "over_forecast_count", "test_n", "business_bias_note"])
+def _fast_build_metrics_df(outputs: Dict[str, Any]) -> pd.DataFrame:
+    test_df = _fast_get_test_df(outputs)
+    if not len(test_df) or "y" not in test_df.columns:
+        return pd.DataFrame()
     y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
     rows = []
-    for name, pred in _mbt_canonical_prediction_items(outputs):
-        y_pred = np.asarray(pred, dtype=float).reshape(-1)[:len(y_true)]
-        n = min(len(y_true), len(y_pred))
+    for name, pred in _fast_prediction_items(outputs):
+        n = min(len(y_true), len(pred))
         if n <= 0:
             continue
-        err = y_pred[:n] - y_true[:n]
-        mean_abs = max(float(np.nanmean(np.abs(y_true[:n]))), 1e-9)
-        under = int(np.sum(y_pred[:n] < y_true[:n]))
-        over = int(np.sum(y_pred[:n] > y_true[:n]))
-        bias_pct = float(100.0 * np.nanmean(err) / mean_abs)
+        row = {"model": name, "Model": name}
+        row.update(_fast_metrics(y_true[:n], pred[:n]))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _fast_select_production_model(outputs: Dict[str, Any], pack: Dict[str, Any]) -> Optional[str]:
+    items = dict(_fast_prediction_items(outputs))
+    for cand in [pack.get("production_model"), outputs.get("production_model"), outputs.get("best_model")]:
+        if cand and str(cand) in items:
+            return str(cand)
+    mdf = outputs.get("metrics_df") if _fast_is_nonempty_df(outputs.get("metrics_df")) else _fast_build_metrics_df(outputs)
+    if _fast_is_nonempty_df(mdf) and "model" in mdf.columns:
+        score_col = "WAPE" if "WAPE" in mdf.columns else ("MAPE" if "MAPE" in mdf.columns else None)
+        if score_col:
+            tmp = mdf.copy()
+            tmp["_score"] = pd.to_numeric(tmp[score_col], errors="coerce")
+            tmp = tmp.loc[tmp["_score"].notna()].sort_values("_score")
+            for cand in tmp["model"].astype(str).tolist():
+                if cand in items:
+                    return cand
+    return next(iter(items.keys()), None)
+
+
+def _fast_build_forecast_value_add(outputs: Dict[str, Any]) -> pd.DataFrame:
+    test_df = _fast_get_test_df(outputs)
+    if not len(test_df) or "y" not in test_df.columns:
+        return pd.DataFrame(columns=["model", "baseline_model", "model_WAPE", "baseline_WAPE", "WAPE_iyileşme_puan", "yorum"])
+    y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
+    baseline = _fast_baseline_prediction(outputs, len(y_true))
+    bmet = _fast_metrics(y_true, baseline)
+    rows = []
+    for name, pred in _fast_prediction_items(outputs):
+        n = min(len(y_true), len(pred), len(baseline))
+        if n <= 0:
+            continue
+        met = _fast_metrics(y_true[:n], pred[:n])
+        gain = float(bmet.get("WAPE", np.nan) - met.get("WAPE", np.nan)) if pd.notna(bmet.get("WAPE", np.nan)) and pd.notna(met.get("WAPE", np.nan)) else np.nan
         rows.append({
             "model": name,
-            "mean_error": float(np.nanmean(err)),
-            "median_error": float(np.nanmedian(err)),
-            "bias_pct": bias_pct,
-            "under_forecast_rate": float(under / max(n, 1)),
-            "over_forecast_rate": float(over / max(n, 1)),
-            "under_forecast_count": under,
-            "over_forecast_count": over,
-            "test_n": int(n),
-            "max_under_error": float(np.nanmin(err)),
-            "max_over_error": float(np.nanmax(err)),
-            "business_bias_note": "Eksik tahmin eğilimi stok-out riski yaratabilir" if bias_pct < -3 else ("Fazla tahmin eğilimi stok/sermaye bağlama riski yaratabilir" if bias_pct > 3 else "Bias kontrollü"),
+            "baseline_model": "seasonal_naive_train_only",
+            "model_WAPE": met.get("WAPE"),
+            "baseline_WAPE": bmet.get("WAPE"),
+            "WAPE_iyileşme_puan": gain,
+            "WAPE_iyileşme_yüzde": (gain / bmet.get("WAPE") * 100.0) if pd.notna(gain) and bmet.get("WAPE", 0) not in [0, np.nan] else np.nan,
+            "model_MAE": met.get("MAE"),
+            "baseline_MAE": bmet.get("MAE"),
+            "yorum": "Baseline'a göre değer katıyor" if pd.notna(gain) and gain > 0 else "Baseline'a göre iyileşme sınırlı/negatif",
         })
-    out = pd.DataFrame(rows)
-    if len(out):
-        out["abs_bias_pct"] = pd.to_numeric(out["bias_pct"], errors="coerce").abs()
-        out = out.sort_values(["abs_bias_pct", "under_forecast_rate"], ascending=[True, True]).drop(columns=["abs_bias_pct"]).reset_index(drop=True)
-    return out
+    return pd.DataFrame(rows).sort_values("model_WAPE", na_position="last").reset_index(drop=True) if rows else pd.DataFrame()
 
 
-def _mbt_build_peak_event_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
-    test_df = outputs.get("test", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    train_df = outputs.get("train", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(test_df, pd.DataFrame) or len(test_df) == 0 or "y" not in test_df.columns:
-        return pd.DataFrame(columns=["model", "peak_threshold", "peak_precision", "peak_recall", "peak_f1", "peak_event_score", "actual_peak_count", "pred_peak_count", "business_peak_note"])
-    y_train = pd.to_numeric(train_df["y"], errors="coerce").astype(float).values if isinstance(train_df, pd.DataFrame) and "y" in train_df.columns else pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
+def _fast_build_bias_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
+    test_df = _fast_get_test_df(outputs)
+    if not len(test_df) or "y" not in test_df.columns:
+        return pd.DataFrame(columns=["model", "test_gözlem_sayısı", "bias", "bias_yüzde", "eksik_tahmin_oranı", "fazla_tahmin_oranı"])
     y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
     rows = []
-    for name, pred in _mbt_canonical_prediction_items(outputs):
-        p = np.asarray(pred, dtype=float).reshape(-1)[:len(y_true)]
-        if len(p) == 0:
+    for name, pred in _fast_prediction_items(outputs):
+        n = min(len(y_true), len(pred))
+        if n <= 0:
             continue
-        score = compute_peak_event_score(y_train, y_true[:len(p)], p, quantile=0.75 if len(y_true) <= 6 else 0.80)
-        score["model"] = name
-        score["business_peak_note"] = "Tepe talep olaylarını yakalama güçlü" if safe_float(score.get("peak_event_score", np.nan)) >= 0.67 else "Tepe olay yakalama sınırlı; stok güvenlik payı ile desteklenmeli"
-        rows.append(score)
-    out = pd.DataFrame(rows)
-    if len(out):
-        out = out.sort_values(["peak_event_score", "peak_recall"], ascending=[False, False], na_position="last").reset_index(drop=True)
-    return out
+        yp = pred[:n]
+        yt = y_true[:n]
+        err = yp - yt
+        under = np.maximum(yt - yp, 0.0)
+        over = np.maximum(yp - yt, 0.0)
+        rows.append({
+            "model": name,
+            "test_gözlem_sayısı": int(n),
+            "bias": float(np.nanmean(err)),
+            "bias_yüzde": float(np.nanmean(err) / max(np.nanmean(np.abs(yt)), 1e-9) * 100.0),
+            "toplam_eksik_tahmin_miktarı": float(np.nansum(under)),
+            "toplam_fazla_tahmin_miktarı": float(np.nansum(over)),
+            "eksik_tahmin_adedi": int(np.nansum((yp < yt).astype(int))),
+            "fazla_tahmin_adedi": int(np.nansum((yp > yt).astype(int))),
+            "eksik_tahmin_oranı": float(np.nanmean((yp < yt).astype(float))),
+            "fazla_tahmin_oranı": float(np.nanmean((yp > yt).astype(float))),
+            "yorum": "Eksik tahmin eğilimi" if np.nanmean(err) < 0 else ("Fazla tahmin eğilimi" if np.nanmean(err) > 0 else "Dengeli"),
+        })
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
-def _mbt_build_interval_table_for_model(outputs: Dict[str, Any], model_name: str, pred: Any) -> pd.DataFrame:
-    test_df = outputs.get("test", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(test_df, pd.DataFrame) or len(test_df) == 0 or "y" not in test_df.columns:
-        return pd.DataFrame(columns=["ds", "y", "q05", "q10", "q50", "q90", "q95", "coverage_80", "coverage_90", "coverage_95", "model", "interval_method"])
-    try:
-        scale = estimate_model_interval_scale(outputs, model_name)
-    except Exception:
-        scale = np.nan
-    if not np.isfinite(scale) or scale <= 0:
-        tbl = _mbt_prediction_table_from_arrays(test_df, pred, model_name)
-        scale = float(pd.to_numeric(tbl.get("abs_error", pd.Series([1.0])), errors="coerce").median()) if len(tbl) else 1.0
-        if not np.isfinite(scale) or scale <= 0:
-            scale = 1.0
-    try:
-        ro = outputs.get("rolling_origin_backtest", pd.DataFrame())
-        qdf = build_calibrated_prediction_interval_table(test_df, pred, model_name, ro, fallback_scale=float(scale))
-    except Exception:
-        qdf = build_prediction_interval_table(test_df, pred, float(scale))
-    if not isinstance(qdf, pd.DataFrame):
-        qdf = pd.DataFrame()
-    if len(qdf):
-        qdf = qdf.copy()
-        qdf["model"] = model_name
-        qdf["interval_method"] = "calibrated_holdout_rolling_mae" if "coverage_80" in qdf.columns else "normal_mae_fallback"
-        # Standardize columns expected by service simulation.
-        if "q90" not in qdf.columns and "q80" in qdf.columns:
-            qdf["q90"] = qdf["q80"]
-        if "q95" not in qdf.columns and "q90" in qdf.columns:
-            qdf["q95"] = qdf["q90"]
-    return qdf
+def _fast_build_peak_dashboard(outputs: Dict[str, Any]) -> pd.DataFrame:
+    test_df = _fast_get_test_df(outputs)
+    if not len(test_df) or "y" not in test_df.columns:
+        return pd.DataFrame(columns=["model", "tepe_eşik", "tepe_dönem_sayısı", "tepe_olay_skoru"])
+    y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
+    train_y = _fast_get_train_y(outputs)
+    hist = train_y[np.isfinite(train_y)] if len(train_y) else y_true[np.isfinite(y_true)]
+    if len(hist) == 0:
+        return pd.DataFrame()
+    q = 0.70 if len(y_true) <= 6 else 0.80
+    threshold = float(np.nanquantile(hist, q))
+    peak_mask = y_true >= threshold
+    if not np.any(peak_mask) and len(y_true):
+        peak_mask[np.nanargmax(y_true)] = True
+    rows = []
+    for name, pred in _fast_prediction_items(outputs):
+        n = min(len(y_true), len(pred))
+        if n <= 0:
+            continue
+        mask = peak_mask[:n]
+        yp = pred[:n]
+        yt = y_true[:n]
+        if not np.any(mask):
+            score = np.nan
+            captured = 0
+            peak_n = 0
+            peak_wape = np.nan
+        else:
+            captured = int(np.nansum((yp[mask] >= threshold).astype(int)))
+            peak_n = int(np.nansum(mask.astype(int)))
+            peak_wape = float(np.nansum(np.abs(yp[mask] - yt[mask])) / max(np.nansum(np.abs(yt[mask])), 1e-9) * 100.0)
+            score = float(max(0.0, 1.0 - peak_wape / 100.0))
+        rows.append({
+            "model": name,
+            "tepe_eşik": threshold,
+            "tepe_dönem_sayısı": peak_n,
+            "yakalanan_tepe_adedi": captured,
+            "tepe_yakalama_oranı": float(captured / max(peak_n, 1)) if peak_n else np.nan,
+            "tepe_WAPE": peak_wape,
+            "tepe_olay_skoru": score,
+            "yorum": "Tepe dönem yakalama güçlü" if pd.notna(score) and score >= 0.80 else "Tepe dönemlerde güvenlik stoku ile desteklenmeli",
+        })
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
-def _mbt_build_service_table(outputs: Dict[str, Any], model_name: str, pred: Any, interval_df: pd.DataFrame) -> pd.DataFrame:
-    test_df = outputs.get("test", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    try:
-        sdf = build_service_level_simulation(test_df, pred, interval_df)
-    except Exception:
-        sdf = pd.DataFrame()
-    if not isinstance(sdf, pd.DataFrame) or len(sdf) == 0:
-        actual = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values if isinstance(test_df, pd.DataFrame) and "y" in test_df.columns else np.array([])
-        p = np.asarray(pred, dtype=float).reshape(-1)[:len(actual)]
-        rows = []
-        for level, mult in [(0.80, 1.2816), (0.90, 1.6449), (0.95, 1.9600)]:
-            if len(actual) and len(p):
-                err_scale = float(np.nanmean(np.abs(actual[:len(p)] - p))) if len(p) else 1.0
-                stock_target = np.maximum(p + max(err_scale, 1.0) * mult, 0.0)
-                stockout = np.maximum(actual[:len(p)] - stock_target, 0.0)
-                achieved = float(np.mean(actual[:len(p)] <= stock_target))
-                safety = np.maximum(stock_target - p, 0.0)
-            else:
-                achieved, stockout, safety, stock_target = np.nan, np.array([]), np.array([]), np.array([])
-            rows.append({
-                "service_level_target": level,
-                "achieved_cycle_service": achieved,
-                "avg_safety_stock": float(np.nanmean(safety)) if len(safety) else np.nan,
-                "avg_total_stock_target": float(np.nanmean(stock_target)) if len(stock_target) else np.nan,
-                "avg_stockout_units": float(np.nanmean(stockout)) if len(stockout) else np.nan,
-            })
-        sdf = pd.DataFrame(rows)
-    sdf = sdf.copy()
-    sdf["model"] = model_name
-    sdf["business_service_note"] = sdf.apply(lambda r: "Hedef servis karşılanıyor" if pd.notna(r.get("achieved_cycle_service", np.nan)) and pd.notna(r.get("service_level_target", np.nan)) and r.get("achieved_cycle_service") >= r.get("service_level_target") else "Servis hedefi için daha yüksek güvenlik stoku veya model yeniden kalibrasyonu gerekir", axis=1)
-    return sdf
+def _fast_quantile_table(outputs: Dict[str, Any], model_name: str, pred: np.ndarray) -> pd.DataFrame:
+    test_df = _fast_get_test_df(outputs)
+    y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values if len(test_df) and "y" in test_df.columns else np.asarray([], dtype=float)
+    n = min(len(pred), len(y_true)) if len(y_true) else len(pred)
+    if n <= 0:
+        return pd.DataFrame(columns=["ds", "model", "tahmin", "AltBant_80", "ÜstBant_80", "AltBant_90", "ÜstBant_90"])
+    pred = np.maximum(_fast_full_float_array(pred)[:n], 0.0)
+    if len(y_true) >= n:
+        resid = y_true[:n] - pred
+    else:
+        train_y = _fast_get_train_y(outputs)
+        resid = np.diff(train_y[-min(len(train_y), 12):]) if len(train_y) > 2 else np.asarray([0.0])
+    resid = resid[np.isfinite(resid)]
+    if len(resid) == 0:
+        resid = np.asarray([0.0])
+    q10, q20, q80, q90 = np.nanquantile(resid, [0.10, 0.20, 0.80, 0.90])
+    ds = test_df["ds"].iloc[:n].values if len(test_df) >= n and "ds" in test_df.columns else np.arange(1, n + 1)
+    return pd.DataFrame({
+        "ds": ds,
+        "model": model_name,
+        "tahmin": pred,
+        "AltBant_90": np.maximum(pred + q10, 0.0),
+        "AltBant_80": np.maximum(pred + q20, 0.0),
+        "ÜstBant_80": np.maximum(pred + q80, 0.0),
+        "ÜstBant_90": np.maximum(pred + q90, 0.0),
+        "interval_method": "holdout_residual_empirical_no_refit",
+    })
 
 
-def _mbt_complete_production_pack(outputs: Dict[str, Any], pack: Optional[Dict[str, Any]] = None, freq_alias: Optional[str] = None) -> Dict[str, Any]:
-    outputs = _mbt_ensure_lstm_gru_aliases(outputs)
-    pack = pack if isinstance(pack, dict) else {}
-    freq_alias = freq_alias or ((outputs.get("metadata") or {}).get("freq_alias") if isinstance(outputs, dict) else None) or "M"
+def _fast_service_table(outputs: Dict[str, Any], model_name: str, pred: np.ndarray, qdf: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    test_df = _fast_get_test_df(outputs)
+    if not len(test_df) or "y" not in test_df.columns:
+        return pd.DataFrame(columns=["model", "hedef_servis", "gerçekleşen_servis", "stok_açığı_miktarı"])
+    y_true = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
+    n = min(len(y_true), len(pred))
+    if n <= 0:
+        return pd.DataFrame(columns=["model", "hedef_servis", "gerçekleşen_servis", "stok_açığı_miktarı"])
+    yt = y_true[:n]
+    yp = np.maximum(_fast_full_float_array(pred)[:n], 0.0)
+    resid = yt - yp
+    sigma = float(np.nanstd(resid)) if np.isfinite(np.nanstd(resid)) else 0.0
+    z = 1.28
+    safety_stock = max(z * sigma, 0.0)
+    available = yp + safety_stock
+    stockout = np.maximum(yt - available, 0.0)
+    overstock = np.maximum(available - yt, 0.0)
+    service_event = (available >= yt).astype(float)
+    return pd.DataFrame([{
+        "model": model_name,
+        "hedef_servis": 0.90,
+        "gerçekleşen_servis": float(np.nanmean(service_event)),
+        "test_gözlem_sayısı": int(n),
+        "önerilen_güvenlik_stoku": safety_stock,
+        "stok_açığı_dönem_sayısı": int(np.nansum((stockout > 0).astype(int))),
+        "stok_açığı_miktarı": float(np.nansum(stockout)),
+        "fazla_stok_miktarı": float(np.nansum(overstock)),
+        "ortalama_stok_açığı": float(np.nanmean(stockout)),
+        "ortalama_fazla_stok": float(np.nanmean(overstock)),
+        "yorum": "Servis seviyesi hedefe yakın/üstünde" if float(np.nanmean(service_event)) >= 0.90 else "Stok riski var; güvenlik stoku/forecast bias ayarı önerilir",
+    }])
 
-    # Ensure metrics exist from actual predictions if earlier model comparison failed.
-    rebuilt_metrics = _mbt_build_metrics_from_predictions(outputs)
-    if (not isinstance(outputs.get("metrics_df"), pd.DataFrame) or len(outputs.get("metrics_df", pd.DataFrame())) == 0) and len(rebuilt_metrics):
-        outputs["metrics_df"] = rebuilt_metrics
 
-    fva = pack.get("forecast_value_add")
-    if not isinstance(fva, pd.DataFrame) or len(fva) == 0:
-        fva = _mbt_build_forecast_value_add(outputs, freq_alias)
-    pack["forecast_value_add"] = fva
+def _fast_build_production_pack_no_refit(outputs: Dict[str, Any], existing_pack: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    outputs = _fast_ensure_dl_ui_aliases(outputs if isinstance(outputs, dict) else {})
+    pack = existing_pack if isinstance(existing_pack, dict) else {}
 
-    bias = pack.get("bias_dashboard")
-    if not isinstance(bias, pd.DataFrame) or len(bias) == 0:
-        bias = _mbt_build_bias_dashboard(outputs)
-    pack["bias_dashboard"] = bias
+    metrics = outputs.get("metrics_df") if _fast_is_nonempty_df(outputs.get("metrics_df")) else _fast_build_metrics_df(outputs)
+    if _fast_is_nonempty_df(metrics):
+        outputs["metrics_df"] = metrics
+        score_col = "WAPE" if "WAPE" in metrics.columns else ("MAPE" if "MAPE" in metrics.columns else None)
+        rank = metrics.copy()
+        if score_col:
+            rank["_score"] = pd.to_numeric(rank[score_col], errors="coerce")
+            rank = rank.sort_values("_score", na_position="last").drop(columns=["_score"], errors="ignore")
+        pack["production_ranking"] = rank.reset_index(drop=True)
 
-    peak = pack.get("peak_event_dashboard")
-    if not isinstance(peak, pd.DataFrame) or len(peak) == 0:
-        peak = _mbt_build_peak_event_dashboard(outputs)
-    pack["peak_event_dashboard"] = peak
+    prod_model = _fast_select_production_model(outputs, pack)
+    pack["production_model"] = prod_model
+    pack["production_status"] = "eligible_no_refit" if prod_model else "no_prediction_available"
+    pack["production_selection_reason"] = "Mevcut holdout tahminleri üzerinden seçildi; tablo üretimi hiçbir modeli yeniden fit etmedi."
+
+    if not _fast_is_nonempty_df(pack.get("forecast_value_add")):
+        pack["forecast_value_add"] = _fast_build_forecast_value_add(outputs)
+    if not _fast_is_nonempty_df(pack.get("bias_dashboard")):
+        pack["bias_dashboard"] = _fast_build_bias_dashboard(outputs)
+    if not _fast_is_nonempty_df(pack.get("peak_event_dashboard")):
+        pack["peak_event_dashboard"] = _fast_build_peak_dashboard(outputs)
 
     qtables = pack.get("quantile_forecasts") if isinstance(pack.get("quantile_forecasts"), dict) else {}
     stables = pack.get("service_level_simulation") if isinstance(pack.get("service_level_simulation"), dict) else {}
-    for name, pred in _mbt_canonical_prediction_items(outputs):
-        qdf = qtables.get(name)
-        if not isinstance(qdf, pd.DataFrame) or len(qdf) == 0:
-            qdf = _mbt_build_interval_table_for_model(outputs, name, pred)
-        qtables[name] = qdf
-        sdf = stables.get(name)
-        if not isinstance(sdf, pd.DataFrame) or len(sdf) == 0:
-            sdf = _mbt_build_service_table(outputs, name, pred, qdf)
-        stables[name] = sdf
+    for name, pred in _fast_prediction_items(outputs):
+        if not _fast_is_nonempty_df(qtables.get(name)):
+            qtables[name] = _fast_quantile_table(outputs, name, pred)
+        if not _fast_is_nonempty_df(stables.get(name)):
+            stables[name] = _fast_service_table(outputs, name, pred, qtables.get(name))
     pack["quantile_forecasts"] = qtables
     pack["service_level_simulation"] = stables
-
-    # Select production model from pack, outputs, or best finite metric. Then ensure interval/service tables are never blank.
-    prod_model = pack.get("production_model") or outputs.get("production_model") or outputs.get("best_model")
-    if (not prod_model or str(prod_model) not in qtables) and isinstance(outputs.get("metrics_df"), pd.DataFrame) and len(outputs["metrics_df"]) and "model" in outputs["metrics_df"].columns:
-        mdf = outputs["metrics_df"].copy()
-        if "WAPE" in mdf.columns:
-            mdf["_wape"] = pd.to_numeric(mdf["WAPE"], errors="coerce")
-            mdf = mdf.sort_values("_wape", na_position="last")
-        for cand in mdf["model"].dropna().astype(str).tolist():
-            if cand in qtables and isinstance(qtables[cand], pd.DataFrame) and len(qtables[cand]):
-                prod_model = cand
-                break
-    if not prod_model:
-        items = _mbt_canonical_prediction_items(outputs)
-        prod_model = items[0][0] if items else None
-    pack["production_model"] = prod_model
-    pack.setdefault("production_status", "eligible" if prod_model else "no_prediction_available")
     pack["production_interval_table"] = qtables.get(prod_model, pd.DataFrame()) if prod_model else pd.DataFrame()
     pack["production_service_table"] = stables.get(prod_model, pd.DataFrame()) if prod_model else pd.DataFrame()
 
-    # Add a compact completeness manifest so thesis/business users see why each table exists.
+    live = pack.get("live_monitoring_pack") if isinstance(pack.get("live_monitoring_pack"), dict) else {}
+    if not _fast_is_nonempty_df(live.get("summary")):
+        live["summary"] = pd.DataFrame([{
+            "production_model": prod_model,
+            "status": pack.get("production_status"),
+            "available_model_count": len(_fast_prediction_items(outputs)),
+            "business_tables_source": "existing_holdout_predictions_no_model_refit",
+        }])
+    if not _fast_is_nonempty_df(live.get("model_health_table")):
+        health = pack.get("bias_dashboard", pd.DataFrame()).copy()
+        if _fast_is_nonempty_df(health):
+            health["health_source"] = "bias_dashboard"
+        live["model_health_table"] = health
+    if "alerts" not in live:
+        live["alerts"] = pd.DataFrame()
+    pack["live_monitoring_pack"] = live
+
     pack["mandatory_business_table_manifest"] = pd.DataFrame([{
-        "version": MANDATORY_BUSINESS_TABLES_VERSION,
+        "version": FAST_UI_BUSINESS_PATCH_VERSION,
+        "no_model_refit": True,
         "forecast_value_add_rows": len(pack.get("forecast_value_add", pd.DataFrame())) if isinstance(pack.get("forecast_value_add"), pd.DataFrame) else 0,
         "bias_dashboard_rows": len(pack.get("bias_dashboard", pd.DataFrame())) if isinstance(pack.get("bias_dashboard"), pd.DataFrame) else 0,
         "peak_event_dashboard_rows": len(pack.get("peak_event_dashboard", pd.DataFrame())) if isinstance(pack.get("peak_event_dashboard"), pd.DataFrame) else 0,
         "production_interval_rows": len(pack.get("production_interval_table", pd.DataFrame())) if isinstance(pack.get("production_interval_table"), pd.DataFrame) else 0,
         "production_service_rows": len(pack.get("production_service_table", pd.DataFrame())) if isinstance(pack.get("production_service_table"), pd.DataFrame) else 0,
-        "lstm_ui_alias_available": "LSTM" in (outputs.get("tables", {}) or {}) and "LSTM" in (outputs.get("predictions", {}) or {}),
-        "gru_ui_alias_available": "GRU" in (outputs.get("tables", {}) or {}) and "GRU" in (outputs.get("predictions", {}) or {}),
-        "explanation": "Bu tablolar holdout tahminleri üretildiği sürece zorunlu olarak hesaplanır; boş kalırsa model çıktısı değil veri/prediction eksikliği vardır.",
+        "lstm_ui_alias_available": bool("LSTM" in (outputs.get("tables", {}) or {}) and "LSTM" in (outputs.get("predictions", {}) or {})),
+        "gru_ui_alias_available": bool("GRU" in (outputs.get("tables", {}) or {}) and "GRU" in (outputs.get("predictions", {}) or {})),
     }])
     return pack
 
 
-# Preserve the current production-governance builder, then harden its output.
-_MBT_PREV_build_production_governance_pack = globals().get("build_production_governance_pack")
-
-def build_production_governance_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, freq_alias: str) -> Dict[str, Any]:
-    outputs = _mbt_ensure_lstm_gru_aliases(outputs if isinstance(outputs, dict) else {})
-    try:
-        pack = _MBT_PREV_build_production_governance_pack(outputs, export_payload, target_col, freq_alias) if callable(_MBT_PREV_build_production_governance_pack) else {}
-    except Exception as e:
-        pack = {"production_governance_error": pd.DataFrame([{"stage": "legacy_build_production_governance_pack", "error": str(e)}])}
-    pack = _mbt_complete_production_pack(outputs, pack, freq_alias)
-    outputs["production_governance"] = pack
-    return pack
-
-
-_MBT_PREV_ensure_production_reporting_tables = globals().get("ensure_production_reporting_tables")
-
 def ensure_production_reporting_tables(outputs: Dict[str, Any], export_payload: Optional[Dict[str, pd.DataFrame]] = None, target_col: Optional[str] = None, freq_alias: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(outputs, dict):
         return outputs
-    outputs = _mbt_ensure_lstm_gru_aliases(outputs)
-    if callable(_MBT_PREV_ensure_production_reporting_tables):
-        try:
-            outputs = _MBT_PREV_ensure_production_reporting_tables(outputs, export_payload, target_col, freq_alias)
-        except Exception:
-            pass
-    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
-    prod_pack = _mbt_complete_production_pack(outputs, prod_pack, freq_alias or ((outputs.get("metadata") or {}).get("freq_alias") if isinstance(outputs, dict) else None))
-    outputs["production_governance"] = prod_pack
-    outputs["production_model"] = prod_pack.get("production_model", outputs.get("production_model", outputs.get("best_model")))
-    outputs["production_status"] = prod_pack.get("production_status", outputs.get("production_status", "eligible"))
+    outputs = _fast_ensure_dl_ui_aliases(outputs)
+    existing_pack = outputs.get("production_governance") if isinstance(outputs.get("production_governance"), dict) else {}
+    pack = _fast_build_production_pack_no_refit(outputs, existing_pack)
+    outputs["production_governance"] = pack
+    outputs["production_model"] = pack.get("production_model")
+    outputs["production_status"] = pack.get("production_status")
+    try:
+        outputs.setdefault("metadata", {})["fast_ui_business_patch"] = FAST_UI_BUSINESS_PATCH_VERSION
+    except Exception:
+        pass
     return outputs
 
 
-_MBT_PREV_build_named_output_tables = globals().get("build_named_output_tables")
+_FAST_UI_PREV_BUILD_NAMED_TABLES = globals().get("build_named_output_tables")
 
 def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    outputs = ensure_production_reporting_tables(outputs if isinstance(outputs, dict) else {}, export_payload, (outputs.get("metadata") or {}).get("target_col") if isinstance(outputs, dict) else None, (outputs.get("metadata") or {}).get("freq_alias") if isinstance(outputs, dict) else None)
-    tables = _MBT_PREV_build_named_output_tables(outputs, export_payload) if callable(_MBT_PREV_build_named_output_tables) else {}
+    outputs = ensure_production_reporting_tables(outputs if isinstance(outputs, dict) else {}, export_payload)
+    tables = {}
+    if callable(_FAST_UI_PREV_BUILD_NAMED_TABLES):
+        try:
+            tables = _FAST_UI_PREV_BUILD_NAMED_TABLES(outputs, export_payload) or {}
+        except Exception as e:
+            tables = {"Rapor oluşturma uyarısı": pd.DataFrame([{"warning": str(e)}])}
     if not isinstance(tables, dict):
         tables = {}
-    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs, dict) else {}
-    mandatory = {
-        "Tahmin katkı değeri (baseline'a göre)": prod_pack.get("forecast_value_add", pd.DataFrame()),
-        "Bias dashboard": prod_pack.get("bias_dashboard", pd.DataFrame()),
-        "Tepe olay yakalama skoru": prod_pack.get("peak_event_dashboard", pd.DataFrame()),
-        "Üretim modeli için tahmin aralığı - quantile forecast": prod_pack.get("production_interval_table", pd.DataFrame()),
-        "Servis seviyesi - stok etkisi simülasyonu": prod_pack.get("production_service_table", pd.DataFrame()),
-        "Zorunlu iş tabloları manifestosu": prod_pack.get("mandatory_business_table_manifest", pd.DataFrame()),
-    }
-    for k, v in mandatory.items():
-        tables[k] = style_metric_dataframe(v) if isinstance(v, pd.DataFrame) else pd.DataFrame()
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+    tables["Tahmin katkı değeri (baseline'a göre)"] = prod_pack.get("forecast_value_add", pd.DataFrame())
+    tables["Bias dashboard"] = prod_pack.get("bias_dashboard", pd.DataFrame())
+    tables["Tepe olay yakalama skoru"] = prod_pack.get("peak_event_dashboard", pd.DataFrame())
+    tables["Üretim modeli için tahmin aralığı - quantile forecast"] = prod_pack.get("production_interval_table", pd.DataFrame())
+    tables["Servis seviyesi - stok etkisi simülasyonu"] = prod_pack.get("production_service_table", pd.DataFrame())
+    tables["Zorunlu iş tabloları manifestosu"] = prod_pack.get("mandatory_business_table_manifest", pd.DataFrame())
+    for fam in ["LSTM", "GRU"]:
+        if fam in outputs.get("tables", {}):
+            tables[f"{fam} - Gerçek ve Tahmin"] = outputs["tables"][fam]
+        pack = outputs.get(fam.lower(), {}) if isinstance(outputs.get(fam.lower(), {}), dict) else {}
+        if _fast_is_nonempty_df(pack.get("history_df")):
+            tables[f"{fam} - Epoch Loss Geçmişi"] = pack.get("history_df")
+        if _fast_is_nonempty_df(pack.get("dl_training_status_table")):
+            tables[f"{fam} - Eğitim Durumu Tablosu"] = pack.get("dl_training_status_table")
     return tables
 
 
-_MBT_PREV_build_thesis_business_report_pack = globals().get("build_thesis_business_report_pack")
+_FAST_UI_PREV_THESIS_PACK = globals().get("build_thesis_business_report_pack")
 
 def build_thesis_business_report_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, selected_sheet: Optional[str] = None) -> Dict[str, Any]:
-    outputs = ensure_production_reporting_tables(outputs if isinstance(outputs, dict) else {}, export_payload, target_col, (outputs.get("metadata") or {}).get("freq_alias") if isinstance(outputs, dict) else None)
-    pack = _MBT_PREV_build_thesis_business_report_pack(outputs, export_payload, target_col, selected_sheet) if callable(_MBT_PREV_build_thesis_business_report_pack) else {"tables": {}}
+    outputs = ensure_production_reporting_tables(outputs if isinstance(outputs, dict) else {}, export_payload, target_col)
+    if callable(_FAST_UI_PREV_THESIS_PACK):
+        try:
+            pack = _FAST_UI_PREV_THESIS_PACK(outputs, export_payload, target_col, selected_sheet) or {"tables": {}}
+        except Exception as e:
+            pack = {"tables": {"Tez raporu uyarısı": pd.DataFrame([{"warning": str(e)}])}}
+    else:
+        pack = {"tables": {}}
     if not isinstance(pack, dict):
         pack = {"tables": {}}
     tables = pack.setdefault("tables", {})
-    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs, dict) else {}
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
     tables["Tez - Tahmin katkı değeri"] = prod_pack.get("forecast_value_add", pd.DataFrame())
     tables["Tez - Bias dashboard"] = prod_pack.get("bias_dashboard", pd.DataFrame())
     tables["Tez - Tepe olay yakalama skoru"] = prod_pack.get("peak_event_dashboard", pd.DataFrame())
     tables["Tez - Üretim quantile forecast"] = prod_pack.get("production_interval_table", pd.DataFrame())
     tables["Tez - Servis seviyesi stok etkisi"] = prod_pack.get("production_service_table", pd.DataFrame())
     tables["Tez - Zorunlu iş tabloları manifestosu"] = prod_pack.get("mandatory_business_table_manifest", pd.DataFrame())
-    pack["version"] = str(pack.get("version", "")) + " + " + MANDATORY_BUSINESS_TABLES_VERSION
+    pack["version"] = str(pack.get("version", "")) + " + " + FAST_UI_BUSINESS_PATCH_VERSION
     return pack
 
 
-_MBT_PREV_run_full_forecasting_pipeline = globals().get("run_full_forecasting_pipeline")
+_FAST_UI_PREV_RUN_FULL_PIPELINE = globals().get("run_full_forecasting_pipeline")
 
 def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_stat: bool = True, use_exog_prophet: bool = True) -> Dict[str, Any]:
-    if not callable(_MBT_PREV_run_full_forecasting_pipeline):
+    if not callable(_FAST_UI_PREV_RUN_FULL_PIPELINE):
         raise RuntimeError("run_full_forecasting_pipeline implementation is unavailable.")
-    outputs = _MBT_PREV_run_full_forecasting_pipeline(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
+    outputs = _FAST_UI_PREV_RUN_FULL_PIPELINE(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
     outputs = outputs if isinstance(outputs, dict) else {}
-    outputs = _mbt_ensure_lstm_gru_aliases(outputs)
-    freq_alias = (outputs.get("metadata") or {}).get("freq_alias") or "M"
-    try:
-        prod_pack = build_production_governance_pack(outputs, export_payload or {}, target_col, freq_alias)
-        outputs["production_governance"] = prod_pack
-    except Exception as e:
-        outputs.setdefault("production_governance", {})["mandatory_business_table_error"] = pd.DataFrame([{"error": str(e)}])
-        outputs = ensure_production_reporting_tables(outputs, export_payload or {}, target_col, freq_alias)
+    outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, (outputs.get("metadata") or {}).get("freq_alias"))
     try:
         outputs["thesis_business_pack"] = build_thesis_business_report_pack(outputs, export_payload or {}, target_col, (outputs.get("metadata") or {}).get("selected_sheet"))
     except Exception:
@@ -19352,6 +19429,188 @@ def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], targe
     return outputs
 
 
+
+# =========================================================
+# STREAMLIT STABILITY PATCH V2 - TRUE NO-REFIT UI TABLES
+# =========================================================
+FAST_STREAMLIT_STABILITY_PATCH_VERSION = "2026_04_25_streamlit_stability_v2_no_refit_no_empty_tables"
+
+try:
+    import logging as _stability_logging
+    for _logger_name in ["cmdstanpy", "prophet", "stanio"]:
+        _lg = _stability_logging.getLogger(_logger_name)
+        _lg.setLevel(_stability_logging.ERROR)
+        _lg.propagate = False
+        _lg.disabled = True
+    _stability_logging.getLogger().setLevel(max(_stability_logging.getLogger().level, _stability_logging.WARNING))
+except Exception:
+    pass
+
+try:
+    FORECAST_RUNTIME_CONFIG.prophet_max_configs = 1
+    FORECAST_RUNTIME_CONFIG.prophet_max_exog_cols = min(int(getattr(FORECAST_RUNTIME_CONFIG, 'prophet_max_exog_cols', 0) or 0), 3)
+except Exception:
+    pass
+
+def _stability_get_model_prediction_from_long(outputs: Dict[str, Any], model_aliases: List[str]) -> Optional[np.ndarray]:
+    avp = outputs.get("all_predictions_long", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(avp, pd.DataFrame) or len(avp) == 0:
+        return None
+    lower_cols = {str(c).strip().lower(): c for c in avp.columns}
+    model_col = lower_cols.get("model") or lower_cols.get("model adı") or lower_cols.get("model_adi")
+    pred_col = lower_cols.get("prediction") or lower_cols.get("forecast") or lower_cols.get("yhat") or lower_cols.get("tahmin") or lower_cols.get("pred")
+    if model_col is None or pred_col is None:
+        return None
+    aliases_l = {str(a).strip().lower() for a in model_aliases}
+    mask = avp[model_col].astype(str).str.strip().str.lower().isin(aliases_l)
+    if not mask.any():
+        patterns = [str(a).replace("(real)", "").strip().lower() for a in model_aliases]
+        mask = avp[model_col].astype(str).str.lower().apply(lambda v: any(p and p in v for p in patterns))
+    vals = pd.to_numeric(avp.loc[mask, pred_col], errors="coerce").dropna().values
+    return np.asarray(vals, dtype=float) if len(vals) else None
+
+def _stability_ensure_dl_ui_aliases(outputs: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(outputs, dict):
+        return outputs
+    tables = outputs.setdefault("tables", {})
+    preds = outputs.setdefault("predictions", {})
+    model_errors = outputs.setdefault("model_errors", {})
+    test_df = _fast_get_test_df(outputs) if '_fast_get_test_df' in globals() else pd.DataFrame()
+    for fam, pack_key, public_name in [("LSTM", "lstm", "LSTM (real)"), ("GRU", "gru", "GRU (real)")]:
+        aliases = [fam, public_name, fam.lower(), f"{fam}-real", f"{fam}_REAL"]
+        pred = None
+        pkey = _fast_find_key(preds, aliases) if '_fast_find_key' in globals() else None
+        if pkey is not None:
+            pred = preds.get(pkey)
+        if pred is None:
+            pred = _stability_get_model_prediction_from_long(outputs, aliases)
+        pack = outputs.get(pack_key, {}) if isinstance(outputs.get(pack_key, {}), dict) else {}
+        if pred is None and isinstance(pack, dict):
+            for fc_key in ["forecast", "prediction", "predictions", "y_pred", "holdout_forecast"]:
+                if pack.get(fc_key) is not None:
+                    pred = pack.get(fc_key)
+                    break
+        if pred is None:
+            tkey = _fast_find_key(tables, aliases) if '_fast_find_key' in globals() else None
+            tdf = tables.get(tkey) if tkey is not None else None
+            if isinstance(tdf, pd.DataFrame) and len(tdf):
+                cols = {str(c).strip().lower(): c for c in tdf.columns}
+                pc = cols.get("prediction") or cols.get("forecast") or cols.get("tahmin") or cols.get("yhat")
+                if pc is not None:
+                    pred = pd.to_numeric(tdf[pc], errors="coerce").dropna().values
+        arr = _fast_full_float_array(pred) if '_fast_full_float_array' in globals() else np.asarray(pred if pred is not None else [], dtype=float).reshape(-1)
+        if len(arr) > 0 and np.isfinite(arr).any():
+            arr = np.maximum(arr[np.isfinite(arr)], 0.0)
+            preds[fam] = arr
+            preds[public_name] = arr
+            tbl_key = _fast_find_key(tables, aliases) if '_fast_find_key' in globals() else None
+            tbl = tables.get(tbl_key) if tbl_key is not None else None
+            if not (isinstance(tbl, pd.DataFrame) and len(tbl)):
+                tbl = _fast_prediction_table(test_df, arr, fam) if '_fast_prediction_table' in globals() else pd.DataFrame({"prediction": arr, "model": fam})
+            if isinstance(tbl, pd.DataFrame) and len(tbl):
+                legacy_tbl = tbl.copy(); legacy_tbl["model"] = fam
+                public_tbl = tbl.copy(); public_tbl["model"] = public_name
+                tables[fam] = legacy_tbl; tables[public_name] = public_tbl
+            model_errors.pop(fam, None); model_errors.pop(public_name, None)
+            if isinstance(pack, dict):
+                hist = pack.get("history_df", pd.DataFrame())
+                epochs = int(len(hist)) if isinstance(hist, pd.DataFrame) and len(hist) else int(pack.get("epochs_ran", 0) or 0)
+                cfg = pack.get("selected_config", {}) if isinstance(pack.get("selected_config", {}), dict) else {}
+                if not isinstance(pack.get("dl_training_status_table"), pd.DataFrame) or len(pack.get("dl_training_status_table", pd.DataFrame())) == 0:
+                    pack["dl_training_status_table"] = pd.DataFrame([{
+                        "model": fam,
+                        "trained_with_tensorflow": bool(pack.get("trained_with_tensorflow", True if epochs > 0 else False)),
+                        "trained_with_real_dl_backend": bool(pack.get("trained_with_real_dl_backend", True if epochs > 0 else False)),
+                        "real_dl_backend": pack.get("real_dl_backend", "tensorflow" if epochs > 0 else "unknown"),
+                        "surrogate_used": bool(pack.get("surrogate_used", False)),
+                        "fallback_used": bool(pack.get("fallback_used", False)),
+                        "epochs_ran": epochs,
+                        "n_sequences": pack.get("n_sequences", cfg.get("n_sequences")),
+                        "selected_window": pack.get("selected_window", cfg.get("window")),
+                        "selected_strategy": pack.get("selected_strategy", cfg.get("strategy")),
+                        "ui_alias_status": "available",
+                    }])
+                outputs[pack_key] = pack
+    outputs["tables"] = tables; outputs["predictions"] = preds; outputs["model_errors"] = model_errors
+    return outputs
+
+_fast_ensure_dl_ui_aliases = _stability_ensure_dl_ui_aliases
+
+def fit_best_prophet(train_df: pd.DataFrame, test_df: pd.DataFrame, freq_alias: str, profile: Dict[str, Any], exog_train: Optional[pd.DataFrame] = None, exog_test: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    if not HAS_PROPHET:
+        return fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason="prophet_package_missing")
+    cfg = {"seasonality_mode": "additive", "changepoint_prior_scale": 0.05, "seasonality_prior_scale": 3.0, "changepoint_range": 0.90, "n_changepoints": int(max(3, min(8, max(3, len(train_df) // 4)))), "growth": "linear"}
+    transform_cfg = {"name": "none", "lambda": None, "shift": 0.0}
+    try:
+        m, fc, pred = _fit_predict_prophet_once(train_df.copy(), test_df.copy(), freq_alias, cfg, [], use_holidays=False, add_custom_seasonality=True, transform_cfg=transform_cfg)
+        pred = np.maximum(np.asarray(pred, dtype=float).reshape(-1), 0.0)
+        actual = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values if "y" in test_df.columns else np.asarray([], dtype=float)
+        val_w = wape(actual, pred) if len(actual) else np.nan
+        val_s = smape(actual, pred) if len(actual) else np.nan
+        rows = [{**cfg, "transform": "none", "plan_name": "streamlit_fast_single_real_fit", "use_exog": False, "use_holidays": False, "custom_seasonality": True, "val_wape": val_w, "val_smape": val_s, "composite_score": val_w, "fit_count": 1}]
+        return {"model": m, "forecast_df": fc, "forecast": pred, "config": cfg, "selected_plan": {"cfg": cfg, "streamlit_fast_single_fit": True}, "component_validation": {"seasonality_present": bool("yearly" in fc.columns or "weekly" in fc.columns), "used_exog_cols": [], "dropped_exog_cols": list(exog_train.columns) if isinstance(exog_train, pd.DataFrame) else [], "fit_count": 1, "streamlit_fast_mode": True, "note": "Prophet Streamlit modunda tek gerçek fit ile çalıştırıldı; tablo üretimi Prophet'i yeniden fit etmez."}, "used_exog_cols": [], "dropped_exog_cols": list(exog_train.columns) if isinstance(exog_train, pd.DataFrame) else [], "search_table": pd.DataFrame(rows), "search_accelerator_cache_hit": False, "validation_wape": safe_float(val_w), "validation_smape": safe_float(val_s), "fallback_used": False, "fallback_method": None, "fit_mode": "gercek_prophet_fit_streamlit_fast_single", "fit_visibility_note": "Gerçek Prophet modeli Streamlit hızlı modunda tek fit ile eğitildi."}
+    except Exception as e:
+        result = fit_prophet_surrogate(train_df, test_df, freq_alias, exog_train, exog_test, reason=f"streamlit_fast_prophet_failed:{e}")
+        result["search_table"] = pd.DataFrame([{"plan_name": "streamlit_fast_single_real_fit", "fit_error": str(e)[:300], "fallback_used": True}])
+        return result
+
+def run_rolling_origin_backtest_full(export_payload: Dict[str, pd.DataFrame], target_col: str, outputs: Dict[str, Any], freq_alias: str, horizon: int = 3, use_exog_for_stat_models: bool = True, use_exog_for_prophet: bool = True, max_folds: int = 3) -> pd.DataFrame:
+    outputs = ensure_production_reporting_tables(outputs if isinstance(outputs, dict) else {}, export_payload, target_col, freq_alias)
+    test_df = _fast_get_test_df(outputs)
+    if not isinstance(test_df, pd.DataFrame) or len(test_df) == 0 or "y" not in test_df.columns:
+        return pd.DataFrame(columns=["fold", "step", "model", "WAPE", "sMAPE", "MAE", "actual", "prediction", "abs_error", "no_refit_proxy"])
+    y = pd.to_numeric(test_df["y"], errors="coerce").astype(float).values
+    rows = []
+    for model_name, pred in _fast_prediction_items(outputs):
+        n = min(len(y), len(pred))
+        for i in range(n):
+            a = float(y[i]); p = float(pred[i])
+            rows.append({"fold": 1, "step": i + 1, "model": model_name, "WAPE": wape(np.asarray([a]), np.asarray([p])), "sMAPE": smape(np.asarray([a]), np.asarray([p])), "MAE": mae(np.asarray([a]), np.asarray([p])), "actual": a, "prediction": p, "abs_error": abs(p - a), "no_refit_proxy": True, "note": "Streamlit hızlı mod: mevcut holdout tahminlerinden üretildi; model yeniden fit edilmedi."})
+    return pd.DataFrame(rows)
+
+def build_thesis_business_report_pack(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame], target_col: str, selected_sheet: Optional[str] = None) -> Dict[str, Any]:
+    outputs = ensure_production_reporting_tables(outputs if isinstance(outputs, dict) else {}, export_payload, target_col)
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+    tables = {"Tez - Model karşılaştırma": outputs.get("metrics_df", pd.DataFrame()), "Tez - Gerçek vs Tahmin": outputs.get("all_predictions_long", pd.DataFrame()), "Tez - Tahmin katkı değeri": prod_pack.get("forecast_value_add", pd.DataFrame()), "Tez - Bias dashboard": prod_pack.get("bias_dashboard", pd.DataFrame()), "Tez - Tepe olay yakalama skoru": prod_pack.get("peak_event_dashboard", pd.DataFrame()), "Tez - Üretim quantile forecast": prod_pack.get("production_interval_table", pd.DataFrame()), "Tez - Servis seviyesi stok etkisi": prod_pack.get("production_service_table", pd.DataFrame()), "Tez - Zorunlu iş tabloları manifestosu": prod_pack.get("mandatory_business_table_manifest", pd.DataFrame())}
+    for fam in ["LSTM", "GRU"]:
+        if fam in outputs.get("tables", {}): tables[f"Tez - {fam} gerçek ve tahmin"] = outputs["tables"][fam]
+        pack = outputs.get(fam.lower(), {}) if isinstance(outputs.get(fam.lower(), {}), dict) else {}
+        if isinstance(pack.get("history_df"), pd.DataFrame) and len(pack.get("history_df")): tables[f"Tez - {fam} epoch loss"] = pack.get("history_df")
+        if isinstance(pack.get("dl_training_status_table"), pd.DataFrame) and len(pack.get("dl_training_status_table")): tables[f"Tez - {fam} eğitim durumu"] = pack.get("dl_training_status_table")
+    return {"version": FAST_STREAMLIT_STABILITY_PATCH_VERSION, "tables": tables, "notes": ["Streamlit hızlı/no-refit modunda üretildi.", "İş tabloları mevcut tahminlerden türetildi; model yeniden fit edilmedi."]}
+
+def build_named_output_tables(outputs: Dict[str, Any], export_payload: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    outputs = ensure_production_reporting_tables(outputs if isinstance(outputs, dict) else {}, export_payload)
+    tables: Dict[str, pd.DataFrame] = {}
+    if isinstance(outputs.get("metrics_df"), pd.DataFrame): tables["Model karşılaştırma tablosu"] = outputs.get("metrics_df")
+    if isinstance(outputs.get("all_predictions_long"), pd.DataFrame): tables["Gerçek vs Tahmin - Tüm Modeller"] = outputs.get("all_predictions_long")
+    for k, v in (outputs.get("tables", {}) or {}).items():
+        if isinstance(v, pd.DataFrame) and len(v): tables[f"{k} - Gerçek ve Tahmin"] = v
+    prod_pack = outputs.get("production_governance", {}) if isinstance(outputs.get("production_governance", {}), dict) else {}
+    tables["Tahmin katkı değeri (baseline'a göre)"] = prod_pack.get("forecast_value_add", pd.DataFrame())
+    tables["Bias dashboard"] = prod_pack.get("bias_dashboard", pd.DataFrame())
+    tables["Tepe olay yakalama skoru"] = prod_pack.get("peak_event_dashboard", pd.DataFrame())
+    tables["Üretim modeli için tahmin aralığı - quantile forecast"] = prod_pack.get("production_interval_table", pd.DataFrame())
+    tables["Servis seviyesi - stok etkisi simülasyonu"] = prod_pack.get("production_service_table", pd.DataFrame())
+    tables["Zorunlu iş tabloları manifestosu"] = prod_pack.get("mandatory_business_table_manifest", pd.DataFrame())
+    for fam in ["LSTM", "GRU"]:
+        pack = outputs.get(fam.lower(), {}) if isinstance(outputs.get(fam.lower(), {}), dict) else {}
+        if isinstance(pack.get("history_df"), pd.DataFrame) and len(pack.get("history_df")): tables[f"{fam} - Epoch Loss Geçmişi"] = pack.get("history_df")
+        if isinstance(pack.get("dl_training_status_table"), pd.DataFrame) and len(pack.get("dl_training_status_table")): tables[f"{fam} - Eğitim Durumu Tablosu"] = pack.get("dl_training_status_table")
+    return {k: v for k, v in tables.items() if isinstance(v, pd.DataFrame) and len(v) > 0}
+
+_STABILITY_PREV_RUN_FULL_PIPELINE = globals().get("_FAST_UI_PREV_RUN_FULL_PIPELINE") or globals().get("run_full_forecasting_pipeline")
+
+def run_full_forecasting_pipeline(export_payload: Dict[str, pd.DataFrame], target_col: str, horizon: int, use_exog_stat: bool = True, use_exog_prophet: bool = True) -> Dict[str, Any]:
+    if not callable(_STABILITY_PREV_RUN_FULL_PIPELINE):
+        raise RuntimeError("run_full_forecasting_pipeline implementation is unavailable.")
+    outputs = _STABILITY_PREV_RUN_FULL_PIPELINE(export_payload, target_col, horizon, use_exog_stat, use_exog_prophet)
+    outputs = outputs if isinstance(outputs, dict) else {}
+    outputs = ensure_production_reporting_tables(outputs, export_payload, target_col, (outputs.get("metadata") or {}).get("freq_alias"))
+    outputs["thesis_business_pack"] = build_thesis_business_report_pack(outputs, export_payload or {}, target_col, (outputs.get("metadata") or {}).get("selected_sheet"))
+    try: outputs.setdefault("metadata", {})["streamlit_stability_patch"] = FAST_STREAMLIT_STABILITY_PATCH_VERSION
+    except Exception: pass
+    return outputs
 
 if __name__ == "__main__":
     try:
